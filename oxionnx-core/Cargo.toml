@@ -1,0 +1,22 @@
+[package]
+name = "oxionnx-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "Core types for OxiONNX — Tensor, Graph, OpKind, Operator trait, and error types"
+keywords = ["onnx", "tensor", "inference", "core", "pure-rust"]
+categories = ["science", "data-structures"]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+half = { workspace = true }
+hashbrown = { workspace = true }

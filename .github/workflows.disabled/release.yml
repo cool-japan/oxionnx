@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.1.0)'
+        required: true
+
+jobs:
+  verify:
+    name: Pre-release Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --all-features
+      - name: Doc
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - name: Publish dry-run (oxionnx-core)
+        run: cargo publish --dry-run -p oxionnx-core
+      - name: Publish dry-run (oxionnx-proto)
+        run: cargo publish --dry-run -p oxionnx-proto
+      - name: Publish dry-run (oxionnx-ops)
+        run: cargo publish --dry-run -p oxionnx-ops
+      - name: Publish dry-run (oxionnx-gpu)
+        run: cargo publish --dry-run -p oxionnx-gpu
+      - name: Publish dry-run (oxionnx)
+        run: cargo publish --dry-run -p oxionnx
+
+  # Note: Actual publishing should be done manually after verification.
+  # cargo publish -p oxionnx-core
+  # cargo publish -p oxionnx-proto
+  # cargo publish -p oxionnx-ops
+  # cargo publish -p oxionnx-gpu
+  # cargo publish -p oxionnx

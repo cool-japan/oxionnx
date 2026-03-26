@@ -1,0 +1,92 @@
+[workspace]
+members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+license = "Apache-2.0"
+repository = "https://github.com/cool-japan/oxionnx"
+documentation = "https://docs.rs/oxionnx"
+homepage = "https://github.com/cool-japan/oxionnx"
+rust-version = "1.75"
+
+[workspace.dependencies]
+oxionnx-core = { path = "oxionnx-core", version = "0.1.0" }
+oxionnx-ops = { path = "oxionnx-ops", version = "0.1.0" }
+oxionnx-proto = { path = "oxionnx-proto", version = "0.1.0" }
+oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.0" }
+half = "2.7"
+matrixmultiply = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+rayon = "1"
+wgpu = { version = "29", features = ["wgsl"] }
+hashbrown = "0.16"
+pollster = "0.4"
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
+aes-gcm = "0.10"
+memmap2 = "0.9"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+
+[package]
+name = "oxionnx"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "Pure Rust ONNX inference engine — zero C/C++ dependencies"
+keywords = ["onnx", "inference", "deep-learning", "machine-learning", "pure-rust"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+oxionnx-core = { workspace = true }
+oxionnx-ops = { workspace = true }
+oxionnx-proto = { workspace = true }
+oxionnx-gpu = { workspace = true, optional = true }
+half = { workspace = true }
+matrixmultiply = { workspace = true }
+bytemuck = { workspace = true }
+aes-gcm = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "oxionnx-gpu"]
+simd = ["oxionnx-ops/simd"]
+encryption = ["dep:aes-gcm"]
+mmap = ["dep:memmap2", "oxionnx-proto/mmap"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "operators"
+harness = false
+
+[[bench]]
+name = "session"
+harness = false
+
+[profile.dev]
+opt-level = 3
+
+[profile.test]
+opt-level = 3

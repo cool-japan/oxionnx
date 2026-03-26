@@ -1,0 +1,28 @@
+[package]
+name = "oxionnx-ops"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "Operator implementations for OxiONNX — 88+ ONNX operators in Pure Rust"
+keywords = ["onnx", "operators", "inference", "neural-network", "pure-rust"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+oxionnx-core = { workspace = true }
+matrixmultiply = { workspace = true }
+
+[dev-dependencies]
+half = { workspace = true }
+
+[features]
+default = []
+simd = []
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }

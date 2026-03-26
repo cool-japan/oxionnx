@@ -1,0 +1,22 @@
+[package]
+name = "oxionnx-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "ONNX protobuf parser for OxiONNX — zero-dependency wire format decoder"
+keywords = ["onnx", "protobuf", "parser", "pure-rust"]
+categories = ["parser-implementations", "encoding"]
+
+[dependencies]
+oxionnx-core = { workspace = true }
+memmap2 = { workspace = true, optional = true }
+
+[features]
+default = []
+mmap = ["dep:memmap2"]

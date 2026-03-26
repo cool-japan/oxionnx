@@ -1,0 +1,22 @@
+[package]
+name = "oxionnx-gpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "GPU compute backend for OxiONNX — wgpu-based MatMul and Conv2D acceleration"
+keywords = ["onnx", "gpu", "wgpu", "compute", "pure-rust"]
+categories = ["science", "graphics"]
+
+[dependencies]
+oxionnx-core = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = { workspace = true }

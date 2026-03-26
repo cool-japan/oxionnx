@@ -1,0 +1,92 @@
+name: Cross-Platform Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cross-compile:
+    name: Cross (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: wasm32-unknown-unknown
+            os: ubuntu-latest
+            wasm: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      # For cross-compilation on Linux aarch64
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      # Native build
+      - name: Build (native)
+        if: "!matrix.cross && !matrix.wasm"
+        run: cargo build --target ${{ matrix.target }}
+
+      # Cross build (aarch64-linux)
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --target ${{ matrix.target }}
+
+      # WASM build (no default features - no rayon, no file I/O)
+      - name: Build (wasm)
+        if: matrix.wasm
+        run: cargo build --target ${{ matrix.target }} --no-default-features -p oxionnx-core -p oxionnx-ops
+
+  # Build and check wasm-bindgen target
+  wasm-bindgen:
+    name: WASM (wasm-bindgen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with wasm feature
+        run: cargo build --target wasm32-unknown-unknown --features wasm --no-default-features -p oxionnx-core
+
+  # Size check - report binary sizes for tracking
+  binary-size:
+    name: Binary Size Report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --all-features
+      - name: Report sizes
+        run: |
+          echo "## Binary Sizes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Crate | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|------|" >> $GITHUB_STEP_SUMMARY
+          for lib in target/release/lib*.rlib; do
+            name=$(basename "$lib")
+            size=$(du -h "$lib" | cut -f1)
+            echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
+          done
