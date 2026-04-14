@@ -16,7 +16,9 @@ categories = ["science", "data-structures"]
 [features]
 default = ["std"]
 std = []
+ndarray = ["dep:ndarray"]
 
 [dependencies]
 half = { workspace = true }
 hashbrown = { workspace = true }
+ndarray = { workspace = true, optional = true }

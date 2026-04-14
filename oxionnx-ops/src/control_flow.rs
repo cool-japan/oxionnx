@@ -687,6 +687,7 @@ mod tests {
             }],
             input_names: vec![],
             output_names: vec!["Y".into()],
+            ..Default::default()
         };
 
         let else_graph = Graph {
@@ -699,6 +700,7 @@ mod tests {
             }],
             input_names: vec![],
             output_names: vec!["Y".into()],
+            ..Default::default()
         };
 
         let mut attrs = default_attrs();
@@ -747,6 +749,7 @@ mod tests {
             }],
             input_names: vec![],
             output_names: vec!["Y".into()],
+            ..Default::default()
         };
 
         let else_graph = Graph {
@@ -759,6 +762,7 @@ mod tests {
             }],
             input_names: vec![],
             output_names: vec!["Y".into()],
+            ..Default::default()
         };
 
         let mut attrs = default_attrs();
@@ -826,6 +830,7 @@ mod tests {
             ],
             input_names: vec!["iter_num".into(), "cond_in".into(), "accum".into()],
             output_names: vec!["cond_out".into(), "accum_out".into(), "scan_out".into()],
+            ..Default::default()
         };
 
         let mut attrs = default_attrs();
@@ -879,6 +884,7 @@ mod tests {
             }],
             input_names: vec!["iter_num".into(), "cond_in".into()],
             output_names: vec!["cond_out".into()],
+            ..Default::default()
         };
 
         let mut attrs = default_attrs();
@@ -933,6 +939,7 @@ mod tests {
             ],
             input_names: vec!["state_in".into(), "scan_elem".into()],
             output_names: vec!["state_out".into(), "scan_out".into()],
+            ..Default::default()
         };
 
         let mut attrs = default_attrs();
@@ -983,6 +990,7 @@ mod tests {
             }],
             input_names: vec![],
             output_names: vec!["Y".into()],
+            ..Default::default()
         };
 
         let else_graph = Graph {
@@ -995,6 +1003,7 @@ mod tests {
             }],
             input_names: vec![],
             output_names: vec!["Y".into()],
+            ..Default::default()
         };
 
         let mut attrs = default_attrs();

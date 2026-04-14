@@ -1,9 +1,9 @@
 [workspace]
-members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu"]
+members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu", "oxionnx-cuda"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
 license = "Apache-2.0"
@@ -13,17 +13,29 @@ homepage = "https://github.com/cool-japan/oxionnx"
 rust-version = "1.75"
 
 [workspace.dependencies]
-oxionnx-core = { path = "oxionnx-core", version = "0.1.0" }
-oxionnx-ops = { path = "oxionnx-ops", version = "0.1.0" }
-oxionnx-proto = { path = "oxionnx-proto", version = "0.1.0" }
-oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.0" }
+oxionnx-core = { path = "oxionnx-core", version = "0.1.1" }
+ndarray = { version = "0.17" }
+oxionnx-ops = { path = "oxionnx-ops", version = "0.1.1" }
+oxionnx-proto = { path = "oxionnx-proto", version = "0.1.1" }
+oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.1" }
+oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.1" }
+# OxiCUDA stack
+oxifft = "0.2.0"
+oxicuda-driver = { version = "0.1.2" }
+oxicuda-memory = { version = "0.1.2" }
+oxicuda-blas = { version = "0.1.2" }
+oxicuda-dnn = { version = "0.1.2" }
+oxicuda-ptx = { version = "0.1.2" }
+oxicuda-launch = { version = "0.1.2" }
+thiserror = "2"
 half = "2.7"
 matrixmultiply = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
 wgpu = { version = "29", features = ["wgsl"] }
-hashbrown = "0.16"
+hashbrown = "0.17"
 pollster = "0.4"
+tracing = "0.1"
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1"
 aes-gcm = "0.10"
@@ -51,9 +63,11 @@ oxionnx-core = { workspace = true }
 oxionnx-ops = { workspace = true }
 oxionnx-proto = { workspace = true }
 oxionnx-gpu = { workspace = true, optional = true }
+oxionnx-cuda = { workspace = true, optional = true }
 half = { workspace = true }
 matrixmultiply = { workspace = true }
 bytemuck = { workspace = true }
+tracing = { workspace = true }
 aes-gcm = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
@@ -68,14 +82,18 @@ rayon = { workspace = true }
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:pollster", "oxionnx-gpu"]
+cuda = ["dep:oxionnx-cuda"]
 simd = ["oxionnx-ops/simd"]
 encryption = ["dep:aes-gcm"]
 mmap = ["dep:memmap2", "oxionnx-proto/mmap"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+ndarray = ["oxionnx-core/ndarray"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+half = { workspace = true }
 proptest = { workspace = true }
+ndarray = { workspace = true }
 
 [[bench]]
 name = "operators"
@@ -83,6 +101,10 @@ harness = false
 
 [[bench]]
 name = "session"
+harness = false
+
+[[bench]]
+name = "performance"
 harness = false
 
 [profile.dev]

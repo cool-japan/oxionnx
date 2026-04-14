@@ -492,7 +492,10 @@ mod tests {
         // Each 2x2 bin averages 4 sample points
         // Values should be reasonable averages of the quadrants
         for &v in &out.data {
-            assert!(v >= 0.0 && v <= 15.0, "roi_align value out of range: {v}");
+            assert!(
+                (0.0..=15.0).contains(&v),
+                "roi_align value out of range: {v}"
+            );
         }
     }
 
@@ -511,7 +514,7 @@ mod tests {
         // Max mode: values should be >= avg mode values
         for &v in &out.data {
             assert!(
-                v >= 0.0 && v <= 15.0,
+                (0.0..=15.0).contains(&v),
                 "roi_align max value out of range: {v}"
             );
         }

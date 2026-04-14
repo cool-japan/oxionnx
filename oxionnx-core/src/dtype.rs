@@ -290,6 +290,50 @@ impl TypedTensor {
         Self::new(TensorStorage::F32(t.data.clone()), t.shape.clone())
     }
 
+    /// Return the shape of this tensor.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Convert a `Vec<f32>` into a `TypedTensor` of the given dtype.
+    ///
+    /// Used for recovering output dtype after f32-based inference.
+    ///
+    /// # Precision note
+    /// For integer dtypes (i64, i32, etc.), this converts via `as` casting.
+    /// Values outside the representable range of f32 (~2^24) may lose precision
+    /// when the original dtype is i64. See `Session::run_typed` documentation.
+    pub fn from_f32_vec(
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        dtype: DType,
+    ) -> Result<Self, crate::OnnxError> {
+        let storage = match dtype {
+            DType::F32 => TensorStorage::F32(data),
+            DType::F64 => TensorStorage::F64(data.into_iter().map(|x| x as f64).collect()),
+            DType::I8 => TensorStorage::I8(data.into_iter().map(|x| x as i8).collect()),
+            DType::I16 => TensorStorage::I16(data.into_iter().map(|x| x as i16).collect()),
+            DType::I32 => TensorStorage::I32(data.into_iter().map(|x| x as i32).collect()),
+            DType::I64 => TensorStorage::I64(data.into_iter().map(|x| x as i64).collect()),
+            DType::U8 => TensorStorage::U8(data.into_iter().map(|x| x as u8).collect()),
+            DType::U16 => TensorStorage::U16(data.into_iter().map(|x| x as u16).collect()),
+            DType::U32 => TensorStorage::U32(data.into_iter().map(|x| x as u32).collect()),
+            DType::U64 => TensorStorage::U64(data.into_iter().map(|x| x as u64).collect()),
+            DType::Bool => TensorStorage::Bool(data.into_iter().map(|x| x != 0.0).collect()),
+            DType::F16 => TensorStorage::F16(
+                data.into_iter()
+                    .map(|x| half::f16::from_f32(x).to_bits())
+                    .collect(),
+            ),
+            DType::BF16 => TensorStorage::BF16(
+                data.into_iter()
+                    .map(|x| half::bf16::from_f32(x).to_bits())
+                    .collect(),
+            ),
+        };
+        Ok(Self::new(storage, shape))
+    }
+
     /// Create a zeros tensor of the given dtype and shape.
     pub fn zeros(dtype: DType, shape: &[usize]) -> Self {
         let n: usize = shape.iter().product();
@@ -582,7 +626,7 @@ mod tests {
     #[test]
     fn test_typed_tensor_f16() {
         // Create F16 storage from known values
-        let f32_vals = vec![1.0f32, 0.5, -2.0, 0.0];
+        let f32_vals = [1.0f32, 0.5, -2.0, 0.0];
         let f16_bits: Vec<u16> = f32_vals
             .iter()
             .map(|&x| half::f16::from_f32(x).to_bits())
@@ -600,13 +644,15 @@ mod tests {
         assert!((result[3] - 0.0).abs() < 1e-3);
 
         // Cast from F32 to F16 and back
-        let src = TypedTensor::new(TensorStorage::F32(vec![3.14, -1.0]), vec![2]);
+        #[allow(clippy::approx_constant)]
+        let pi_approx = 3.14;
+        let src = TypedTensor::new(TensorStorage::F32(vec![pi_approx, -1.0]), vec![2]);
         let as_f16 = src.cast(DType::F16);
         assert_eq!(as_f16.dtype(), DType::F16);
         let back = as_f16.cast(DType::F32);
         assert_eq!(back.dtype(), DType::F32);
         let vals = back.storage.to_f32_vec();
-        assert!((vals[0] - 3.14).abs() < 0.01);
+        assert!((vals[0] - pi_approx).abs() < 0.01);
         assert!((vals[1] - (-1.0)).abs() < 1e-3);
     }
 }

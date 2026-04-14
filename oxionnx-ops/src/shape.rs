@@ -632,29 +632,33 @@ pub fn reverse_sequence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxionnx_core::OnnxError;
 
     #[test]
-    fn test_reshape() {
+    fn test_reshape() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0; 6], vec![2, 3]);
-        let y = reshape(&x, &[3, 2]).unwrap();
+        let y = reshape(&x, &[3, 2])?;
         assert_eq!(y.shape, vec![3, 2]);
+        Ok(())
     }
 
     #[test]
-    fn test_reshape_neg1() {
+    fn test_reshape_neg1() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0; 6], vec![6]);
-        let y = reshape(&x, &[2, -1]).unwrap();
+        let y = reshape(&x, &[2, -1])?;
         assert_eq!(y.shape, vec![2, 3]);
+        Ok(())
     }
 
     #[test]
-    fn test_transpose_2d() {
+    fn test_transpose_2d() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
-        let y = transpose(&x, &[1, 0]).unwrap();
+        let y = transpose(&x, &[1, 0])?;
         assert_eq!(y.shape, vec![3, 2]);
         assert_eq!(y.data[0], 1.0);
         assert_eq!(y.data[1], 4.0);
         assert_eq!(y.data[2], 2.0);
+        Ok(())
     }
 
     #[test]
@@ -667,19 +671,21 @@ mod tests {
     }
 
     #[test]
-    fn test_concat() {
+    fn test_concat() -> Result<(), OnnxError> {
         let a = Tensor::new(vec![1.0, 2.0], vec![1, 2]);
         let b = Tensor::new(vec![3.0, 4.0], vec![1, 2]);
-        let c = concat(&[&a, &b], 0).unwrap();
+        let c = concat(&[&a, &b], 0)?;
         assert_eq!(c.shape, vec![2, 2]);
         assert_eq!(c.data, vec![1.0, 2.0, 3.0, 4.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_slice() {
+    fn test_slice() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![0.0, 1.0, 2.0, 3.0, 4.0], vec![5]);
-        let y = slice(&x, &[1], &[4], None, None).unwrap();
+        let y = slice(&x, &[1], &[4], None, None)?;
         assert_eq!(y.data, vec![1.0, 2.0, 3.0]);
+        Ok(())
     }
 
     #[test]
@@ -697,30 +703,33 @@ mod tests {
     }
 
     #[test]
-    fn test_split_equal() {
+    fn test_split_equal() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
-        let chunks = split(&x, 1, &[1, 2]).unwrap();
+        let chunks = split(&x, 1, &[1, 2])?;
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].shape, vec![2, 1]);
         assert_eq!(chunks[1].shape, vec![2, 2]);
         assert_eq!(chunks[0].data, vec![1.0, 4.0]);
         assert_eq!(chunks[1].data, vec![2.0, 3.0, 5.0, 6.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_tile() {
+    fn test_tile() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![1, 3]);
-        let y = tile(&x, &[2, 1]).unwrap();
+        let y = tile(&x, &[2, 1])?;
         assert_eq!(y.shape, vec![2, 3]);
         assert_eq!(y.data, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_tile_2d() {
+    fn test_tile_2d() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
-        let y = tile(&x, &[1, 2]).unwrap();
+        let y = tile(&x, &[1, 2])?;
         assert_eq!(y.shape, vec![2, 4]);
         assert_eq!(y.data, vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+        Ok(())
     }
 
     #[test]

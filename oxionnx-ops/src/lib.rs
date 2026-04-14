@@ -5,11 +5,15 @@
 pub mod simd_ops;
 
 pub mod attention;
+pub mod bitwise;
 pub mod comparison;
 pub mod control_flow;
 pub mod conv;
+pub mod dsp;
 pub mod einsum;
+pub mod flash;
 pub mod indexing;
+pub mod kv_cache;
 pub mod math;
 pub mod ml;
 pub mod ml_svm;

@@ -48,6 +48,7 @@ fn run_single_op(
         nodes: vec![node],
         input_names: input_names.iter().map(|s| s.to_string()).collect(),
         output_names: vec![node_output.to_string()],
+        ..Default::default()
     };
     let mut w: HashMap<String, Tensor> = HashMap::new();
     for (name, tensor) in weights {
@@ -79,6 +80,7 @@ fn run_single_op_multi_output(
         nodes: vec![node],
         input_names: input_names.iter().map(|s| s.to_string()).collect(),
         output_names: node_outputs.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     };
     let mut w: HashMap<String, Tensor> = HashMap::new();
     for (name, tensor) in weights {
@@ -567,6 +569,7 @@ fn test_concat_axis0() {
         nodes: vec![node],
         input_names: vec!["a".to_string(), "b".to_string()],
         output_names: vec!["out".to_string()],
+        ..Default::default()
     };
     let session = Session::builder()
         .with_optimization_level(OptLevel::None)
@@ -1108,6 +1111,7 @@ fn test_concat_axis1() {
         nodes: vec![node],
         input_names: vec!["a".to_string(), "b".to_string()],
         output_names: vec!["out".to_string()],
+        ..Default::default()
     };
     let session = Session::builder()
         .with_optimization_level(OptLevel::None)
@@ -1215,6 +1219,264 @@ fn test_reduce_min() {
     let out = outputs.get("out").unwrap();
     assert_tensor_approx(out, &[1.0, 2.0], 1e-5);
 }
+
+// ── Stage-3 J-tests: 12 new operators ────────────────────────────────────────
+
+// test_reduce_l1
+#[test]
+fn test_reduce_l1() {
+    // input [[1,2],[3,4]] shape [2,2], axes=[1], keepdims=false → [|1|+|2|, |3|+|4|] = [3, 7]
+    let mut attrs = Attributes::default();
+    attrs.int_lists.insert("axes".to_string(), vec![1]);
+    attrs.ints.insert("keepdims".to_string(), 0);
+
+    let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+    let outputs = run_single_op(
+        OpKind::ReduceL1,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        attrs,
+    );
+    let out = outputs.get("out").unwrap();
+    assert_tensor_approx(out, &[3.0, 7.0], 1e-5);
+}
+
+// test_reduce_l2
+#[test]
+fn test_reduce_l2() {
+    // input [3, 4] shape [2], axes=[] (reduce all) → sqrt(9+16) = 5.0
+    let attrs = Attributes::default(); // empty axes = reduce all
+    let x = Tensor::new(vec![3.0, 4.0], vec![2]);
+    let outputs = run_single_op(
+        OpKind::ReduceL2,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        attrs,
+    );
+    let out = outputs.get("out").unwrap();
+    assert_tensor_approx(out, &[5.0], 1e-5);
+}
+
+// test_reduce_log_sum
+#[test]
+fn test_reduce_log_sum() {
+    // input [1, 1, 1] shape [3], axes=[] → log(1+1+1) = ln(3) ≈ 1.0986
+    let attrs = Attributes::default();
+    let x = Tensor::new(vec![1.0, 1.0, 1.0], vec![3]);
+    let outputs = run_single_op(
+        OpKind::ReduceLogSum,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        attrs,
+    );
+    let out = outputs.get("out").unwrap();
+    let expected = 3.0f32.ln();
+    assert!(
+        (out.data[0] - expected).abs() < 1e-5,
+        "reduce_log_sum: got {}, expected {}",
+        out.data[0],
+        expected
+    );
+}
+
+// test_reduce_log_sum_exp
+#[test]
+fn test_reduce_log_sum_exp() {
+    // input [0, 1, 2] shape [3], axes=[] → log(e^0 + e^1 + e^2)
+    let attrs = Attributes::default();
+    let x = Tensor::new(vec![0.0, 1.0, 2.0], vec![3]);
+    let outputs = run_single_op(
+        OpKind::ReduceLogSumExp,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        attrs,
+    );
+    let out = outputs.get("out").unwrap();
+    let expected = (0.0f32.exp() + 1.0f32.exp() + 2.0f32.exp()).ln();
+    assert!(
+        (out.data[0] - expected).abs() < 1e-4,
+        "reduce_log_sum_exp: got {}, expected {}",
+        out.data[0],
+        expected
+    );
+}
+
+// test_reduce_sum_square
+#[test]
+fn test_reduce_sum_square() {
+    // input [2, 3, 4] shape [3], axes=[] → 4+9+16 = 29.0
+    let attrs = Attributes::default();
+    let x = Tensor::new(vec![2.0, 3.0, 4.0], vec![3]);
+    let outputs = run_single_op(
+        OpKind::ReduceSumSquare,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        attrs,
+    );
+    let out = outputs.get("out").unwrap();
+    assert_tensor_approx(out, &[29.0], 1e-5);
+}
+
+// test_bitwise_and
+#[test]
+fn test_bitwise_and() {
+    // [5, 3] & [3, 6] = [1, 2]
+    let a = Tensor::new(vec![5.0, 3.0], vec![2]);
+    let b = Tensor::new(vec![3.0, 6.0], vec![2]);
+    let outputs = run_single_op(
+        OpKind::BitwiseAnd,
+        vec![("a", a), ("b", b)],
+        vec![],
+        vec!["a", "b"],
+        vec!["a", "b"],
+        "out",
+        Attributes::default(),
+    );
+    let out = outputs.get("out").unwrap();
+    assert_eq!(out.data[0] as u32, 5u32 & 3u32); // 1
+    assert_eq!(out.data[1] as u32, 3u32 & 6u32); // 2
+}
+
+// test_bitwise_or
+#[test]
+fn test_bitwise_or() {
+    // [5, 3] | [3, 6] = [7, 7]
+    let a = Tensor::new(vec![5.0, 3.0], vec![2]);
+    let b = Tensor::new(vec![3.0, 6.0], vec![2]);
+    let outputs = run_single_op(
+        OpKind::BitwiseOr,
+        vec![("a", a), ("b", b)],
+        vec![],
+        vec!["a", "b"],
+        vec!["a", "b"],
+        "out",
+        Attributes::default(),
+    );
+    let out = outputs.get("out").unwrap();
+    assert_eq!(out.data[0] as u32, 5u32 | 3u32); // 7
+    assert_eq!(out.data[1] as u32, 3u32 | 6u32); // 7
+}
+
+// test_bitwise_xor
+#[test]
+fn test_bitwise_xor() {
+    // [5, 3] ^ [3, 6] = [6, 5]
+    let a = Tensor::new(vec![5.0, 3.0], vec![2]);
+    let b = Tensor::new(vec![3.0, 6.0], vec![2]);
+    let outputs = run_single_op(
+        OpKind::BitwiseXor,
+        vec![("a", a), ("b", b)],
+        vec![],
+        vec!["a", "b"],
+        vec!["a", "b"],
+        "out",
+        Attributes::default(),
+    );
+    let out = outputs.get("out").unwrap();
+    assert_eq!(out.data[0] as u32, 5u32 ^ 3u32); // 6
+    assert_eq!(out.data[1] as u32, 3u32 ^ 6u32); // 5
+}
+
+// test_bitwise_not
+#[test]
+fn test_bitwise_not() {
+    // !0u32 = 4294967295 (u32::MAX)
+    let x = Tensor::new(vec![0.0], vec![1]);
+    let outputs = run_single_op(
+        OpKind::BitwiseNot,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        Attributes::default(),
+    );
+    let out = outputs.get("out").unwrap();
+    assert_eq!(
+        out.data[0] as u32, !0u32,
+        "bitwise_not(0) should be u32::MAX as u32"
+    );
+}
+
+// test_size_op
+#[test]
+fn test_size_op() {
+    // input shape [2, 3] → num elements = 6
+    let x = Tensor::new(vec![1.0; 6], vec![2, 3]);
+    let outputs = run_single_op(
+        OpKind::Size,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        Attributes::default(),
+    );
+    let out = outputs.get("out").unwrap();
+    assert_eq!(out.data[0], 6.0, "Size of [2,3] tensor should be 6");
+}
+
+// test_hardmax
+#[test]
+fn test_hardmax() {
+    // input [1, 3, 2] shape [3], max at index 1 → [0, 1, 0]
+    let mut attrs = Attributes::default();
+    attrs.ints.insert("axis".to_string(), 0);
+
+    let x = Tensor::new(vec![1.0, 3.0, 2.0], vec![3]);
+    let outputs = run_single_op(
+        OpKind::Hardmax,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        attrs,
+    );
+    let out = outputs.get("out").unwrap();
+    assert_eq!(out.shape, vec![3]);
+    assert_tensor_approx(out, &[0.0, 1.0, 0.0], 1e-5);
+}
+
+// test_shrink
+#[test]
+fn test_shrink() {
+    // input [-2, 0, 2] shape [3], lambd=0.5, bias=0.0
+    // -2 < -0.5 → -2 + 0.0 = -2; 0 in [-0.5,0.5] → 0; 2 > 0.5 → 2 - 0.0 = 2
+    let mut attrs = Attributes::default();
+    attrs.floats.insert("lambd".to_string(), 0.5);
+    attrs.floats.insert("bias".to_string(), 0.0);
+
+    let x = Tensor::new(vec![-2.0, 0.0, 2.0], vec![3]);
+    let outputs = run_single_op(
+        OpKind::Shrink,
+        vec![("x", x)],
+        vec![],
+        vec!["x"],
+        vec!["x"],
+        "out",
+        attrs,
+    );
+    let out = outputs.get("out").unwrap();
+    assert_tensor_approx(out, &[-2.0, 0.0, 2.0], 1e-5);
+}
+
+// ── End Stage-3 J-tests ───────────────────────────────────────────────────────
 
 // test_neg
 #[test]

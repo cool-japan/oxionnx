@@ -675,13 +675,85 @@ fn generate_skipgrams(
     }
 }
 
-/// ONNX-ML StringNormalizer operator (stub — returns Unsupported).
+/// ONNX-ML StringNormalizer operator.
 ///
-/// String tensors are not supported in oxionnx, so this always returns an error.
-pub fn string_normalizer(_ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
-    Err(OnnxError::Unsupported(
-        "StringNormalizer requires string tensor support which is not available".into(),
-    ))
+/// Since oxionnx uses f32 tensors, strings are encoded as sequences of byte values:
+/// each f32 element represents one byte of UTF-8 data, with 0.0 acting as a string
+/// delimiter (null terminator).
+///
+/// Attributes:
+///   - `case_change_action`: `"LOWER"`, `"UPPER"`, or `"NONE"` (default `"NONE"`)
+///   - `is_case_sensitive`: int (default 1) — controls stopword matching case sensitivity
+///   - `locale`: string (optional, currently unused; Pure Rust, no ICU)
+///   - `stopwords`: string list — words to filter out
+///
+/// Input 0: X \[N\] — f32 tensor encoding null-terminated UTF-8 strings
+/// Output 0: Y — f32 tensor with normalized strings (same encoding)
+pub fn string_normalizer(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+    let x = ctx.input(0)?;
+    let attrs = ctx.attrs();
+
+    let case_action = attrs.s("case_change_action");
+    let is_case_sensitive = attrs.i("is_case_sensitive", 1) != 0;
+    let stopwords = attrs.string_list("stopwords");
+
+    // ── Step 1: Decode f32 byte stream into strings ─────────────────────
+    // Each f32 is treated as one byte value. Strings are delimited by 0.0.
+    let mut strings: Vec<String> = Vec::new();
+    let mut current_bytes: Vec<u8> = Vec::new();
+
+    for &val in &x.data {
+        let byte_val = val as u8;
+        if byte_val == 0 {
+            // Null terminator — flush the current string
+            let s = String::from_utf8(current_bytes.clone()).unwrap_or_default();
+            strings.push(s);
+            current_bytes.clear();
+        } else {
+            current_bytes.push(byte_val);
+        }
+    }
+    // If the stream doesn't end with a null terminator, flush remaining bytes
+    if !current_bytes.is_empty() {
+        let s = String::from_utf8(current_bytes).unwrap_or_default();
+        strings.push(s);
+    }
+
+    // ── Step 2: Filter stopwords ────────────────────────────────────────
+    if !stopwords.is_empty() {
+        strings.retain(|s| {
+            if is_case_sensitive {
+                !stopwords.iter().any(|sw| sw == s)
+            } else {
+                let s_lower = s.to_lowercase();
+                !stopwords.iter().any(|sw| sw.to_lowercase() == s_lower)
+            }
+        });
+    }
+
+    // ── Step 3: Apply case transformation ───────────────────────────────
+    for s in &mut strings {
+        match case_action {
+            "LOWER" => *s = s.to_lowercase(),
+            "UPPER" => *s = s.to_uppercase(),
+            _ => {} // "NONE" or empty — no change
+        }
+    }
+
+    // ── Step 4: Re-encode strings back to f32 tensor ────────────────────
+    let mut output: Vec<f32> = Vec::new();
+    for (i, s) in strings.iter().enumerate() {
+        for &b in s.as_bytes() {
+            output.push(b as f32);
+        }
+        // Add null terminator between strings (but not after the last one)
+        if i + 1 < strings.len() {
+            output.push(0.0);
+        }
+    }
+
+    let len = output.len();
+    Ok(vec![Tensor::new(output, vec![len])])
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -692,11 +764,11 @@ mod tests {
     use oxionnx_core::graph::{Attributes, Node, OpKind};
 
     /// Helper to build a minimal OpContext for testing.
-    fn make_context<'a>(
+    fn make_context(
         op: OpKind,
-        inputs: Vec<Option<&'a Tensor>>,
+        inputs: Vec<Option<&Tensor>>,
         attrs: Attributes,
-    ) -> (Node, Vec<Option<&'a Tensor>>) {
+    ) -> (Node, Vec<Option<&Tensor>>) {
         let node = Node {
             op,
             name: "test_node".to_string(),
@@ -1113,5 +1185,213 @@ mod tests {
         assert!((y.data[0] - 2.0).abs() < 1e-5); // [1,2] count
         assert!((y.data[1] - 1.0).abs() < 1e-5); // [2,3] count
         assert!((y.data[2] - 1.0).abs() < 1e-5); // [3,1] count
+    }
+
+    // -----------------------------------------------------------------------
+    // StringNormalizer tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: encode a slice of strings into a null-separated f32 tensor.
+    fn encode_strings(strings: &[&str]) -> Tensor {
+        let mut data: Vec<f32> = Vec::new();
+        for (i, s) in strings.iter().enumerate() {
+            for &b in s.as_bytes() {
+                data.push(b as f32);
+            }
+            if i + 1 < strings.len() {
+                data.push(0.0); // null separator
+            }
+        }
+        let len = data.len();
+        Tensor::new(data, vec![len])
+    }
+
+    /// Helper: decode a f32 tensor back into strings (split on 0.0).
+    fn decode_strings(tensor: &Tensor) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut current = Vec::new();
+        for &v in &tensor.data {
+            let b = v as u8;
+            if b == 0 {
+                result.push(String::from_utf8(current.clone()).unwrap_or_default());
+                current.clear();
+            } else {
+                current.push(b);
+            }
+        }
+        if !current.is_empty() {
+            result.push(String::from_utf8(current).unwrap_or_default());
+        }
+        result
+    }
+
+    #[test]
+    fn test_string_normalizer_lowercase() {
+        let x = encode_strings(&["Hello", "WORLD", "Foo"]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "LOWER".into());
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("string_normalizer LOWER failed");
+
+        let decoded = decode_strings(&result[0]);
+        assert_eq!(decoded, vec!["hello", "world", "foo"]);
+    }
+
+    #[test]
+    fn test_string_normalizer_uppercase() {
+        let x = encode_strings(&["Hello", "world"]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "UPPER".into());
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("string_normalizer UPPER failed");
+
+        let decoded = decode_strings(&result[0]);
+        assert_eq!(decoded, vec!["HELLO", "WORLD"]);
+    }
+
+    #[test]
+    fn test_string_normalizer_none_action() {
+        let x = encode_strings(&["Hello", "World"]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "NONE".into());
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("string_normalizer NONE failed");
+
+        let decoded = decode_strings(&result[0]);
+        assert_eq!(decoded, vec!["Hello", "World"]);
+    }
+
+    #[test]
+    fn test_string_normalizer_stopwords_case_sensitive() {
+        let x = encode_strings(&["hello", "the", "world", "The"]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "NONE".into());
+        attrs.ints.insert("is_case_sensitive".into(), 1);
+        attrs
+            .string_lists
+            .insert("stopwords".into(), vec!["the".into()]);
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("stopwords case-sensitive failed");
+
+        let decoded = decode_strings(&result[0]);
+        // "the" removed, "The" kept (case sensitive)
+        assert_eq!(decoded, vec!["hello", "world", "The"]);
+    }
+
+    #[test]
+    fn test_string_normalizer_stopwords_case_insensitive() {
+        let x = encode_strings(&["hello", "the", "world", "The"]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "NONE".into());
+        attrs.ints.insert("is_case_sensitive".into(), 0);
+        attrs
+            .string_lists
+            .insert("stopwords".into(), vec!["the".into()]);
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("stopwords case-insensitive failed");
+
+        let decoded = decode_strings(&result[0]);
+        // Both "the" and "The" removed (case insensitive)
+        assert_eq!(decoded, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_string_normalizer_stopwords_with_case_change() {
+        // Stopwords are filtered BEFORE case change is applied
+        let x = encode_strings(&["Hello", "a", "World"]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "UPPER".into());
+        attrs.ints.insert("is_case_sensitive".into(), 1);
+        attrs
+            .string_lists
+            .insert("stopwords".into(), vec!["a".into()]);
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("stopwords + case change failed");
+
+        let decoded = decode_strings(&result[0]);
+        assert_eq!(decoded, vec!["HELLO", "WORLD"]);
+    }
+
+    #[test]
+    fn test_string_normalizer_empty_input() {
+        // Empty tensor
+        let x = Tensor::new(vec![], vec![0]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "LOWER".into());
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("empty input failed");
+
+        assert!(result[0].data.is_empty());
+    }
+
+    #[test]
+    fn test_string_normalizer_single_string() {
+        let x = encode_strings(&["OnlyOne"]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "LOWER".into());
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("single string failed");
+
+        let decoded = decode_strings(&result[0]);
+        assert_eq!(decoded, vec!["onlyone"]);
+    }
+
+    #[test]
+    fn test_string_normalizer_all_stopwords_removed() {
+        let x = encode_strings(&["a", "the"]);
+
+        let mut attrs = Attributes::default();
+        attrs
+            .strings
+            .insert("case_change_action".into(), "NONE".into());
+        attrs
+            .string_lists
+            .insert("stopwords".into(), vec!["a".into(), "the".into()]);
+
+        let (node, inputs) = make_context(OpKind::StringNormalizer, vec![Some(&x)], attrs);
+        let ctx = ctx_from(&node, &inputs);
+        let result = string_normalizer(&ctx).expect("all stopwords removed failed");
+
+        assert!(result[0].data.is_empty());
     }
 }

@@ -249,6 +249,7 @@ mod tests {
             nodes,
             input_names: vec!["x".to_string()],
             output_names: vec!["out".to_string()],
+            ..Default::default()
         }
     }
 

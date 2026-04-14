@@ -13,7 +13,7 @@ pub mod tensor;
 
 pub use dtype::{promote, DType, TensorStorage, TypedTensor};
 pub use error::OnnxError;
-pub use graph::{Attributes, Graph, Node, OpKind};
+pub use graph::{Attributes, Dim, Graph, Node, OpKind, TensorInfo};
 pub use operator::{OpContext, Operator, OperatorRegistry};
 pub use tensor::{
     compute_strides, convert_layout, nchw_to_nhwc, nhwc_to_nchw, BroadcastIter, Tensor,

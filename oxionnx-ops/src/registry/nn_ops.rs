@@ -448,3 +448,32 @@ impl Operator for MeanVarianceNormalizationOp {
         Ok(vec![nn::mean_variance_normalization(ctx.input(0)?, &axes)?])
     }
 }
+
+// ── Hardmax ──────────────────────────────────────────────────────────────────
+
+pub struct HardmaxOp;
+impl Operator for HardmaxOp {
+    fn op_type(&self) -> &str {
+        "Hardmax"
+    }
+    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let x = ctx.input(0)?;
+        let axis = ctx.attrs().i("axis", -1);
+        Ok(vec![nn::hardmax(x, axis)?])
+    }
+}
+
+// ── Shrink ───────────────────────────────────────────────────────────────────
+
+pub struct ShrinkOp;
+impl Operator for ShrinkOp {
+    fn op_type(&self) -> &str {
+        "Shrink"
+    }
+    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let x = ctx.input(0)?;
+        let bias = ctx.attrs().f("bias", 0.0);
+        let lambd = ctx.attrs().f("lambd", 0.5);
+        Ok(vec![nn::shrink(x, bias, lambd)])
+    }
+}

@@ -1,11 +1,11 @@
-# OxiONNX 0.1.0 -- Pure Rust ONNX Inference Engine
+# OxiONNX 0.1.1 -- Pure Rust ONNX Inference Engine
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
 **Author:** COOLJAPAN OU (Team Kitasan)
 
-**Current stats (2026-03-26):** ~30,104 SLoC (Rust code) | 147 OpKind variants | 595 tests passing | workspace layout (5 crates)
-**Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), optional `wgpu`/`pollster` (gpu feature)
+**Current stats (2026-04-14):** ~47,829 SLoC (Rust code) | 167 OpKind variants | 1,023 tests passing | workspace layout (6 crates)
+**Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)
 **Zero C/C++ dependencies.**
 
 ---
@@ -188,6 +188,16 @@ High-priority operators not yet tracked above:
 - [x] Compress
 - [x] Unique
 - [x] StringNormalizer, TfIdfVectorizer (text operators)
+- [x] DFT (opset 17)
+- [x] STFT (opset 17)
+- [x] HannWindow (opset 17)
+- [x] HammingWindow (opset 17)
+- [x] BlackmanWindow (opset 17)
+- [x] MelWeightMatrix (opset 17)
+- [x] Bernoulli (opset 15)
+- [x] ReduceL1, ReduceL2, ReduceLogSum, ReduceLogSumExp, ReduceSumSquare
+- [x] BitwiseAnd, BitwiseOr, BitwiseXor, BitwiseNot (opset 18)
+- [x] Size, Hardmax, Shrink
 
 ---
 
@@ -256,7 +266,12 @@ Summary of key items:
       .with_execution_provider(ExecutionProvider::Cpu)
       .load("model.onnx")?
   ```
-- [x] Input/output shape introspection API (partial -- input_names/output_names exist, shapes via model_info)
+- [x] Input/output shape introspection API -- `input_info()` / `output_info()` return `TensorInfo` with dtype, static shape, and symbolic `dim_params`
+- [x] Symbolic shape API -- `TensorInfo::symbolic_shape()` returns `Vec<Dim>` where `Dim` is `Static(usize)` / `Symbol(String)` / `Unknown`
+- [x] Model metadata API -- `Session::metadata()` returns `ModelMetadata` with `producer_name`, `producer_version`, `domain`, `ir_version`, `opset_imports`, `custom_metadata`
+- [x] Multi-dtype inference API -- `Session::run_typed()` accepts/returns `TypedTensor` (i64, f16, bf16, i32, bool, …) via internal f32 conversion
+- [x] `inputs_typed!` macro for ergonomic multi-dtype input construction
+- [x] IOBinding -- `IoBinding` / `Session::run_with_binding()` for zero-allocation repeated inference (output buffers reused via `copy_from_slice` when shape matches)
 - [x] Model profiling API -- per-node execution times, memory usage breakdown
 - [x] Typed inference API with compile-time shape checking (advanced, optional)
 - [x] `no_std` support for `oxionnx-core` (alloc only, no file I/O)
@@ -281,7 +296,7 @@ Summary of key items:
 - [x] Top-level README with:
   - [x] Feature overview and architecture diagram
   - [x] Supported opset table (opset version, operator name, status)
-  - [ ] Performance comparison table (vs onnxruntime, tract, etc.)
+  - [x] Performance comparison table (vs onnxruntime, tract, etc.)
   - [x] Quickstart code example
 - [x] Keywords: `onnx`, `inference`, `machine-learning`, `neural-network`, `pure-rust`
 - [x] Categories: `science`, `algorithms`, `wasm`
@@ -291,6 +306,178 @@ Summary of key items:
 - [x] Dependency audit -- ensure all deps are well-maintained and compatible
 - [x] MSRV policy documented (minimum supported Rust version)
 - [x] CHANGELOG.md maintained per release
+
+---
+
+## 12. Performance & Correctness Enhancements (v0.1.2)
+
+### RNN Operator Completeness
+- [x] Fix `sequence_lens` parameter -- variable-length sequences now correctly masked per batch element
+- [x] LSTM peephole connections (W_ci, W_co, W_cf weight tensors for gates)
+- [x] Per-gate activation function selection (`activations` attribute: Sigmoid, Tanh, Relu)
+- [x] Comprehensive LSTM/GRU unit tests (14 tests: bidirectional, variable-length, peephole, custom activations)
+
+### Flash Attention (Pure Rust)
+- [x] Block-wise tiled attention computation with O(1) extra memory per block
+- [x] Causal masking support (lower-triangular, with early-exit on future blocks)
+- [x] Online softmax (numerically stable, single-pass with running max/sum)
+- [x] Configurable block sizes (Br, Bc) for tuning across hardware
+- [x] Multi-head flash attention with head split/merge
+- [x] Short-sequence fallback to standard SDPA
+- [x] 16 tests (small match, causal, batch, stability at 256 tokens, block boundaries)
+
+### Multi-Query / Grouped-Query Attention
+- [x] Multi-Query Attention (MQA) -- single K/V head shared across Q heads via modular indexing
+- [x] Grouped-Query Attention (GQA) -- K/V head groups with configurable group size
+- [x] ALiBi positional bias support (geometric slopes, absolute distance bias)
+- [x] Comprehensive attention operator tests (22 tests: SDPA, MHA, MQA, GQA, ALiBi, causal, edge cases, numerical stability)
+
+### SIMD Horizontal Reductions
+- [x] SIMD `reduce_sum_f32` (NEON vaddvq_f32, AVX2 horizontal add, Kahan-compensated scalar)
+- [x] SIMD `reduce_max_f32` / `reduce_min_f32` (NEON vmaxvq/vminvq, AVX2 horizontal max/min)
+- [x] SIMD `dot_product_f32` (NEON vfmaq_f32, AVX2 _mm256_fmadd_ps)
+- [x] SIMD `reduce_mean_f32`
+- [x] Integration with ReduceSum/ReduceMax/ReduceMin/ReduceMean operator dispatch (#[cfg(feature = "simd")])
+- [x] 28 tests covering known values, large arrays, edge cases, NaN/Inf boundaries
+
+### Unique Operator Axis Mode
+- [x] Implement `axis` parameter for `Unique` operator (per-slice uniqueness along axis)
+- [x] Support sorted/unsorted modes, negative axis, 3D tensors
+- [x] 11 tests (rows, columns, sorted, negative axis, all-same, all-distinct, 3D, error cases)
+
+### Optimizer Fusion Enhancements
+- [x] Conv + Add + ReLU fusion (ResNet block shortcut pattern → ConvAddRelu fused op)
+- [x] Gather + Gather composition (compose indices for consecutive gathers on same axis)
+- [x] Softmax + Dropout elimination (inference-mode dropout is identity)
+- [x] Transpose + Reshape simplification (identity transpose before reshape, flatten patterns)
+- [x] 19 tests across all fusion patterns
+
+### Quantization Enhancements
+- [x] Asymmetric quantization (non-zero `zero_point`, per-tensor and per-channel)
+- [x] QLinearConv -- fully quantized INT8 convolution with im2col, per-channel scales, grouped support
+- [x] Dynamic quantization (runtime scale/zero_point computation, uint8 range)
+- [x] Optimized fully_quantized_matmul with precomputed row/column sums for zero_point correction
+- [x] 17 tests (asymmetric roundtrip, QLinearConv 1×1/3×3/grouped/per-channel, dynamic quant)
+
+### Mixed Precision Auto-Conversion
+- [x] f16-safe operator classification (40+ ops: activations, norm, softmax, shape, attention)
+- [x] f32-required operator classification (20+ ops: MatMul, Gemm, Conv, reductions, Pow/Exp/Log)
+- [x] Native f16 execution for element-wise ops (Relu, Add, Mul, Sub, Sigmoid, Tanh, Neg, Abs)
+- [x] f16 precision rounding for f16-safe ops without native paths
+- [x] Session run integration with profiling (ops marked with "(f16)" suffix)
+- [x] 36 tests (classification, f16 ops, broadcasting, end-to-end, profiling)
+
+---
+
+## 13. Performance & Architecture Enhancements (v0.1.3)
+
+### KV Cache for Autoregressive Inference
+- [x] Add `past_key_values: Option<&[(Tensor, Tensor)]>` parameter to SDPA, MHA, Flash Attention
+- [x] Incremental KV cache: concatenate new K/V with cached past along sequence dimension
+- [x] Cache-aware attention: compute Q against full (past+current) K/V
+- [x] KV cache management: ring buffer for long sequences exceeding max_seq_len
+- [x] Integration with session streaming API for token-by-token generation
+- [x] Benchmarks: GPT-2 generation latency with/without KV cache
+
+### Softmax / LayerNorm SIMD Acceleration
+- [x] SIMD-accelerated softmax inner loop (exp vectorization, NEON/AVX2)
+- [x] SIMD-accelerated LayerNorm (vectorized mean, variance, normalize)
+- [x] SIMD-accelerated GroupNorm (reuse LayerNorm SIMD path)
+- [x] Integration with `#[cfg(feature = "simd")]` dispatch in nn.rs
+
+### GPU Shader Expansion
+- [x] LayerNorm WGSL compute shader
+- [x] BatchNorm WGSL compute shader
+- [x] Transpose WGSL compute shader
+- [x] ReduceMean WGSL compute shader
+- [x] GPU dispatch table expansion in session/gpu_dispatch.rs
+
+### Conv2D Cache-Blocked im2col + Winograd F(2,3)
+- [x] Cache-blocked im2col: process output in spatial tiles for L1 cache locality
+- [x] Winograd F(2,3) transform for 3×3 stride=1 dilation=1 convolutions (2.25× fewer multiplications)
+- [x] Auto-select: Winograd for 3×3 s1d1, cache-blocked im2col otherwise
+
+### Memory Pool Improvements
+- [x] Enable memory pool by default in SessionBuilder
+- [x] Size-class bucketing: tiny (<512B), small (<4KB), medium (<256KB), large
+- [x] Fragmentation metric: track wasted bytes, trigger compaction above threshold
+- [x] Pool statistics API: alloc count, reuse count, peak usage, fragmentation ratio
+
+### Robustness & Configuration
+- [x] Replace all .expect()/.unwrap() in production code with proper Result chaining
+- [x] Thread pool: implement per-session rayon::ThreadPool via ThreadPoolBuilder
+- [x] Thread count configuration: honor with_intra_threads(N) for op-internal parallelism
+
+---
+
+## 14. Performance & Runtime Enhancements (v0.1.4)
+
+### SIMD Elementwise Expansion + Batched MatMul Parallelism
+- [x] SIMD `simd_sub` / `simd_div` -- NEON/AVX2/scalar paths for subtraction and division
+- [x] SIMD `simd_neg` / `simd_abs` / `simd_sqrt` / `simd_log` -- unary SIMD kernels
+- [x] Integrate new SIMD ops into elementwise dispatch in math.rs (Sub, Div, Neg, Abs, Sqrt, Log)
+- [x] Parallelize batched MatMul with rayon (batch dim ≥ 4 → par_iter over batch slices)
+- [x] SIMD fast path for small MatMul (M×K < 64): avoid function call overhead, inline multiply-accumulate
+- [x] Tests: 20+ covering SIMD correctness, batched matmul parallelism, edge cases
+
+### KV Cache Robustness + Error Propagation
+- [x] Eliminate all unwrap()/expect() calls in kv_cache.rs (25+ instances) with proper Result chaining
+- [x] Add KvCacheError variant to OnnxError for cache-specific failures (bounds, shape, head count)
+- [x] Fix unwrap chains in cached_attention and cached_flash_attention (attention.rs, flash.rs)
+- [x] Add cache overflow recovery: auto-evict oldest entries when ring buffer wraps
+- [x] Tests: verify all 13 existing KV cache tests still pass + 6 new error-path tests
+
+### Dynamic Shape Runtime Resolution
+- [x] Resolve symbolic dimensions at runtime from actual input tensor shapes (batch_size, seq_len)
+- [x] Support varying batch sizes between consecutive `session.run()` calls
+- [x] Shape validation: check input shapes against model's expected symbolic layout
+- [x] Automatic intermediate tensor re-planning when input shapes change (lazy replanning)
+- [x] Tests: 12+ (dynamic batch, dynamic seq_len, shape mismatch errors, re-planning)
+
+### Critical-Path Operator Scheduling
+- [x] Graph cost model: estimate per-op cost from output volume × op-type weight table
+- [x] Critical-path scheduling: longest-remaining-path first within each topological level
+- [x] Priority queue execution: schedule ready-ops by estimated cost (heaviest first for CPUs)
+- [x] Integration with existing topological-depth parallelism in session/run.rs
+- [x] Tests: 10+ (cost estimation, scheduling order, correctness, regression)
+
+### SIMD-Accelerated im2col + Conv2D Pack
+- [x] Vectorize im2col data packing loop (NEON vld1q/vst1q, AVX2 _mm256_load/_mm256_store)
+- [x] Pack weight matrix for cache-friendly GEMM access pattern (row-major → panel layout)
+- [x] Stride-aware SIMD im2col for common stride=1 case (sequential memory → SIMD copy)
+- [x] Tests: 8+ (SIMD im2col correctness, pack/unpack roundtrip, performance regression)
+
+### Execution Provider Operator-Level Routing
+- [x] OperatorPlacement trait: per-op GPU/CPU routing decision at runtime
+- [x] Size-threshold auto-placement: GPU for large MatMul/Conv (output > 64KB), CPU for small ops
+- [x] Provider fallback chain: GPU → CPU with automatic data transfer management
+- [x] Session builder API: `.with_op_placement(OpPlacement::Auto)` / `.with_op_placement(OpPlacement::Manual(map))`
+- [x] Tests: 8+ (auto-placement, manual override, fallback, threshold tuning)
+
+---
+
+## 15. Future Roadmap (Deferred)
+
+### Phase D — Operator-Native TypedTensor Dispatch
+Full multi-dtype dispatch at the operator layer (80+ ops × 13 dtypes). Currently all
+inference runs through f32 internally; `run_typed` performs input→f32 and f32→output
+conversions. Native dispatch would avoid these round-trips for pure-integer or f16 models.
+- **Scope**: ~1040 monomorphizations; requires rearchitecting the `Operator` trait
+- **Deferred reason**: `run_typed` f32 conversion covers 90% of practical use cases
+- **Trigger**: user demand for lossless i64 tensors > 2^24 range without precision loss
+
+### Phase E — DirectML Execution Provider (Windows)
+Full implementation of DirectML (Direct Machine Learning, D3D12-based) execution provider
+for Windows GPU acceleration.
+- **Current state**: stub in `execution_providers.rs` (no-op, compiles)
+- **Dependencies**: `windows` crate, `d3d12` bindings — Windows-only
+- **Scope**: ~2 weeks of platform-specific work; separate initiative
+- **Trigger**: Windows-first deployment requirements from downstream projects
+
+### Phase F — Operator-Level IOBinding Reuse
+Extend `IoBinding` to allow individual operators to write directly into pre-allocated output
+buffers (skip the intermediate `HashMap<String, Tensor>` in `run_internal`). Requires
+changing the `Operator::execute` return contract.
 
 ---
 

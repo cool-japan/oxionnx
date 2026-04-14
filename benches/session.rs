@@ -72,6 +72,7 @@ fn build_linear_chain(
         nodes,
         input_names: vec![input_name.clone()],
         output_names: vec![output_name.clone()],
+        ..Default::default()
     };
 
     (graph, weights, input_name, output_name)
@@ -434,6 +435,7 @@ fn build_transformer_block(
         nodes,
         input_names: vec![input_name.clone()],
         output_names: vec!["output".to_string()],
+        ..Default::default()
     };
 
     (graph, weights, input_name, "output".to_string())
@@ -541,6 +543,7 @@ fn build_resnet_like(
         nodes,
         input_names: vec![input_name.clone()],
         output_names: vec![output_name.clone()],
+        ..Default::default()
     };
 
     (graph, weights, input_name, output_name)
@@ -851,6 +854,7 @@ fn bench_bert_like(c: &mut Criterion) {
         nodes: all_nodes,
         input_names: vec![input_name.clone()],
         output_names: vec![output_name.clone()],
+        ..Default::default()
     };
 
     let session = SessionBuilder::new()

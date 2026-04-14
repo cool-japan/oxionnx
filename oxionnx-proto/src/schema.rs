@@ -82,6 +82,10 @@ pub fn default_schemas() -> HashMap<String, OpSchema> {
         "Gelu",
         "SiLU",
         "NonZero",
+        "BitwiseNot",
+        "Size",
+        "Hardmax",
+        "Shrink",
     ] {
         add_schema(&mut schemas, op, 1, Some(1), 1, Some(1));
     }
@@ -177,6 +181,11 @@ pub fn default_schemas() -> HashMap<String, OpSchema> {
         "ReduceMax",
         "ReduceMin",
         "ReduceProd",
+        "ReduceL1",
+        "ReduceL2",
+        "ReduceLogSum",
+        "ReduceLogSumExp",
+        "ReduceSumSquare",
     ] {
         add_schema(&mut schemas, op, 1, Some(2), 1, Some(1));
     }
@@ -200,6 +209,9 @@ pub fn default_schemas() -> HashMap<String, OpSchema> {
         "And",
         "Or",
         "Xor",
+        "BitwiseAnd",
+        "BitwiseOr",
+        "BitwiseXor",
     ] {
         add_schema(&mut schemas, op, 2, Some(2), 1, Some(1));
     }

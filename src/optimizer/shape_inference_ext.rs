@@ -47,7 +47,10 @@ pub(crate) fn infer_ext_node_shapes(
         | OpKind::ThresholdedRelu
         | OpKind::LeakyRelu
         | OpKind::HardSigmoid
-        | OpKind::HardSwish => {
+        | OpKind::HardSwish
+        | OpKind::BitwiseNot
+        | OpKind::Hardmax
+        | OpKind::Shrink => {
             let shape = get_input_shape(node, 0, known)?;
             Some(vec![shape])
         }
@@ -98,8 +101,12 @@ pub(crate) fn infer_ext_node_shapes(
             Some(vec![shape])
         }
 
-        // ── Binary element-wise: Mod, BitShift ─────────────────────
-        OpKind::Mod | OpKind::BitShift => {
+        // ── Binary element-wise: Mod, BitShift, Bitwise ops ────────
+        OpKind::Mod
+        | OpKind::BitShift
+        | OpKind::BitwiseAnd
+        | OpKind::BitwiseOr
+        | OpKind::BitwiseXor => {
             let a = get_input_shape(node, 0, known)?;
             let b = get_input_shape(node, 1, known)?;
             let out = Tensor::broadcast_shape(&a, &b).ok()?;
@@ -126,7 +133,12 @@ pub(crate) fn infer_ext_node_shapes(
         | OpKind::ReduceSum
         | OpKind::ReduceMax
         | OpKind::ReduceMin
-        | OpKind::ReduceProd => infer_reduce_shape(node, known),
+        | OpKind::ReduceProd
+        | OpKind::ReduceL1
+        | OpKind::ReduceL2
+        | OpKind::ReduceLogSum
+        | OpKind::ReduceLogSumExp
+        | OpKind::ReduceSumSquare => infer_reduce_shape(node, known),
 
         // ArgMax, ArgMin: reduce one axis to 1 (keepdims) or remove it
         OpKind::ArgMax | OpKind::ArgMin => infer_arg_reduce_shape(node, known),
@@ -145,6 +157,8 @@ pub(crate) fn infer_ext_node_shapes(
         OpKind::AveragePool | OpKind::MaxPool => infer_pool_shape(node, known),
 
         // ── Shape ops ───────────────────────────────────────────────
+        OpKind::Size => Some(vec![vec![]]), // scalar output
+
         OpKind::Shape => {
             let shape = get_input_shape(node, 0, known)?;
             Some(vec![vec![shape.len()]])
@@ -221,7 +235,20 @@ pub(crate) fn infer_ext_node_shapes(
         }
 
         // ── Range: output length depends on start/limit/delta values ─
-        OpKind::Range => None,
+        OpKind::Range => {
+            let start_name = node.inputs.first()?;
+            let limit_name = node.inputs.get(1)?;
+            let delta_name = node.inputs.get(2)?;
+            // Only resolvable when all 3 inputs are constant initializers
+            let start = *weights.get(start_name)?.data.first()?;
+            let limit = *weights.get(limit_name)?.data.first()?;
+            let delta = *weights.get(delta_name)?.data.first()?;
+            if delta == 0.0 {
+                return None;
+            }
+            let n = ((limit - start) / delta).ceil().max(0.0) as usize;
+            Some(vec![vec![n]])
+        }
 
         // ── TopK: two outputs, both with reduced axis ───────────────
         OpKind::TopK => infer_topk_shape(node, known, weights),
@@ -281,6 +308,126 @@ pub(crate) fn infer_ext_node_shapes(
         | OpKind::SVMRegressor
         | OpKind::TfIdfVectorizer
         | OpKind::StringNormalizer => None,
+
+        // ── Audio / DSP ops ──────────────────────────────────────────────
+        //
+        // Window functions (HannWindow, HammingWindow, BlackmanWindow):
+        //   Output is 1-D [size] where `size` is the runtime scalar inputs[0].
+        //   The value is not available at graph-construction time in the general
+        //   case, so we cannot compute a concrete static shape here.
+        OpKind::HannWindow | OpKind::HammingWindow | OpKind::BlackmanWindow => {
+            let size_name = node.inputs.first()?;
+            if size_name.is_empty() {
+                return None;
+            }
+            let size_t = weights.get(size_name)?;
+            let size = *size_t.data.first()? as usize;
+            Some(vec![vec![size]])
+        }
+
+        // DFT:
+        //   Input shape is [B, L] or [B, L, 1|2]; output is [B, out_len, 2].
+        //   `out_len` = L when onesided=0, or L/2+1 when onesided=1.
+        //   When inputs[1] (optional dft_length override) is absent we know the
+        //   DFT length equals the signal length L and can produce a static shape.
+        //   If inputs[1] is present as a weight constant we can resolve that too,
+        //   but the common case is that it's absent.
+        OpKind::DFT => {
+            let in_shape = get_input_shape(node, 0, known)?;
+            if in_shape.len() < 2 {
+                return None;
+            }
+            let batch = in_shape[0];
+            let signal_len = in_shape[1];
+            // Only infer when the optional dft_length input is absent.
+            // (If it's present we'd need to read the weight tensor value.)
+            let has_dft_length_input = node.inputs.get(1).is_some_and(|s| !s.is_empty());
+            if has_dft_length_input {
+                // Cannot determine DFT length statically without the tensor value.
+                return None;
+            }
+            let n = signal_len;
+            let inverse = node.attrs.i("inverse", 0) != 0;
+            let onesided = if inverse {
+                false // ONNX spec: onesided is ignored for inverse DFT
+            } else {
+                node.attrs.i("onesided", 0) != 0
+            };
+            let out_len = if onesided { n / 2 + 1 } else { n };
+            Some(vec![vec![batch, out_len, 2]])
+        }
+
+        // STFT:
+        //   Output shape is [B, n_frames, n_dft, 2].
+        //   n_frames = (T - frame_length) / frame_step + 1.
+        //   n_dft    = frame_length/2+1 (onesided=1) or frame_length (onesided=0).
+        //   frame_step comes from inputs[1] (runtime scalar) and frame_length
+        //   from inputs[3] (runtime scalar) — these are not statically known.
+        //   Return None; shape is fully runtime-determined.
+        OpKind::STFT => {
+            // Inputs: signal[0], frame_step[1], window[2] (optional), frame_length[3] (optional)
+            // Output: [batch, n_frames, n_dft/2+1 or n_dft, 2]
+            let signal_shape = get_input_shape(node, 0, known)?;
+            if signal_shape.len() < 2 {
+                return None;
+            }
+            let batch = signal_shape[0];
+            let t_len = signal_shape[1];
+            let frame_step_name = node.inputs.get(1)?;
+            let frame_step = *weights.get(frame_step_name)?.data.first()? as usize;
+            if frame_step == 0 {
+                return None;
+            }
+            // Resolve frame_length: prefer explicit input[3], then window shape from input[2]
+            let frame_length: usize = {
+                let fl_name = node.inputs.get(3).map(|s| s.as_str()).unwrap_or("");
+                if !fl_name.is_empty() {
+                    if let Some(t) = weights.get(fl_name) {
+                        *t.data.first()? as usize
+                    } else {
+                        return None;
+                    }
+                } else {
+                    let w_name = node.inputs.get(2).map(|s| s.as_str()).unwrap_or("");
+                    if !w_name.is_empty() {
+                        get_input_shape(node, 2, known)?.first().copied()?
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            if frame_length == 0 || t_len < frame_length {
+                return None;
+            }
+            let n_frames = (t_len - frame_length) / frame_step + 1;
+            let onesided = node.attrs.i("onesided", 1) != 0;
+            let n_dft = if onesided {
+                frame_length / 2 + 1
+            } else {
+                frame_length
+            };
+            Some(vec![vec![batch, n_frames, n_dft, 2]])
+        }
+
+        // MelWeightMatrix:
+        //   Output shape [num_spectrogram_bins, num_mel_bins].
+        //   All five inputs are runtime scalar tensors; nothing is known statically.
+        OpKind::MelWeightMatrix => {
+            // Inputs: num_mel_bins[0], dft_length[1], ...
+            // Output: [dft_length/2+1, num_mel_bins]
+            let num_mel_name = node.inputs.first()?;
+            let dft_len_name = node.inputs.get(1)?;
+            let num_mel_bins = *weights.get(num_mel_name)?.data.first()? as usize;
+            let dft_length = *weights.get(dft_len_name)?.data.first()? as usize;
+            Some(vec![vec![dft_length / 2 + 1, num_mel_bins]])
+        }
+
+        // Bernoulli:
+        //   Output shape = input shape (direct pass-through). This IS static.
+        OpKind::Bernoulli => {
+            let shape = get_input_shape(node, 0, known)?;
+            Some(vec![shape])
+        }
 
         _ => None,
     }
@@ -1325,6 +1472,103 @@ mod tests {
         // output = indices[:-1] + data[0+2:] = [2] + [4] = [2, 4]
         assert_eq!(result.get("y"), Some(&vec![2, 4]));
     }
+
+    // ── Stage-3 J-tests: shape inference ─────────────────────────────────────
+
+    #[test]
+    fn test_range_shape_inference() {
+        // Range(start=0, limit=5, delta=1) → output shape [5]
+        let node = make_node(
+            OpKind::Range,
+            "range",
+            vec!["start", "limit", "delta"],
+            vec!["y"],
+        );
+        let nodes = vec![node];
+        let weights = weights_map(&[
+            ("start", vec![0.0], vec![1]),
+            ("limit", vec![5.0], vec![1]),
+            ("delta", vec![1.0], vec![1]),
+        ]);
+        let input_shapes = HashMap::new();
+
+        let result = infer_shapes(&nodes, &weights, &input_shapes);
+        assert_eq!(result.get("y"), Some(&vec![5]));
+    }
+
+    #[test]
+    fn test_hann_window_shape_inference() {
+        // HannWindow with size=8 → output shape [8]
+        let node = make_node(OpKind::HannWindow, "hann", vec!["size"], vec!["y"]);
+        let nodes = vec![node];
+        let weights = weights_map(&[("size", vec![8.0], vec![1])]);
+        let input_shapes = HashMap::new();
+
+        let result = infer_shapes(&nodes, &weights, &input_shapes);
+        assert_eq!(result.get("y"), Some(&vec![8]));
+    }
+
+    #[test]
+    fn test_stft_shape_inference() {
+        // signal shape [1, 16], frame_step=4, frame_length=8, onesided=1
+        // n_frames = (16 - 8) / 4 + 1 = 3
+        // n_dft   = 8 / 2 + 1 = 5
+        // output  = [1, 3, 5, 2]
+        let mut node = make_node(
+            OpKind::STFT,
+            "stft",
+            vec!["signal", "frame_step", "", "frame_length"],
+            vec!["y"],
+        );
+        node.attrs.ints.insert("onesided".to_string(), 1);
+        let nodes = vec![node];
+        let weights = weights_map(&[
+            ("frame_step", vec![4.0], vec![1]),
+            ("frame_length", vec![8.0], vec![1]),
+        ]);
+        let input_shapes = shapes_map(&[("signal", vec![1, 16])]);
+
+        let result = infer_shapes(&nodes, &weights, &input_shapes);
+        assert_eq!(result.get("y"), Some(&vec![1, 3, 5, 2]));
+    }
+
+    #[test]
+    fn test_mel_weight_matrix_shape_inference() {
+        // MelWeightMatrix: num_mel_bins=40, dft_length=512
+        // output: [dft_length/2+1, num_mel_bins] = [257, 40]
+        let node = make_node(
+            OpKind::MelWeightMatrix,
+            "mel",
+            vec!["num_mel", "dft_len"],
+            vec!["y"],
+        );
+        let nodes = vec![node];
+        let weights = weights_map(&[
+            ("num_mel", vec![40.0], vec![1]),
+            ("dft_len", vec![512.0], vec![1]),
+        ]);
+        let input_shapes = HashMap::new();
+
+        let result = infer_shapes(&nodes, &weights, &input_shapes);
+        assert_eq!(result.get("y"), Some(&vec![257, 40]));
+    }
+
+    #[test]
+    fn test_reduce_l1_shape_inference() {
+        // ReduceL1 on shape [2, 3] with axes=[1], keepdims=false → [2]
+        let mut node = make_node(OpKind::ReduceL1, "rl1", vec!["x"], vec!["y"]);
+        node.attrs.int_lists.insert("axes".to_string(), vec![1]);
+        node.attrs.ints.insert("keepdims".to_string(), 0);
+
+        let nodes = vec![node];
+        let weights = HashMap::new();
+        let input_shapes = shapes_map(&[("x", vec![2, 3])]);
+
+        let result = infer_shapes(&nodes, &weights, &input_shapes);
+        assert_eq!(result.get("y"), Some(&vec![2]));
+    }
+
+    // ── End Stage-3 J-tests ───────────────────────────────────────────────────
 
     #[test]
     fn test_shape_inference_onehot() {

@@ -277,6 +277,7 @@ fn build_bert_tiny_graph() -> (Graph, HashMap<String, Tensor>, String) {
         nodes,
         input_names: vec!["input_embed".into()],
         output_names: vec![current.clone()],
+        ..Default::default()
     };
 
     (graph, weights, current)

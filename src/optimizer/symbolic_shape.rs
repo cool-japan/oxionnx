@@ -185,7 +185,10 @@ fn infer_node_symbolic(
         | OpKind::Elu
         | OpKind::Selu
         | OpKind::ThresholdedRelu
-        | OpKind::Clip => {
+        | OpKind::Clip
+        | OpKind::BitwiseNot
+        | OpKind::Hardmax
+        | OpKind::Shrink => {
             let s = inputs.first().and_then(|o| *o)?;
             Some(vec![s.clone()])
         }
@@ -211,7 +214,15 @@ fn infer_node_symbolic(
         }
 
         // --- binary element-wise with broadcasting ---
-        OpKind::Add | OpKind::Sub | OpKind::Mul | OpKind::Div | OpKind::Pow | OpKind::Mod => {
+        OpKind::Add
+        | OpKind::Sub
+        | OpKind::Mul
+        | OpKind::Div
+        | OpKind::Pow
+        | OpKind::Mod
+        | OpKind::BitwiseAnd
+        | OpKind::BitwiseOr
+        | OpKind::BitwiseXor => {
             let a = inputs.first().and_then(|o| *o)?;
             let b = inputs.get(1).and_then(|o| *o)?;
             let out = broadcast_symbolic(a, b)?;

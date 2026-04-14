@@ -139,18 +139,41 @@ pub struct GpuContext {
     pub softmax_pass1_pipeline: wgpu::ComputePipeline,
     pub softmax_pass2_pipeline: wgpu::ComputePipeline,
     pub softmax_bind_group_layout: wgpu::BindGroupLayout,
-    // Element-wise pipelines (relu, sigmoid, gelu)
+    // Element-wise pipelines (relu, sigmoid, gelu, tanh, exp, sqrt, abs, neg, log, silu, leaky_relu)
     pub relu_pipeline: wgpu::ComputePipeline,
     pub sigmoid_pipeline: wgpu::ComputePipeline,
     pub gelu_pipeline: wgpu::ComputePipeline,
+    pub tanh_pipeline: wgpu::ComputePipeline,
+    pub exp_pipeline: wgpu::ComputePipeline,
+    pub sqrt_pipeline: wgpu::ComputePipeline,
+    pub abs_pipeline: wgpu::ComputePipeline,
+    pub neg_pipeline: wgpu::ComputePipeline,
+    pub log_pipeline: wgpu::ComputePipeline,
+    pub silu_pipeline: wgpu::ComputePipeline,
+    pub leaky_relu_pipeline: wgpu::ComputePipeline,
     pub elementwise_bind_group_layout: wgpu::BindGroupLayout,
+    // Binary element-wise pipelines (add, mul)
+    pub add_pipeline: wgpu::ComputePipeline,
+    pub mul_pipeline: wgpu::ComputePipeline,
+    pub binary_elementwise_bind_group_layout: wgpu::BindGroupLayout,
     // Reduction pipelines
     pub reduce_sum_pipeline: wgpu::ComputePipeline,
     pub reduce_max_pipeline: wgpu::ComputePipeline,
+    pub reduce_min_pipeline: wgpu::ComputePipeline,
+    pub reduce_mean_pipeline: wgpu::ComputePipeline,
     pub reduce_bind_group_layout: wgpu::BindGroupLayout,
     // Tiled matmul pipeline (shared memory, 16x16 tiles)
     pub tiled_matmul_pipeline: wgpu::ComputePipeline,
     pub tiled_matmul_bind_group_layout: wgpu::BindGroupLayout,
+    // LayerNorm pipeline (shared-memory parallel reduction)
+    pub layer_norm_pipeline: wgpu::ComputePipeline,
+    pub layer_norm_bind_group_layout: wgpu::BindGroupLayout,
+    // BatchNorm pipeline (inference-mode per-channel normalization)
+    pub batch_norm_pipeline: wgpu::ComputePipeline,
+    pub batch_norm_bind_group_layout: wgpu::BindGroupLayout,
+    // Transpose pipeline (general permutation)
+    pub transpose_pipeline: wgpu::ComputePipeline,
+    pub transpose_bind_group_layout: wgpu::BindGroupLayout,
     // Buffer pool
     pub pool: std::sync::Mutex<GpuBufferPool>,
     // Tensor location tracker for host-device transfer minimization
@@ -361,6 +384,108 @@ impl GpuContext {
             compilation_options: Default::default(),
             cache: None,
         });
+        let tanh_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("tanh_pipeline"),
+            layout: Some(&ew_pl),
+            module: &ew_shader,
+            entry_point: Some("op_tanh"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let exp_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("exp_pipeline"),
+            layout: Some(&ew_pl),
+            module: &ew_shader,
+            entry_point: Some("op_exp"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let sqrt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("sqrt_pipeline"),
+            layout: Some(&ew_pl),
+            module: &ew_shader,
+            entry_point: Some("op_sqrt"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let abs_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("abs_pipeline"),
+            layout: Some(&ew_pl),
+            module: &ew_shader,
+            entry_point: Some("op_abs"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let neg_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("neg_pipeline"),
+            layout: Some(&ew_pl),
+            module: &ew_shader,
+            entry_point: Some("op_neg"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let log_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("log_pipeline"),
+            layout: Some(&ew_pl),
+            module: &ew_shader,
+            entry_point: Some("op_log"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let silu_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("silu_pipeline"),
+            layout: Some(&ew_pl),
+            module: &ew_shader,
+            entry_point: Some("silu"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let leaky_relu_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("leaky_relu_pipeline"),
+                layout: Some(&ew_pl),
+                module: &ew_shader,
+                entry_point: Some("leaky_relu"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // --- Binary element-wise pipelines ---
+        let binary_ew_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("binary_elementwise_shader"),
+            source: wgpu::ShaderSource::Wgsl(BINARY_ELEMENTWISE_SHADER.into()),
+        });
+        // Binary EW BGL: a(read), b(read), output(rw), params(uniform)
+        let binary_ew_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("binary_ew_bgl"),
+            entries: &[
+                bgl_storage_ro(0),
+                bgl_storage_ro(1),
+                bgl_storage_rw(2),
+                bgl_uniform(3),
+            ],
+        });
+        let binary_ew_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("binary_ew_pl"),
+            bind_group_layouts: &[Some(&binary_ew_bgl)],
+            immediate_size: 0,
+        });
+        let add_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("add_pipeline"),
+            layout: Some(&binary_ew_pl),
+            module: &binary_ew_shader,
+            entry_point: Some("op_add"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let mul_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("mul_pipeline"),
+            layout: Some(&binary_ew_pl),
+            module: &binary_ew_shader,
+            entry_point: Some("op_mul"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // --- Reduction pipelines ---
         let reduce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -392,6 +517,15 @@ impl GpuContext {
                 layout: Some(&reduce_pl),
                 module: &reduce_shader,
                 entry_point: Some("reduce_max"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let reduce_min_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("reduce_min_pipeline"),
+                layout: Some(&reduce_pl),
+                module: &reduce_shader,
+                entry_point: Some("reduce_min"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -461,6 +595,107 @@ impl GpuContext {
                 cache: None,
             });
 
+        // --- ReduceMean pipeline (reuses reduce shader + BGL) ---
+        let reduce_mean_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("reduce_mean_pipeline"),
+                layout: Some(&reduce_pl),
+                module: &reduce_shader,
+                entry_point: Some("reduce_mean"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // --- LayerNorm pipeline ---
+        let ln_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("layer_norm_shader"),
+            source: wgpu::ShaderSource::Wgsl(LAYER_NORM_SHADER.into()),
+        });
+        let ln_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("layer_norm_bgl"),
+            entries: &[
+                bgl_storage_ro(0), // input
+                bgl_storage_ro(1), // scale
+                bgl_storage_ro(2), // bias
+                bgl_storage_rw(3), // output
+                bgl_uniform(4),    // params
+            ],
+        });
+        let ln_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("layer_norm_pl"),
+            bind_group_layouts: &[Some(&ln_bgl)],
+            immediate_size: 0,
+        });
+        let layer_norm_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("layer_norm_pipeline"),
+                layout: Some(&ln_pl),
+                module: &ln_shader,
+                entry_point: Some("layer_norm"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // --- BatchNorm pipeline (inference) ---
+        let bn_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("batch_norm_shader"),
+            source: wgpu::ShaderSource::Wgsl(BATCH_NORM_SHADER.into()),
+        });
+        let bn_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("batch_norm_bgl"),
+            entries: &[
+                bgl_storage_ro(0), // input
+                bgl_storage_ro(1), // scale
+                bgl_storage_ro(2), // bias
+                bgl_storage_ro(3), // mean
+                bgl_storage_ro(4), // variance
+                bgl_storage_rw(5), // output
+                bgl_uniform(6),    // params
+            ],
+        });
+        let bn_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("batch_norm_pl"),
+            bind_group_layouts: &[Some(&bn_bgl)],
+            immediate_size: 0,
+        });
+        let batch_norm_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("batch_norm_pipeline"),
+                layout: Some(&bn_pl),
+                module: &bn_shader,
+                entry_point: Some("batch_norm"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // --- Transpose pipeline ---
+        let tr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("transpose_shader"),
+            source: wgpu::ShaderSource::Wgsl(TRANSPOSE_SHADER.into()),
+        });
+        let tr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("transpose_bgl"),
+            entries: &[
+                bgl_storage_ro(0), // input
+                bgl_storage_rw(1), // output
+                bgl_storage_ro(2), // perm_data (input_strides, output_strides, perm)
+                bgl_uniform(3),    // params
+            ],
+        });
+        let tr_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("transpose_pl"),
+            bind_group_layouts: &[Some(&tr_bgl)],
+            immediate_size: 0,
+        });
+        let transpose_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("transpose_pipeline"),
+            layout: Some(&tr_pl),
+            module: &tr_shader,
+            entry_point: Some("transpose_op"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Some(Self {
             device,
             queue,
@@ -472,12 +707,31 @@ impl GpuContext {
             relu_pipeline,
             sigmoid_pipeline,
             gelu_pipeline,
+            tanh_pipeline,
+            exp_pipeline,
+            sqrt_pipeline,
+            abs_pipeline,
+            neg_pipeline,
+            log_pipeline,
+            silu_pipeline,
+            leaky_relu_pipeline,
             elementwise_bind_group_layout: ew_bgl,
+            add_pipeline,
+            mul_pipeline,
+            binary_elementwise_bind_group_layout: binary_ew_bgl,
             reduce_sum_pipeline,
             reduce_max_pipeline,
+            reduce_min_pipeline,
             reduce_bind_group_layout: reduce_bgl,
             tiled_matmul_pipeline,
             tiled_matmul_bind_group_layout: tiled_bgl,
+            reduce_mean_pipeline,
+            layer_norm_pipeline,
+            layer_norm_bind_group_layout: ln_bgl,
+            batch_norm_pipeline,
+            batch_norm_bind_group_layout: bn_bgl,
+            transpose_pipeline,
+            transpose_bind_group_layout: tr_bgl,
             pool: std::sync::Mutex::new(GpuBufferPool::new(64)),
             tracker: std::sync::Mutex::new(GpuTensorTracker::new()),
         })
@@ -607,7 +861,7 @@ fn pass2_normalize(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Element-wise WGSL shader — relu, sigmoid, gelu.
+/// Element-wise WGSL shader — relu, sigmoid, gelu, tanh, exp, sqrt, abs, neg, log, silu, leaky_relu.
 ///
 /// Layout: input[len], output[len], params = { len, _pad }.
 const ELEMENTWISE_SHADER: &str = r#"
@@ -643,6 +897,64 @@ fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = 0.7978845608; // sqrt(2/pi)
     let inner = c * (x + 0.044715 * x * x * x);
     output[idx] = 0.5 * x * (1.0 + tanh(inner));
+}
+
+@compute @workgroup_size(256)
+fn op_tanh(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    output[idx] = tanh(input[idx]);
+}
+
+@compute @workgroup_size(256)
+fn op_exp(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    output[idx] = exp(input[idx]);
+}
+
+@compute @workgroup_size(256)
+fn op_sqrt(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    output[idx] = sqrt(input[idx]);
+}
+
+@compute @workgroup_size(256)
+fn op_abs(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    output[idx] = abs(input[idx]);
+}
+
+@compute @workgroup_size(256)
+fn op_neg(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    output[idx] = -input[idx];
+}
+
+@compute @workgroup_size(256)
+fn op_log(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    output[idx] = log(input[idx]);
+}
+
+@compute @workgroup_size(256)
+fn silu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    let x = input[idx];
+    output[idx] = x / (1.0 + exp(-x));
+}
+
+@compute @workgroup_size(256)
+fn leaky_relu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    let x = input[idx];
+    output[idx] = select(0.01 * x, x, x >= 0.0);
 }
 "#;
 
@@ -696,6 +1008,70 @@ fn reduce_max(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (v > acc) { acc = v; }
     }
     output[flat_idx] = acc;
+}
+
+@compute @workgroup_size(256)
+fn reduce_min(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let flat_idx = gid.x;
+    let total_out = params.outer_size * params.inner_size;
+    if (flat_idx >= total_out) { return; }
+
+    let outer = flat_idx / params.inner_size;
+    let inner = flat_idx % params.inner_size;
+    let in_base = outer * params.axis_len * params.inner_size + inner;
+
+    var acc: f32 = input[in_base];
+    for (var i: u32 = 1u; i < params.axis_len; i++) {
+        let v = input[in_base + i * params.inner_size];
+        if (v < acc) { acc = v; }
+    }
+    output[flat_idx] = acc;
+}
+
+@compute @workgroup_size(256)
+fn reduce_mean(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let flat_idx = gid.x;
+    let total_out = params.outer_size * params.inner_size;
+    if (flat_idx >= total_out) { return; }
+
+    let outer = flat_idx / params.inner_size;
+    let inner = flat_idx % params.inner_size;
+    let in_base = outer * params.axis_len * params.inner_size + inner;
+
+    var acc: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.axis_len; i++) {
+        acc += input[in_base + i * params.inner_size];
+    }
+    output[flat_idx] = acc / f32(params.axis_len);
+}
+"#;
+
+/// Binary element-wise WGSL shader — add, mul.
+///
+/// Layout: a[len], b[len], output[len], params = { len, _pad }.
+const BINARY_ELEMENTWISE_SHADER: &str = r#"
+struct Params {
+    len: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn op_add(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    output[idx] = a[idx] + b[idx];
+}
+
+@compute @workgroup_size(256)
+fn op_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) { return; }
+    output[idx] = a[idx] * b[idx];
 }
 "#;
 
@@ -769,5 +1145,180 @@ fn tiled_matmul(
     if (row < M && col < N) {
         c[row * N + col] = sum;
     }
+}
+"#;
+
+/// LayerNorm WGSL shader — parallel reduction in shared memory.
+///
+/// Each workgroup (256 threads) processes one normalization instance.
+/// Three phases: compute mean, compute variance, normalize + scale + bias.
+/// Layout: input(ro), scale(ro), bias(ro), output(rw), params(uniform).
+const LAYER_NORM_SHADER: &str = r#"
+struct Params {
+    n_elements: u32,
+    batch_count: u32,
+    eps: f32,
+    _pad: u32,
+}
+
+const WG_SIZE: u32 = 256u;
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> ln_bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+var<workgroup> shared_data: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn layer_norm(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let instance = wid.x;
+    if (instance >= params.batch_count) { return; }
+    let tid = lid.x;
+    let n = params.n_elements;
+    let base = instance * n;
+
+    // Phase 1: parallel sum for mean
+    var local_sum: f32 = 0.0;
+    var idx: u32 = tid;
+    for (var step: u32 = 0u; step < n; step = step + WG_SIZE) {
+        let i = tid + step;
+        if (i < n) {
+            local_sum = local_sum + input[base + i];
+        }
+    }
+    shared_data[tid] = local_sum;
+    workgroupBarrier();
+
+    // Tree reduction for sum
+    for (var s: u32 = WG_SIZE / 2u; s > 0u; s = s / 2u) {
+        if (tid < s) {
+            shared_data[tid] = shared_data[tid] + shared_data[tid + s];
+        }
+        workgroupBarrier();
+    }
+
+    let mean_val = shared_data[0] / f32(n);
+    workgroupBarrier();
+
+    // Phase 2: parallel sum for variance
+    var local_var: f32 = 0.0;
+    for (var step: u32 = 0u; step < n; step = step + WG_SIZE) {
+        let i = tid + step;
+        if (i < n) {
+            let diff = input[base + i] - mean_val;
+            local_var = local_var + diff * diff;
+        }
+    }
+    shared_data[tid] = local_var;
+    workgroupBarrier();
+
+    for (var s: u32 = WG_SIZE / 2u; s > 0u; s = s / 2u) {
+        if (tid < s) {
+            shared_data[tid] = shared_data[tid] + shared_data[tid + s];
+        }
+        workgroupBarrier();
+    }
+
+    let variance = shared_data[0] / f32(n);
+    let inv_std = 1.0 / sqrt(variance + params.eps);
+    workgroupBarrier();
+
+    // Phase 3: normalize + scale + bias
+    for (var step: u32 = 0u; step < n; step = step + WG_SIZE) {
+        let i = tid + step;
+        if (i < n) {
+            let norm_val = (input[base + i] - mean_val) * inv_std;
+            output[base + i] = norm_val * scale[i] + ln_bias[i];
+        }
+    }
+}
+"#;
+
+/// BatchNorm WGSL shader — inference mode per-channel normalization.
+///
+/// out = scale * (x - mean) / sqrt(variance + eps) + bias
+/// Input is [N,C,H,W] flattened; per-channel mean/var/scale/bias.
+/// Each thread handles one element.
+const BATCH_NORM_SHADER: &str = r#"
+struct Params {
+    total_elements: u32,
+    channels: u32,
+    spatial_size: u32,
+    eps: f32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> bn_scale: array<f32>;
+@group(0) @binding(2) var<storage, read> bn_bias: array<f32>;
+@group(0) @binding(3) var<storage, read> bn_mean: array<f32>;
+@group(0) @binding(4) var<storage, read> bn_var: array<f32>;
+@group(0) @binding(5) var<storage, read_write> output: array<f32>;
+@group(0) @binding(6) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn batch_norm(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.total_elements) { return; }
+
+    // Determine channel: layout [N, C, spatial_size]
+    let channel = (idx / params.spatial_size) % params.channels;
+
+    let x = input[idx];
+    let m = bn_mean[channel];
+    let v = bn_var[channel];
+    let s = bn_scale[channel];
+    let b = bn_bias[channel];
+
+    output[idx] = s * (x - m) / sqrt(v + params.eps) + b;
+}
+"#;
+
+/// Transpose WGSL shader — general permutation via precomputed strides.
+///
+/// perm_data buffer layout: [input_strides..., output_strides..., perm...] (3*ndim u32 values).
+/// Each thread computes one output element by converting its flat index to
+/// multi-dimensional coordinates, permuting dimensions, and computing the source index.
+const TRANSPOSE_SHADER: &str = r#"
+struct Params {
+    total_elements: u32,
+    ndim: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read> perm_data: array<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn transpose_op(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let out_idx = gid.x;
+    if (out_idx >= params.total_elements) { return; }
+
+    let ndim = params.ndim;
+
+    // perm_data layout: input_strides[0..ndim], output_strides[ndim..2*ndim], perm[2*ndim..3*ndim]
+    // Convert flat output index → output coords → input coords → flat input index
+    var remaining = out_idx;
+    var in_flat: u32 = 0u;
+
+    for (var d: u32 = 0u; d < ndim; d = d + 1u) {
+        let out_stride = perm_data[ndim + d];
+        let coord = remaining / out_stride;
+        remaining = remaining % out_stride;
+
+        // This output dimension d corresponds to input dimension perm[d]
+        let in_dim = perm_data[2u * ndim + d];
+        let in_stride = perm_data[in_dim];
+        in_flat = in_flat + coord * in_stride;
+    }
+
+    output[out_idx] = input[in_flat];
 }
 "#;

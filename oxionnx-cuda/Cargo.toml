@@ -1,0 +1,27 @@
+[package]
+name = "oxionnx-cuda"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "CUDA-accelerated dispatch layer for oxionnx ONNX ops"
+keywords = ["onnx", "cuda", "gpu", "inference", "deep-learning"]
+categories = ["science", "hardware-support"]
+readme = "README.md"
+
+[dependencies]
+oxionnx-core = { workspace = true }
+oxicuda-driver = { workspace = true }
+oxicuda-memory = { workspace = true }
+oxicuda-blas = { workspace = true }
+oxicuda-dnn = { workspace = true }
+oxicuda-ptx = { workspace = true }
+oxicuda-launch = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []

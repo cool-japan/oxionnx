@@ -11,7 +11,6 @@ use crate::types::*;
 #[derive(Debug)]
 enum WireValue<'a> {
     Varint(u64),
-    #[allow(dead_code)]
     Fixed64([u8; 8]),
     Bytes(&'a [u8]),
     Fixed32([u8; 4]),
@@ -141,6 +140,10 @@ pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
                     ]));
                 }
             }
+            (7, WireValue::Fixed64(b)) => {
+                // double_data: individual (unpacked) float64
+                t.double_data.push(f64::from_le_bytes(b));
+            }
             (9, WireValue::Bytes(b)) => t.raw_data = b.to_vec(),
             (13, WireValue::Varint(v)) => t.data_location = v as i32,
             (14, WireValue::Bytes(b)) => {
@@ -259,13 +262,16 @@ pub fn parse_graph(buf: &[u8]) -> Result<GraphProto, String> {
             (2, WireValue::Bytes(b)) => graph.name = String::from_utf8_lossy(b).into_owned(),
             (5, WireValue::Bytes(b)) => graph.initializers.push(parse_tensor_proto(b)?),
             (11, WireValue::Bytes(b)) => {
-                // ValueInfoProto — extract name (field 1)
-                let name = extract_name_from_value_info(b);
-                graph.inputs.push(name);
+                // ValueInfoProto for graph inputs — parse full info and extract name
+                let vi = parse_value_info_proto(b);
+                graph.inputs.push(vi.name.clone());
+                graph.input_value_infos.push(vi);
             }
             (12, WireValue::Bytes(b)) => {
-                let name = extract_name_from_value_info(b);
-                graph.outputs.push(name);
+                // ValueInfoProto for graph outputs
+                let vi = parse_value_info_proto(b);
+                graph.outputs.push(vi.name.clone());
+                graph.output_value_infos.push(vi);
             }
             _ => {}
         }
@@ -273,19 +279,139 @@ pub fn parse_graph(buf: &[u8]) -> Result<GraphProto, String> {
     Ok(graph)
 }
 
-fn extract_name_from_value_info(buf: &[u8]) -> String {
+/// Parse a full `ValueInfoProto`, extracting name, elem_type, and shape.
+///
+/// ONNX proto layout (field numbers):
+/// ```text
+/// ValueInfoProto {
+///   1: name (string)
+///   2: type (TypeProto) {
+///     1: tensor_type (Tensor) {
+///       1: elem_type (varint)
+///       2: shape (TensorShapeProto) {
+///         1: dim[] (Dimension) {
+///           1: dim_value (varint) -- static size
+///           2: dim_param (string) -- symbolic name (dynamic)
+///         }
+///       }
+///     }
+///   }
+/// }
+/// ```
+pub fn parse_value_info_proto(buf: &[u8]) -> ValueInfoProto {
+    let mut vi = ValueInfoProto::default();
     let mut pos = 0;
     while pos < buf.len() {
-        if let Ok((field, WireValue::Bytes(b), next)) = read_field(buf, pos) {
-            if field == 1 {
-                return String::from_utf8_lossy(b).into_owned();
+        match read_field(buf, pos) {
+            Ok((1, WireValue::Bytes(b), next)) => {
+                vi.name = String::from_utf8_lossy(b).into_owned();
+                pos = next;
             }
-            pos = next;
-        } else {
-            break;
+            Ok((2, WireValue::Bytes(b), next)) => {
+                // TypeProto — look for tensor_type (field 1)
+                parse_type_proto_into(b, &mut vi);
+                pos = next;
+            }
+            Ok((_, _, next)) => {
+                pos = next;
+            }
+            Err(_) => break,
         }
     }
-    String::new()
+    vi
+}
+
+/// Parse TypeProto bytes and fill elem_type / shape into `vi`.
+fn parse_type_proto_into(buf: &[u8], vi: &mut ValueInfoProto) {
+    let mut pos = 0;
+    while pos < buf.len() {
+        match read_field(buf, pos) {
+            Ok((1, WireValue::Bytes(b), next)) => {
+                // tensor_type: Tensor { 1: elem_type, 2: shape }
+                parse_tensor_type_into(b, vi);
+                pos = next;
+            }
+            Ok((_, _, next)) => {
+                pos = next;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Parse TensorTypeProto bytes and fill elem_type / shape into `vi`.
+fn parse_tensor_type_into(buf: &[u8], vi: &mut ValueInfoProto) {
+    let mut pos = 0;
+    while pos < buf.len() {
+        match read_field(buf, pos) {
+            Ok((1, WireValue::Varint(v), next)) => {
+                vi.elem_type = v as i32;
+                pos = next;
+            }
+            Ok((2, WireValue::Bytes(b), next)) => {
+                // TensorShapeProto — repeated Dimension (field 1)
+                parse_shape_proto_into(b, vi);
+                pos = next;
+            }
+            Ok((_, _, next)) => {
+                pos = next;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Parse TensorShapeProto bytes and append dimensions into `vi.shape` and `vi.dim_params`.
+fn parse_shape_proto_into(buf: &[u8], vi: &mut ValueInfoProto) {
+    let mut pos = 0;
+    while pos < buf.len() {
+        match read_field(buf, pos) {
+            Ok((1, WireValue::Bytes(b), next)) => {
+                // Dimension: field 1 = dim_value (varint), field 2 = dim_param (string)
+                let (dim_value, dim_param) = parse_dimension(b);
+                vi.shape.push(dim_value);
+                vi.dim_params.push(dim_param);
+                pos = next;
+            }
+            Ok((_, _, next)) => {
+                pos = next;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Parse a single Dimension message and return (static_size, symbolic_param_name).
+///
+/// ONNX Dimension fields:
+///   1: dim_value (varint) — concrete size; 0 means dynamic
+///   2: dim_param (string) — symbolic name (e.g. "batch_size")
+fn parse_dimension(buf: &[u8]) -> (Option<i64>, Option<String>) {
+    let mut dim_value: Option<i64> = None;
+    let mut dim_param: Option<String> = None;
+    let mut pos = 0;
+    while pos < buf.len() {
+        match read_field(buf, pos) {
+            Ok((1, WireValue::Varint(v), next)) => {
+                // dim_value: 0 = dynamic/batch, >0 = static
+                dim_value = if v == 0 { None } else { Some(v as i64) };
+                pos = next;
+            }
+            Ok((2, WireValue::Bytes(s), next)) => {
+                // dim_param: symbolic dimension name
+                let name = String::from_utf8_lossy(s).into_owned();
+                if !name.is_empty() {
+                    dim_param = Some(name);
+                }
+                pos = next;
+            }
+            Ok((_, _, next)) => {
+                pos = next;
+            }
+            Err(_) => break,
+        }
+    }
+    (dim_value, dim_param)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -299,6 +425,19 @@ pub fn parse_model(buf: &[u8]) -> Result<ModelProto, String> {
         pos = next;
         match (field, value) {
             (1, WireValue::Varint(v)) => model.ir_version = v as i64,
+            (2, WireValue::Bytes(b)) => {
+                model.producer_name = String::from_utf8_lossy(b).into_owned();
+            }
+            (3, WireValue::Bytes(b)) => {
+                model.producer_version = String::from_utf8_lossy(b).into_owned();
+            }
+            (4, WireValue::Bytes(b)) => {
+                model.domain = String::from_utf8_lossy(b).into_owned();
+            }
+            (5, WireValue::Varint(v)) => model.model_version = v as i64,
+            (6, WireValue::Bytes(b)) => {
+                model.doc_string = String::from_utf8_lossy(b).into_owned();
+            }
             (7, WireValue::Bytes(b)) => model.graph = parse_graph(b)?,
             (8, WireValue::Bytes(b)) => {
                 // OperatorSetIdProto — field 1 = domain (string), field 2 = version (varint)
@@ -329,8 +468,10 @@ pub fn parse_model(buf: &[u8]) -> Result<ModelProto, String> {
                     .opset_imports
                     .push(crate::types::OpsetImport { domain, version });
             }
-            (3, WireValue::Varint(v)) => model.model_version = v as i64,
-            (4, WireValue::Bytes(b)) => model.doc_string = String::from_utf8_lossy(b).into_owned(),
+            (14, WireValue::Bytes(b)) => {
+                let (key, val) = parse_string_string_entry(b)?;
+                model.metadata_props.push((key, val));
+            }
             (20, WireValue::Bytes(b)) => {
                 model.training_info.push(parse_training_info(b)?);
             }
@@ -446,7 +587,7 @@ mod tests {
 
     /// Helper: encode a protobuf field tag + varint value.
     fn encode_varint_field(field: u32, val: u64) -> Vec<u8> {
-        let tag = (field << 3) | 0; // wire type 0 = varint
+        let tag = field << 3; // wire type 0 = varint
         let mut buf = encode_varint(tag as u64);
         buf.extend(encode_varint(val));
         buf

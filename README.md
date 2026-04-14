@@ -10,7 +10,7 @@ OxiONNX is a high-performance ONNX inference engine written in pure Rust.
 It supports 147 ONNX operators, GPU acceleration via wgpu, SIMD optimization,
 and runs on any platform including WebAssembly.
 
-**30,000+ lines of Rust | 590+ tests | 0 clippy warnings**
+**47,829 lines of Rust | 1,023 tests | 0 clippy warnings**
 
 ## Features
 
@@ -86,8 +86,10 @@ OxiONNX implements 147 operators across the full ONNX specification:
 | `gpu` | GPU acceleration via wgpu |
 | `simd` | SIMD-accelerated element-wise ops |
 | `encryption` | AES-GCM model encryption |
+| `cuda` | CUDA GPU acceleration via OxiCUDA |
 | `mmap` | Memory-mapped weight loading |
 | `wasm` | WebAssembly browser bindings |
+| `ndarray` | ndarray interop for Tensor conversion |
 
 ## Architecture
 
@@ -97,7 +99,48 @@ oxionnx (root)           -- Session, optimizer, execution engine
   oxionnx-ops            -- 147 operator implementations
   oxionnx-proto          -- Pure Rust ONNX protobuf parser
   oxionnx-gpu            -- wgpu compute backend (optional)
+  oxionnx-cuda           -- CUDA dispatch layer via OxiCUDA (optional)
 ```
+
+## Performance
+
+OxiONNX is a pure Rust implementation with no C/C++ BLAS dependency.
+Run `cargo bench --bench performance` to measure on your hardware.
+
+### Operator Microbenchmarks
+
+| Operation | Size | Implementation | Notes |
+|-----------|------|----------------|-------|
+| MatMul | 512×512 | `matrixmultiply` crate | Run `cargo bench` to measure |
+| MatMul | 1024×1024 | `matrixmultiply` crate | Run `cargo bench` to measure |
+| MatMul | 2048×2048 | `matrixmultiply` crate | Run `cargo bench` to measure |
+| Conv2D | 64ch, 56×56, 3×3 | im2col + matmul | Run `cargo bench` to measure |
+| Softmax | [1, 128, 768] | Numerically stable (log-sum-exp) | Run `cargo bench` to measure |
+| LayerNorm | [1, 128, 768] | Fused mean/var + scale/bias | Run `cargo bench` to measure |
+| GELU | 100K elements | SIMD-accelerated (with `simd` feature) | Run `cargo bench` to measure |
+| Add (broadcast) | [1, 128, 768] + [768] | Auto-broadcast | Run `cargo bench` to measure |
+
+### End-to-End Model Workloads
+
+| Workload | Description | Notes |
+|----------|-------------|-------|
+| ResNet-50 backbone | Conv(3→64, 7×7) → BN → ReLU → MaxPool → 4 residual blocks | batch=1, 224×224 input |
+| BERT attention | Q/K/V projections → scaled dot-product attention → output proj | seq=128, hidden=768 |
+| Transformer block | LayerNorm → Attention → FFN(GELU) → Residual | Stacked 4-layer encoder |
+| Optimization passes | Session load with/without graph optimization | 20-layer graph with dead code |
+
+### Performance Characteristics
+
+- **Pure Rust, zero C/BLAS**: All computation uses `matrixmultiply` (pure Rust BLAS-like) and hand-written kernels
+- **SIMD**: Optional NEON (aarch64) and AVX2 (x86_64) acceleration for element-wise ops via `--features simd`
+- **Graph optimization**: Constant folding, operator fusion, CSE, and dead code elimination reduce runtime overhead
+- **Memory pooling**: Buffer reuse across inference calls reduces allocation pressure
+- **Parallelism**: Rayon-based parallel execution of independent graph branches
+
+> **Comparison note**: OxiONNX prioritizes portability and safety (pure Rust, no unsafe in ops).
+> For absolute peak throughput, C++ runtimes like onnxruntime (with MKL/cuDNN) will be faster
+> on operations dominated by BLAS. OxiONNX targets use cases where pure Rust, WebAssembly
+> compatibility, and zero native dependencies are more important than raw FLOPS.
 
 ## License
 

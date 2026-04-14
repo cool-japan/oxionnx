@@ -223,6 +223,50 @@ impl Operator for EinsumOp {
     }
 }
 
+// ── Bitwise ──────────────────────────────────────────────────────────────
+
+macro_rules! bitwise_binary_op {
+    ($name:ident, $op_type:expr, $func:path) => {
+        pub struct $name;
+        impl Operator for $name {
+            fn op_type(&self) -> &str {
+                $op_type
+            }
+            fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+                Ok(vec![$func(ctx.input(0)?, ctx.input(1)?)?])
+            }
+        }
+    };
+}
+
+bitwise_binary_op!(BitwiseAndOp, "BitwiseAnd", crate::bitwise::bitwise_and);
+bitwise_binary_op!(BitwiseOrOp, "BitwiseOr", crate::bitwise::bitwise_or);
+bitwise_binary_op!(BitwiseXorOp, "BitwiseXor", crate::bitwise::bitwise_xor);
+
+pub struct BitwiseNotOp;
+impl Operator for BitwiseNotOp {
+    fn op_type(&self) -> &str {
+        "BitwiseNot"
+    }
+    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        Ok(vec![crate::bitwise::bitwise_not(ctx.input(0)?)])
+    }
+}
+
+// ── Size ─────────────────────────────────────────────────────────────────
+
+pub struct SizeOp;
+impl Operator for SizeOp {
+    fn op_type(&self) -> &str {
+        "Size"
+    }
+    fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+        let x = ctx.input(0)?;
+        let n = x.numel();
+        Ok(vec![Tensor::new(vec![n as f32], vec![1])])
+    }
+}
+
 // ── NonMaxSuppression ───────────────────────────────────────────────────────
 
 pub struct NonMaxSuppressionOp;

@@ -266,6 +266,7 @@ fn build_resnet(num_classes: usize) -> (Graph, HashMap<String, Tensor>) {
         nodes: b.nodes,
         input_names: vec!["input".to_string()],
         output_names: vec![logits],
+        ..Default::default()
     };
 
     (graph, b.weights)

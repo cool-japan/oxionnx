@@ -179,6 +179,84 @@ impl Tensor {
 }
 
 // ---------------------------------------------------------------------------
+// ndarray interoperability (feature = "ndarray")
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ndarray")]
+impl Tensor {
+    /// Convert an owned `ndarray::ArrayBase` with `f32` elements into a `Tensor`.
+    ///
+    /// The array is converted to C-order (row-major) contiguous layout before
+    /// copying into the `Tensor` backing store.
+    pub fn from_ndarray<S, D>(arr: ndarray::ArrayBase<S, D>) -> Self
+    where
+        S: ndarray::Data<Elem = f32>,
+        D: ndarray::Dimension,
+    {
+        let shape: Vec<usize> = arr.shape().to_vec();
+        // to_owned gives a contiguous copy in C order
+        let data: Vec<f32> = arr.iter().copied().collect();
+        Self::new(data, shape)
+    }
+
+    /// Convert a borrowed `ndarray::ArrayView<'_, f32, D>` into a `Tensor`.
+    pub fn from_ndarray_view<D>(view: ndarray::ArrayView<'_, f32, D>) -> Self
+    where
+        D: ndarray::Dimension,
+    {
+        let shape: Vec<usize> = view.shape().to_vec();
+        let data: Vec<f32> = view.iter().copied().collect();
+        Self::new(data, shape)
+    }
+
+    /// Convert this `Tensor` into an `ndarray::ArrayD<f32>`.
+    ///
+    /// Returns a new heap-allocated dynamic-rank array with a copy of this
+    /// tensor's data.
+    pub fn to_ndarray(&self) -> ndarray::ArrayD<f32> {
+        let shape = ndarray::IxDyn(&self.shape);
+        // from_shape_vec returns Result; the only error case is element count
+        // mismatch, which cannot happen here because Tensor invariants guarantee
+        // data.len() == shape.product().
+        ndarray::ArrayD::from_shape_vec(shape, self.data.clone())
+            .unwrap_or_else(|_| ndarray::ArrayD::zeros(ndarray::IxDyn(&self.shape)))
+    }
+
+    /// Return a borrowed `ndarray::ArrayViewD<f32>` into this tensor's data.
+    ///
+    /// The view is valid for the lifetime of `self`.
+    ///
+    /// Returns `Err` if the shape is inconsistent with the data length.
+    pub fn as_ndarray_view(&self) -> Result<ndarray::ArrayViewD<'_, f32>, crate::error::OnnxError> {
+        let shape = ndarray::IxDyn(&self.shape);
+        ndarray::ArrayViewD::from_shape(shape, &self.data)
+            .map_err(|e| crate::error::OnnxError::Internal(format!("ndarray view error: {e}")))
+    }
+
+    /// `ort`-compatible method: extract `(shape, data)` from this tensor.
+    ///
+    /// Returns a `(&[usize], &[f32])` tuple.  The type parameter `T` is ignored
+    /// (it acts as a phantom type for ort API compatibility; oxionnx tensors are
+    /// always `f32` internally).
+    pub fn try_extract_tensor<T: ?Sized>(
+        &self,
+    ) -> Result<(&[usize], &[f32]), crate::error::OnnxError> {
+        Ok((&self.shape, &self.data))
+    }
+
+    /// `ort`-compatible method: extract tensor data as an `ndarray::ArrayViewD<f32>`.
+    ///
+    /// The type parameter `T` is ignored — see [`Tensor::try_extract_tensor`].
+    pub fn try_extract_array<T: ?Sized>(
+        &self,
+    ) -> Result<ndarray::ArrayViewD<'_, f32>, crate::error::OnnxError> {
+        let shape = ndarray::IxDyn(&self.shape);
+        ndarray::ArrayViewD::from_shape(shape, &self.data)
+            .map_err(|e| crate::error::OnnxError::Internal(format!("ndarray view error: {e}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TensorView — zero-copy strided view
 // ---------------------------------------------------------------------------
 

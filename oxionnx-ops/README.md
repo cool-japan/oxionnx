@@ -25,7 +25,7 @@ registered via `default_registry()`.
 
 ```toml
 [dependencies]
-oxionnx-ops = "0.1.0"
+oxionnx-ops = "0.1.1"
 ```
 
 ```rust

@@ -2,39 +2,101 @@
 //! Applied after model loading but before topological sort and execution.
 
 pub mod constant_fold;
+pub mod cost_model;
 pub mod cse;
 pub mod dead_code;
 pub mod fusion;
-#[allow(dead_code)]
 pub mod graph_diff;
-#[allow(dead_code)]
 pub mod shape_inference;
-#[allow(dead_code)]
 pub(crate) mod shape_inference_ext;
-#[allow(dead_code)]
 pub mod symbolic_shape;
 
-use crate::graph::Node;
+use crate::graph::{Node, OpKind};
 use crate::tensor::Tensor;
 use oxionnx_core::OperatorRegistry;
 use std::collections::HashMap;
 
 /// Apply all optimization passes to the graph.
 /// Modifies weights in place (for fusion passes that fold parameters).
+///
+/// Pass order:
+///  1. **Shape inference** — infer tensor shapes from weights and propagate
+///     through the graph.  For every `Shape` node whose input has a known
+///     shape, the output is materialised as a constant weight so that
+///     downstream ops (Reshape, Gather, …) become constant-foldable.
+///  2. **Constant folding** — evaluate nodes whose inputs are all constants.
+///  3. **Dead-node elimination** — remove nodes not reachable from outputs.
+///  4. **CSE** — merge duplicate sub-expressions.
+///  5. **Fusion passes** — MatMul+Add, Conv+BN, Conv+Relu, Conv+ReLU6,
+///     SiLU fusion, Div+Sqrt→Rsqrt, standalone BN folding, LayerNorm,
+///     transpose cancellation.
 pub fn optimize(
     nodes: Vec<Node>,
     weights: &mut HashMap<String, Tensor>,
     output_names: &[String],
     registry: &OperatorRegistry,
 ) -> Vec<Node> {
+    // Phase 1: Shape inference.
+    // Even without runtime input shapes we can propagate shapes that originate
+    // from constant weights. This lets us materialise Shape op outputs so that
+    // constant folding can evaluate their consumers.
+    let input_shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    let known_shapes = shape_inference::infer_shapes(&nodes, weights, &input_shapes);
+    materialize_shape_ops(&nodes, weights, &known_shapes);
+
+    // Phase 2–N: existing optimisation pipeline.
     let nodes = constant_fold::constant_fold(nodes, weights, registry);
     let nodes = dead_code::dead_node_elimination(nodes, output_names);
     let nodes = cse::eliminate_common_subexpressions(nodes);
     let nodes = fusion::fuse_matmul_add(nodes, weights);
     let nodes = fusion::fuse_conv_batchnorm(nodes, weights);
     let nodes = fusion::fuse_conv_relu(nodes);
+    let nodes = fusion::fuse_conv_clip_to_conv_relu6(nodes);
+    let nodes = fusion::fuse_mul_sigmoid_to_silu(nodes);
+    let nodes = fusion::fuse_div_sqrt_to_rsqrt(nodes, weights);
+    let nodes = fusion::fold_batch_norm_inference(nodes, weights);
     let nodes = fusion::fuse_layer_norm(nodes, weights);
-    fusion::cancel_consecutive_transpose(nodes)
+    let nodes = fusion::cancel_consecutive_transpose(nodes);
+    let nodes = fusion::fuse_matmul_transpose(nodes);
+    let nodes = fusion::fuse_add_matmul_to_gemm(nodes, weights);
+    fusion::cancel_consecutive_reshape(nodes)
+}
+
+/// For each `Shape` node whose input has a known shape, store the shape
+/// vector as a constant weight tensor.  This allows `constant_fold` to
+/// evaluate downstream consumers that depend on Shape outputs (e.g.
+/// `Shape → Gather → Reshape` chains).
+fn materialize_shape_ops(
+    nodes: &[Node],
+    weights: &mut HashMap<String, Tensor>,
+    known_shapes: &HashMap<String, Vec<usize>>,
+) {
+    for node in nodes {
+        if node.op != OpKind::Shape {
+            continue;
+        }
+        let input_name = match node.inputs.first() {
+            Some(name) if !name.is_empty() => name,
+            _ => continue,
+        };
+        let shape = match known_shapes.get(input_name) {
+            Some(s) => s,
+            None => continue,
+        };
+        let output_name = match node.outputs.first() {
+            Some(name) if !name.is_empty() => name,
+            _ => continue,
+        };
+        // Don't overwrite an already-known constant.
+        if weights.contains_key(output_name) {
+            continue;
+        }
+        // Store as a 1-D tensor.  Shape output is int64 per ONNX spec;
+        // we use f32 since our Tensor stores f32 data.
+        let shape_data: Vec<f32> = shape.iter().map(|&d| d as f32).collect();
+        let len = shape_data.len();
+        weights.insert(output_name.clone(), Tensor::new(shape_data, vec![len]));
+    }
 }
 
 #[cfg(test)]

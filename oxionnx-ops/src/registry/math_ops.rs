@@ -201,6 +201,19 @@ reduce_op!(ReduceSumOp, "ReduceSum", math::reduce_sum);
 reduce_op!(ReduceMaxOp, "ReduceMax", math::reduce_max);
 reduce_op!(ReduceMinOp, "ReduceMin", math::reduce_min);
 reduce_op!(ReduceProdOp, "ReduceProd", math::reduce_prod);
+reduce_op!(ReduceL1Op, "ReduceL1", math::reduce_l1);
+reduce_op!(ReduceL2Op, "ReduceL2", math::reduce_l2);
+reduce_op!(ReduceLogSumOp, "ReduceLogSum", math::reduce_log_sum);
+reduce_op!(
+    ReduceLogSumExpOp,
+    "ReduceLogSumExp",
+    math::reduce_log_sum_exp
+);
+reduce_op!(
+    ReduceSumSquareOp,
+    "ReduceSumSquare",
+    math::reduce_sum_square
+);
 
 // ── ArgMax / ArgMin ─────────────────────────────────────────────────────────
 

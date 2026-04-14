@@ -20,7 +20,7 @@ and has minimal dependencies.
 
 ```toml
 [dependencies]
-oxionnx-core = "0.1.0"
+oxionnx-core = "0.1.1"
 ```
 
 ```rust

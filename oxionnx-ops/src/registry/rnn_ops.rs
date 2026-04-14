@@ -19,6 +19,7 @@ impl Operator for LSTMOp {
         let sequence_lens = ctx.optional_input(4);
         let initial_h = ctx.optional_input(5);
         let initial_c = ctx.optional_input(6);
+        let peephole = ctx.optional_input(7);
 
         let attrs = ctx.attrs();
         let hidden_size = attrs.i("hidden_size", 1) as usize;
@@ -27,6 +28,13 @@ impl Operator for LSTMOp {
             "forward"
         } else {
             direction_str
+        };
+        let act_strs = attrs.string_list("activations");
+        let act_refs: Vec<&str> = act_strs.iter().map(|s| s.as_str()).collect();
+        let activations = if act_refs.is_empty() {
+            None
+        } else {
+            Some(act_refs.as_slice())
         };
 
         let (y, y_h, y_c) = rnn::lstm(
@@ -37,8 +45,10 @@ impl Operator for LSTMOp {
             sequence_lens,
             initial_h,
             initial_c,
+            peephole,
             hidden_size,
             direction,
+            activations,
         )?;
 
         Ok(vec![y, y_h, y_c])
@@ -69,6 +79,13 @@ impl Operator for GRUOp {
             direction_str
         };
         let linear_before_reset = attrs.i("linear_before_reset", 0) != 0;
+        let act_strs = attrs.string_list("activations");
+        let act_refs: Vec<&str> = act_strs.iter().map(|s| s.as_str()).collect();
+        let activations = if act_refs.is_empty() {
+            None
+        } else {
+            Some(act_refs.as_slice())
+        };
 
         let (y, y_h) = rnn::gru(
             x,
@@ -80,6 +97,7 @@ impl Operator for GRUOp {
             hidden_size,
             direction,
             linear_before_reset,
+            activations,
         )?;
 
         Ok(vec![y, y_h])

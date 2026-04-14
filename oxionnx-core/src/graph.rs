@@ -2,8 +2,19 @@ use std::collections::HashMap;
 
 use crate::Tensor;
 
-/// All ONNX operators currently supported by oxionnx.
+/// A tensor dimension: either a concrete size, a symbolic name, or unknown.
 #[derive(Debug, Clone, PartialEq)]
+pub enum Dim {
+    /// A concrete static dimension (e.g., 768).
+    Static(usize),
+    /// A symbolic dimension name (e.g., "batch_size", "seq_len").
+    Symbol(String),
+    /// No dimension information available.
+    Unknown,
+}
+
+/// All ONNX operators currently supported by oxionnx.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OpKind {
     // Math
     MatMul,
@@ -170,6 +181,31 @@ pub enum OpKind {
     SVMRegressor,
     TfIdfVectorizer,
     StringNormalizer,
+    // Audio / DSP ops
+    DFT,
+    STFT,
+    BlackmanWindow,
+    HannWindow,
+    HammingWindow,
+    MelWeightMatrix,
+    Bernoulli,
+    // Math (J-phase additions)
+    ReduceL1,
+    ReduceL2,
+    ReduceLogSum,
+    ReduceLogSumExp,
+    ReduceSumSquare,
+    // Bitwise (J-phase additions)
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseNot,
+    Size,
+    // Neural network (J-phase additions)
+    Hardmax,
+    Shrink,
+    // Fused ops (optimizer-generated)
+    ConvAddRelu,
     // Unknown (logged but skipped gracefully)
     Unknown(String),
 }
@@ -328,6 +364,31 @@ impl OpKind {
             "SVMRegressor" | "ai.onnx.ml.SVMRegressor" => Self::SVMRegressor,
             "TfIdfVectorizer" | "ai.onnx.ml.TfIdfVectorizer" => Self::TfIdfVectorizer,
             "StringNormalizer" | "ai.onnx.ml.StringNormalizer" => Self::StringNormalizer,
+            // Audio / DSP ops
+            "DFT" => Self::DFT,
+            "STFT" => Self::STFT,
+            "BlackmanWindow" => Self::BlackmanWindow,
+            "HannWindow" => Self::HannWindow,
+            "HammingWindow" => Self::HammingWindow,
+            "MelWeightMatrix" => Self::MelWeightMatrix,
+            "Bernoulli" => Self::Bernoulli,
+            // Math (J-phase additions)
+            "ReduceL1" => Self::ReduceL1,
+            "ReduceL2" => Self::ReduceL2,
+            "ReduceLogSum" => Self::ReduceLogSum,
+            "ReduceLogSumExp" => Self::ReduceLogSumExp,
+            "ReduceSumSquare" => Self::ReduceSumSquare,
+            // Bitwise (J-phase additions)
+            "BitwiseAnd" => Self::BitwiseAnd,
+            "BitwiseOr" => Self::BitwiseOr,
+            "BitwiseXor" => Self::BitwiseXor,
+            "BitwiseNot" => Self::BitwiseNot,
+            "Size" => Self::Size,
+            // Neural network (J-phase additions)
+            "Hardmax" => Self::Hardmax,
+            "Shrink" => Self::Shrink,
+            // Fused ops (optimizer-generated)
+            "ConvAddRelu" => Self::ConvAddRelu,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -481,6 +542,31 @@ impl OpKind {
             Self::SVMRegressor => "SVMRegressor",
             Self::TfIdfVectorizer => "TfIdfVectorizer",
             Self::StringNormalizer => "StringNormalizer",
+            // Audio / DSP ops
+            Self::DFT => "DFT",
+            Self::STFT => "STFT",
+            Self::BlackmanWindow => "BlackmanWindow",
+            Self::HannWindow => "HannWindow",
+            Self::HammingWindow => "HammingWindow",
+            Self::MelWeightMatrix => "MelWeightMatrix",
+            Self::Bernoulli => "Bernoulli",
+            // Math (J-phase additions)
+            Self::ReduceL1 => "ReduceL1",
+            Self::ReduceL2 => "ReduceL2",
+            Self::ReduceLogSum => "ReduceLogSum",
+            Self::ReduceLogSumExp => "ReduceLogSumExp",
+            Self::ReduceSumSquare => "ReduceSumSquare",
+            // Bitwise (J-phase additions)
+            Self::BitwiseAnd => "BitwiseAnd",
+            Self::BitwiseOr => "BitwiseOr",
+            Self::BitwiseXor => "BitwiseXor",
+            Self::BitwiseNot => "BitwiseNot",
+            Self::Size => "Size",
+            // Neural network (J-phase additions)
+            Self::Hardmax => "Hardmax",
+            Self::Shrink => "Shrink",
+            // Fused ops (optimizer-generated)
+            Self::ConvAddRelu => "ConvAddRelu",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -538,12 +624,69 @@ pub struct Node {
     pub attrs: Attributes,
 }
 
-/// The full computation graph.
-#[derive(Debug, Clone)]
+/// Metadata for a model input or output tensor (parsed from ValueInfoProto).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorInfo {
+    /// Name of the tensor.
+    pub name: String,
+    /// ONNX element type code (1=float32, 10=float16, 7=int64, …). 0 = unknown.
+    pub dtype: crate::dtype::DType,
+    /// Per-dimension sizes. `None` means a dynamic (symbolic) dimension.
+    pub shape: Vec<Option<usize>>,
+    /// Symbolic dimension parameter names parallel to `shape` (e.g. "batch_size").
+    pub dim_params: Vec<Option<String>>,
+}
+
+impl Default for TensorInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            dtype: crate::dtype::DType::F32,
+            shape: Vec::new(),
+            dim_params: Vec::new(),
+        }
+    }
+}
+
+impl TensorInfo {
+    /// Return the full symbolic shape, combining static values and symbolic names.
+    ///
+    /// Each dimension resolves to:
+    /// - [`Dim::Static`] when a concrete size is known,
+    /// - [`Dim::Symbol`] when only a symbolic name is present,
+    /// - [`Dim::Unknown`] when neither is available.
+    pub fn symbolic_shape(&self) -> Vec<Dim> {
+        self.shape
+            .iter()
+            .zip(
+                self.dim_params
+                    .iter()
+                    .map(Some)
+                    .chain(std::iter::repeat(None)),
+            )
+            .map(|(static_dim, param_opt)| match static_dim {
+                Some(n) => Dim::Static(*n),
+                None => match param_opt.and_then(|p| p.as_ref()) {
+                    Some(s) => Dim::Symbol(s.clone()),
+                    None => Dim::Unknown,
+                },
+            })
+            .collect()
+    }
+}
+
+/// Compute graph produced by parsing an ONNX model.
+#[derive(Debug, Clone, Default)]
 pub struct Graph {
+    /// Optional graph name (from the ONNX `GraphProto.name` field).
+    pub name: String,
     pub nodes: Vec<Node>,
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
+    /// Detailed metadata for graph inputs (populated from ValueInfoProto when available).
+    pub input_infos: Vec<TensorInfo>,
+    /// Detailed metadata for graph outputs (populated from ValueInfoProto when available).
+    pub output_infos: Vec<TensorInfo>,
 }
 
 impl Graph {

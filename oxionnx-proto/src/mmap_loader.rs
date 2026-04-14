@@ -106,7 +106,7 @@ mod tests {
     }
 
     fn encode_varint_field(field: u32, val: u64) -> Vec<u8> {
-        let tag = (field << 3) | 0;
+        let tag = field << 3;
         let mut buf = encode_varint(tag as u64);
         buf.extend(encode_varint(val));
         buf

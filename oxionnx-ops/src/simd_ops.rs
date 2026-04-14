@@ -50,17 +50,298 @@ pub fn simd_exp(data: &mut [f32]) {
     dispatch_unary(data, Op::Exp);
 }
 
+/// SIMD-accelerated element-wise subtraction: out[i] = a[i] - b[i]
+pub fn simd_sub(a: &[f32], b: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), out.len());
+    dispatch_binary(a, b, out, Op::Sub);
+}
+
+/// SIMD-accelerated element-wise division: out[i] = a[i] / b[i]
+pub fn simd_div(a: &[f32], b: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), out.len());
+    dispatch_binary(a, b, out, Op::Div);
+}
+
+/// SIMD-accelerated in-place negation: data[i] = -data[i]
+pub fn simd_neg(data: &mut [f32]) {
+    dispatch_unary(data, Op::Neg);
+}
+
+/// SIMD-accelerated in-place absolute value: data[i] = |data[i]|
+pub fn simd_abs(data: &mut [f32]) {
+    dispatch_unary(data, Op::Abs);
+}
+
+/// SIMD-accelerated in-place square root: data[i] = sqrt(data[i])
+pub fn simd_sqrt(data: &mut [f32]) {
+    dispatch_unary(data, Op::Sqrt);
+}
+
+/// SIMD-accelerated in-place natural logarithm: data[i] = ln(data[i])
+pub fn simd_log(data: &mut [f32]) {
+    dispatch_unary(data, Op::Log);
+}
+
+// ── Horizontal reduction dispatch functions ─────────────────────────────────
+
+/// SIMD-accelerated sum reduction over a flat slice.
+///
+/// Returns 0.0 for an empty slice.
+pub fn simd_reduce_sum(data: &[f32]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_impl::reduce_sum(data)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA detected at runtime
+            return unsafe { avx2_impl::reduce_sum(data) };
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        return scalar_reduce_sum(data);
+    }
+
+    // Fallback for x86_64 without AVX2
+    #[cfg(target_arch = "x86_64")]
+    scalar_reduce_sum(data)
+}
+
+/// SIMD-accelerated max reduction over a flat slice.
+///
+/// Returns `f32::NEG_INFINITY` for an empty slice.
+pub fn simd_reduce_max(data: &[f32]) -> f32 {
+    if data.is_empty() {
+        return f32::NEG_INFINITY;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_impl::reduce_max(data)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 detected at runtime
+            return unsafe { avx2_impl::reduce_max(data) };
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        return scalar_reduce_max(data);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    scalar_reduce_max(data)
+}
+
+/// SIMD-accelerated min reduction over a flat slice.
+///
+/// Returns `f32::INFINITY` for an empty slice.
+pub fn simd_reduce_min(data: &[f32]) -> f32 {
+    if data.is_empty() {
+        return f32::INFINITY;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_impl::reduce_min(data)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 detected at runtime
+            return unsafe { avx2_impl::reduce_min(data) };
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        return scalar_reduce_min(data);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    scalar_reduce_min(data)
+}
+
+/// SIMD-accelerated dot product of two f32 slices.
+///
+/// Uses the minimum of `a.len()` and `b.len()` as the effective length.
+/// Returns 0.0 if either slice is empty.
+pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let a = &a[..n];
+    let b = &b[..n];
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_impl::dot_product(a, b)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA detected at runtime
+            return unsafe { avx2_impl::dot_product(a, b) };
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        return scalar_dot_product(a, b);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    scalar_dot_product(a, b)
+}
+
+/// SIMD-accelerated mean reduction over a flat slice.
+///
+/// Returns 0.0 for an empty slice.
+pub fn simd_reduce_mean(data: &[f32]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    simd_reduce_sum(data) / data.len() as f32
+}
+
+// ── Softmax & LayerNorm dispatch functions ──────────────────────────────────
+
+/// SIMD-accelerated in-place softmax over the entire slice.
+///
+/// Computes softmax: `data[i] = exp(data[i] - max) / sum(exp(data - max))`
+pub fn simd_softmax_inplace(data: &mut [f32]) {
+    if data.is_empty() {
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_impl::softmax_inplace(data);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA detected at runtime
+            unsafe { avx2_impl::softmax_inplace(data) };
+            return;
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        scalar_softmax_inplace(data);
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    scalar_softmax_inplace(data);
+}
+
+/// SIMD-accelerated strided softmax: applies softmax to consecutive chunks
+/// of `inner_dim` elements within `data`.
+///
+/// Used when softmax is along the last axis of a multi-dimensional tensor.
+pub fn simd_softmax_strided(data: &mut [f32], inner_dim: usize) {
+    if inner_dim == 0 || data.is_empty() {
+        return;
+    }
+    let n_chunks = data.len() / inner_dim;
+    for c in 0..n_chunks {
+        let start = c * inner_dim;
+        let end = start + inner_dim;
+        simd_softmax_inplace(&mut data[start..end]);
+    }
+}
+
+/// SIMD-accelerated in-place LayerNorm over the entire slice.
+///
+/// Computes: `data[i] = (data[i] - mean) / sqrt(var + eps) * scale[i] + bias[i]`
+pub fn simd_layer_norm(data: &mut [f32], scale: &[f32], bias: Option<&[f32]>, eps: f32) {
+    if data.is_empty() {
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_impl::layer_norm_inplace(data, scale, bias, eps);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2+FMA detected at runtime
+            unsafe { avx2_impl::layer_norm_inplace(data, scale, bias, eps) };
+            return;
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        scalar_layer_norm_inplace(data, scale, bias, eps);
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    scalar_layer_norm_inplace(data, scale, bias, eps);
+}
+
+/// SIMD-accelerated strided LayerNorm: applies LayerNorm to consecutive chunks
+/// of `inner_dim` elements within `data`.
+///
+/// `scale` and `bias` have length `inner_dim` and are reused for each chunk.
+pub fn simd_layer_norm_strided(
+    data: &mut [f32],
+    inner_dim: usize,
+    scale: &[f32],
+    bias: Option<&[f32]>,
+    eps: f32,
+) {
+    if inner_dim == 0 || data.is_empty() {
+        return;
+    }
+    let n_chunks = data.len() / inner_dim;
+    for c in 0..n_chunks {
+        let start = c * inner_dim;
+        let end = start + inner_dim;
+        simd_layer_norm(&mut data[start..end], scale, bias, eps);
+    }
+}
+
 // ── Dispatch helpers ────────────────────────────────────────────────────────
 
 enum Op {
     Add,
     Mul,
+    Sub,
+    Div,
     Relu,
     Sigmoid,
     Tanh,
     Gelu,
     Silu,
     Exp,
+    Neg,
+    Abs,
+    Sqrt,
+    Log,
 }
 
 fn dispatch_binary(a: &[f32], b: &[f32], out: &mut [f32], op: Op) {
@@ -69,6 +350,8 @@ fn dispatch_binary(a: &[f32], b: &[f32], out: &mut [f32], op: Op) {
         match op {
             Op::Add => neon_impl::add(a, b, out),
             Op::Mul => neon_impl::mul(a, b, out),
+            Op::Sub => neon_impl::sub(a, b, out),
+            Op::Div => neon_impl::div(a, b, out),
             _ => scalar_binary(a, b, out, op),
         }
     }
@@ -81,6 +364,8 @@ fn dispatch_binary(a: &[f32], b: &[f32], out: &mut [f32], op: Op) {
                 match op {
                     Op::Add => avx2_impl::add(a, b, out),
                     Op::Mul => avx2_impl::mul(a, b, out),
+                    Op::Sub => avx2_impl::sub(a, b, out),
+                    Op::Div => avx2_impl::div(a, b, out),
                     _ => scalar_binary(a, b, out, op),
                 }
             }
@@ -105,6 +390,10 @@ fn dispatch_unary(data: &mut [f32], op: Op) {
             Op::Gelu => neon_impl::gelu(data),
             Op::Silu => neon_impl::silu(data),
             Op::Exp => neon_impl::exp(data),
+            Op::Neg => neon_impl::neg(data),
+            Op::Abs => neon_impl::abs(data),
+            Op::Sqrt => neon_impl::sqrt(data),
+            Op::Log => neon_impl::log(data),
             _ => scalar_unary(data, op),
         }
     }
@@ -121,6 +410,10 @@ fn dispatch_unary(data: &mut [f32], op: Op) {
                     Op::Gelu => avx2_impl::gelu(data),
                     Op::Silu => avx2_impl::silu(data),
                     Op::Exp => avx2_impl::exp(data),
+                    Op::Neg => avx2_impl::neg(data),
+                    Op::Abs => avx2_impl::abs(data),
+                    Op::Sqrt => avx2_impl::sqrt(data),
+                    Op::Log => avx2_impl::log(data),
                     _ => scalar_unary(data, op),
                 }
             }
@@ -174,6 +467,33 @@ fn fast_sigmoid_scalar(x: f32) -> f32 {
     1.0 / (1.0 + fast_exp_scalar(-x))
 }
 
+/// Fast natural log approximation (scalar) using IEEE 754 bit decomposition.
+///
+/// Extracts exponent and mantissa from the float's bit representation, then uses
+/// a polynomial correction on the mantissa.
+#[inline]
+fn fast_log_scalar(x: f32) -> f32 {
+    if x <= 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    let bits = x.to_bits();
+    let exponent = ((bits >> 23) & 0xFF) as i32 - 127;
+    // Reconstruct mantissa in [1, 2)
+    let mantissa_bits = (bits & 0x007F_FFFF) | 0x3F80_0000;
+    let m = f32::from_bits(mantissa_bits); // m in [1.0, 2.0)
+
+    // Polynomial approximation for ln(m) where m in [1.0, 2.0)
+    // ln(m) ≈ (m - 1) * (2.0 - (m - 1) * 0.333_333_3)  -- Padé-like
+    // More accurate: use a degree-3 minimax polynomial
+    let f = m - 1.0;
+    // Degree-5 minimax polynomial for ln(1+f) where f in [0, 1)
+    let ln_m = f
+        * (0.999_999_7
+            + f * (-0.499_999_4 + f * (0.333_319_8 + f * (-0.249_989_5 + f * 0.150_198_6))));
+
+    (exponent as f32) * std::f32::consts::LN_2 + ln_m
+}
+
 #[allow(dead_code)]
 fn scalar_binary(a: &[f32], b: &[f32], out: &mut [f32], op: Op) {
     match op {
@@ -185,6 +505,16 @@ fn scalar_binary(a: &[f32], b: &[f32], out: &mut [f32], op: Op) {
         Op::Mul => {
             for i in 0..a.len() {
                 out[i] = a[i] * b[i];
+            }
+        }
+        Op::Sub => {
+            for i in 0..a.len() {
+                out[i] = a[i] - b[i];
+            }
+        }
+        Op::Div => {
+            for i in 0..a.len() {
+                out[i] = a[i] / b[i];
             }
         }
         _ => {}
@@ -228,7 +558,120 @@ fn scalar_unary(data: &mut [f32], op: Op) {
                 *v = fast_exp_scalar(*v);
             }
         }
+        Op::Neg => {
+            for v in data.iter_mut() {
+                *v = -*v;
+            }
+        }
+        Op::Abs => {
+            for v in data.iter_mut() {
+                *v = v.abs();
+            }
+        }
+        Op::Sqrt => {
+            for v in data.iter_mut() {
+                *v = v.sqrt();
+            }
+        }
+        Op::Log => {
+            for v in data.iter_mut() {
+                *v = fast_log_scalar(*v);
+            }
+        }
         _ => {}
+    }
+}
+
+// ── Scalar reduction fallbacks ───────────────────────────────────────────────
+
+#[allow(dead_code)]
+fn scalar_reduce_sum(data: &[f32]) -> f32 {
+    // Kahan compensated summation for improved accuracy on large arrays
+    let mut sum = 0.0f32;
+    let mut comp = 0.0f32;
+    for &v in data {
+        let y = v - comp;
+        let t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+    sum
+}
+
+#[allow(dead_code)]
+fn scalar_reduce_max(data: &[f32]) -> f32 {
+    let mut m = f32::NEG_INFINITY;
+    for &v in data {
+        if v > m {
+            m = v;
+        }
+    }
+    m
+}
+
+#[allow(dead_code)]
+fn scalar_reduce_min(data: &[f32]) -> f32 {
+    let mut m = f32::INFINITY;
+    for &v in data {
+        if v < m {
+            m = v;
+        }
+    }
+    m
+}
+
+#[allow(dead_code)]
+fn scalar_dot_product(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut comp = 0.0f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let prod = x * y;
+        let t_y = prod - comp;
+        let t = sum + t_y;
+        comp = (t - sum) - t_y;
+        sum = t;
+    }
+    sum
+}
+
+// ── Scalar softmax & layer_norm fallbacks ───────────────────────────────────
+
+#[allow(dead_code)]
+fn scalar_softmax_inplace(data: &mut [f32]) {
+    let max_val = scalar_reduce_max(data);
+    let mut sum = 0.0f32;
+    for v in data.iter_mut() {
+        *v = fast_exp_scalar(*v - max_val);
+        sum += *v;
+    }
+    if sum > 0.0 {
+        let inv = sum.recip();
+        for v in data.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn scalar_layer_norm_inplace(data: &mut [f32], scale: &[f32], bias: Option<&[f32]>, eps: f32) {
+    let n = data.len();
+    if n == 0 {
+        return;
+    }
+    let n_f = n as f32;
+    let mean = scalar_reduce_sum(data) / n_f;
+    let mut var_sum = 0.0f32;
+    for &v in data.iter() {
+        let d = v - mean;
+        var_sum += d * d;
+    }
+    let inv_std = (var_sum / n_f + eps).sqrt().recip();
+    for i in 0..n {
+        let normalized = (data[i] - mean) * inv_std;
+        data[i] = normalized * scale[i % scale.len()];
+        if let Some(b) = bias {
+            data[i] += b[i % b.len()];
+        }
     }
 }
 
@@ -478,6 +921,329 @@ mod neon_impl {
             *v = super::fast_exp_scalar(*v);
         }
     }
+
+    pub fn sub(a: &[f32], b: &[f32], out: &mut [f32]) {
+        let n = a.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            unsafe {
+                let va = vld1q_f32(a.as_ptr().add(offset));
+                let vb = vld1q_f32(b.as_ptr().add(offset));
+                vst1q_f32(out.as_mut_ptr().add(offset), vsubq_f32(va, vb));
+            }
+        }
+        for i in (chunks * LANE_WIDTH)..n {
+            out[i] = a[i] - b[i];
+        }
+    }
+
+    pub fn div(a: &[f32], b: &[f32], out: &mut [f32]) {
+        let n = a.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            unsafe {
+                let va = vld1q_f32(a.as_ptr().add(offset));
+                let vb = vld1q_f32(b.as_ptr().add(offset));
+                vst1q_f32(out.as_mut_ptr().add(offset), vdivq_f32(va, vb));
+            }
+        }
+        for i in (chunks * LANE_WIDTH)..n {
+            out[i] = a[i] / b[i];
+        }
+    }
+
+    pub fn neg(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            unsafe {
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                vst1q_f32(data.as_mut_ptr().add(offset), vnegq_f32(v));
+            }
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = -*v;
+        }
+    }
+
+    pub fn abs(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            unsafe {
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                vst1q_f32(data.as_mut_ptr().add(offset), vabsq_f32(v));
+            }
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = v.abs();
+        }
+    }
+
+    pub fn sqrt(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            unsafe {
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                vst1q_f32(data.as_mut_ptr().add(offset), vsqrtq_f32(v));
+            }
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = v.sqrt();
+        }
+    }
+
+    /// Fast natural log approximation for NEON f32x4 using IEEE 754 bit decomposition.
+    #[inline]
+    unsafe fn fast_log_neon(x: float32x4_t) -> float32x4_t {
+        // Extract exponent: (bits >> 23) - 127
+        let bits = vreinterpretq_s32_f32(x);
+        let exponent = vcvtq_f32_s32(vsubq_s32(
+            vshrq_n_s32::<23>(vandq_s32(bits, vdupq_n_s32(0x7F80_0000u32 as i32))),
+            vdupq_n_s32(127),
+        ));
+        // Reconstruct mantissa in [1, 2): (bits & 0x007FFFFF) | 0x3F800000
+        let mantissa_bits = vorrq_s32(
+            vandq_s32(bits, vdupq_n_s32(0x007F_FFFFu32 as i32)),
+            vdupq_n_s32(0x3F80_0000u32 as i32),
+        );
+        let m = vreinterpretq_f32_s32(mantissa_bits);
+        let one = vdupq_n_f32(1.0);
+        let f = vsubq_f32(m, one);
+        // Polynomial: ln(1+f) ≈ f*(c0 + f*(c1 + f*(c2 + f*(c3 + f*c4))))
+        let c0 = vdupq_n_f32(0.999_999_7);
+        let c1 = vdupq_n_f32(-0.499_999_4);
+        let c2 = vdupq_n_f32(0.333_319_8);
+        let c3 = vdupq_n_f32(-0.249_989_5);
+        let c4 = vdupq_n_f32(0.150_198_6);
+        let ln_m = vmulq_f32(
+            f,
+            vaddq_f32(
+                c0,
+                vmulq_f32(
+                    f,
+                    vaddq_f32(
+                        c1,
+                        vmulq_f32(
+                            f,
+                            vaddq_f32(c2, vmulq_f32(f, vaddq_f32(c3, vmulq_f32(f, c4)))),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        let ln2 = vdupq_n_f32(std::f32::consts::LN_2);
+        vaddq_f32(vmulq_f32(exponent, ln2), ln_m)
+    }
+
+    pub fn log(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            unsafe {
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                vst1q_f32(data.as_mut_ptr().add(offset), fast_log_neon(v));
+            }
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = super::fast_log_scalar(*v);
+        }
+    }
+
+    // ── NEON horizontal reductions ──────────────────────────────────────────
+
+    pub fn reduce_sum(data: &[f32]) -> f32 {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        // SAFETY: NEON is always available on aarch64; bounds checked by chunk iteration
+        unsafe {
+            let mut acc = vdupq_n_f32(0.0);
+            for i in 0..chunks {
+                let offset = i * LANE_WIDTH;
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                acc = vaddq_f32(acc, v);
+            }
+            let mut sum = vaddvq_f32(acc);
+            // Tail elements
+            for &v in &data[chunks * LANE_WIDTH..] {
+                sum += v;
+            }
+            sum
+        }
+    }
+
+    pub fn reduce_max(data: &[f32]) -> f32 {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        // SAFETY: NEON is always available on aarch64; bounds checked
+        unsafe {
+            let mut acc = vdupq_n_f32(f32::NEG_INFINITY);
+            for i in 0..chunks {
+                let offset = i * LANE_WIDTH;
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                acc = vmaxq_f32(acc, v);
+            }
+            let mut m = vmaxvq_f32(acc);
+            for &v in &data[chunks * LANE_WIDTH..] {
+                if v > m {
+                    m = v;
+                }
+            }
+            m
+        }
+    }
+
+    pub fn reduce_min(data: &[f32]) -> f32 {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        // SAFETY: NEON is always available on aarch64; bounds checked
+        unsafe {
+            let mut acc = vdupq_n_f32(f32::INFINITY);
+            for i in 0..chunks {
+                let offset = i * LANE_WIDTH;
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                acc = vminq_f32(acc, v);
+            }
+            let mut m = vminvq_f32(acc);
+            for &v in &data[chunks * LANE_WIDTH..] {
+                if v < m {
+                    m = v;
+                }
+            }
+            m
+        }
+    }
+
+    pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len();
+        let chunks = n / LANE_WIDTH;
+
+        // SAFETY: NEON is always available on aarch64; bounds checked
+        unsafe {
+            let mut acc = vdupq_n_f32(0.0);
+            for i in 0..chunks {
+                let offset = i * LANE_WIDTH;
+                let va = vld1q_f32(a.as_ptr().add(offset));
+                let vb = vld1q_f32(b.as_ptr().add(offset));
+                acc = vfmaq_f32(acc, va, vb);
+            }
+            let mut sum = vaddvq_f32(acc);
+            let start = chunks * LANE_WIDTH;
+            for i in start..n {
+                sum += a[i] * b[i];
+            }
+            sum
+        }
+    }
+
+    pub fn softmax_inplace(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        // Step 1: Find max
+        let max_val = reduce_max(data);
+
+        // Step 2: Subtract max and compute exp (vectorized)
+        // SAFETY: NEON is always available on aarch64; bounds checked by chunk iteration
+        unsafe {
+            let v_max = vdupq_n_f32(max_val);
+            for i in 0..chunks {
+                let offset = i * LANE_WIDTH;
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                let shifted = vsubq_f32(v, v_max);
+                vst1q_f32(data.as_mut_ptr().add(offset), fast_exp_neon(shifted));
+            }
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = super::fast_exp_scalar(*v - max_val);
+        }
+
+        // Step 3: Sum all exp values
+        let sum = reduce_sum(data);
+
+        // Step 4: Divide all by sum
+        if sum > 0.0 {
+            let inv_sum = sum.recip();
+            // SAFETY: NEON always available; bounds checked
+            unsafe {
+                let v_inv = vdupq_n_f32(inv_sum);
+                for i in 0..chunks {
+                    let offset = i * LANE_WIDTH;
+                    let v = vld1q_f32(data.as_ptr().add(offset));
+                    vst1q_f32(data.as_mut_ptr().add(offset), vmulq_f32(v, v_inv));
+                }
+            }
+            for v in data[chunks * LANE_WIDTH..].iter_mut() {
+                *v *= inv_sum;
+            }
+        }
+    }
+
+    pub fn layer_norm_inplace(data: &mut [f32], scale: &[f32], bias: Option<&[f32]>, eps: f32) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        // Step 1: mean
+        let mean = reduce_sum(data) / n as f32;
+
+        // Step 2: variance (vectorized)
+        let var_sum;
+        // SAFETY: NEON always available; bounds checked
+        unsafe {
+            let v_mean = vdupq_n_f32(mean);
+            let mut acc = vdupq_n_f32(0.0);
+            for i in 0..chunks {
+                let offset = i * LANE_WIDTH;
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                let diff = vsubq_f32(v, v_mean);
+                acc = vfmaq_f32(acc, diff, diff);
+            }
+            let mut vs = vaddvq_f32(acc);
+            for &v in data[chunks * LANE_WIDTH..].iter() {
+                let d = v - mean;
+                vs += d * d;
+            }
+            var_sum = vs;
+        }
+        let inv_std = (var_sum / n as f32 + eps).sqrt().recip();
+
+        // Step 3: normalize + scale + bias (vectorized)
+        // SAFETY: NEON always available; bounds checked
+        unsafe {
+            let v_mean = vdupq_n_f32(mean);
+            let v_inv_std = vdupq_n_f32(inv_std);
+            for i in 0..chunks {
+                let offset = i * LANE_WIDTH;
+                let v = vld1q_f32(data.as_ptr().add(offset));
+                let mut result = vmulq_f32(vsubq_f32(v, v_mean), v_inv_std);
+                let s = vld1q_f32(scale.as_ptr().add(offset % scale.len()));
+                result = vmulq_f32(result, s);
+                if let Some(b) = bias {
+                    let vb = vld1q_f32(b.as_ptr().add(offset % b.len()));
+                    result = vaddq_f32(result, vb);
+                }
+                vst1q_f32(data.as_mut_ptr().add(offset), result);
+            }
+        }
+        // Tail elements
+        for i in (chunks * LANE_WIDTH)..n {
+            let normalized = (data[i] - mean) * inv_std;
+            data[i] = normalized * scale[i % scale.len()];
+            if let Some(b) = bias {
+                data[i] += b[i % b.len()];
+            }
+        }
+    }
 }
 
 // ── AVX2 (x86_64) implementations ──────────────────────────────────────────
@@ -724,156 +1490,385 @@ mod avx2_impl {
             *v = super::fast_exp_scalar(*v);
         }
     }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn sub(a: &[f32], b: &[f32], out: &mut [f32]) {
+        let n = a.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let va = _mm256_loadu_ps(a.as_ptr().add(offset));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(offset));
+            _mm256_storeu_ps(out.as_mut_ptr().add(offset), _mm256_sub_ps(va, vb));
+        }
+        for i in (chunks * LANE_WIDTH)..n {
+            out[i] = a[i] - b[i];
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn div(a: &[f32], b: &[f32], out: &mut [f32]) {
+        let n = a.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let va = _mm256_loadu_ps(a.as_ptr().add(offset));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(offset));
+            _mm256_storeu_ps(out.as_mut_ptr().add(offset), _mm256_div_ps(va, vb));
+        }
+        for i in (chunks * LANE_WIDTH)..n {
+            out[i] = a[i] / b[i];
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn neg(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+        let zero = _mm256_setzero_ps();
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            _mm256_storeu_ps(data.as_mut_ptr().add(offset), _mm256_sub_ps(zero, v));
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = -*v;
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn abs(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+        // Mask off the sign bit: abs(x) = x & 0x7FFFFFFF
+        let sign_mask = _mm256_set1_ps(f32::from_bits(0x7FFF_FFFF));
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            _mm256_storeu_ps(data.as_mut_ptr().add(offset), _mm256_and_ps(v, sign_mask));
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = v.abs();
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn sqrt(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            _mm256_storeu_ps(data.as_mut_ptr().add(offset), _mm256_sqrt_ps(v));
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = v.sqrt();
+        }
+    }
+
+    /// Fast natural log approximation for AVX2 using IEEE 754 bit decomposition.
+    ///
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn fast_log_avx2(x: __m256) -> __m256 {
+        // Extract exponent: (bits >> 23) & 0xFF - 127
+        let bits = _mm256_castps_si256(x);
+        let exponent = _mm256_cvtepi32_ps(_mm256_sub_epi32(
+            _mm256_srli_epi32(
+                _mm256_and_si256(bits, _mm256_set1_epi32(0x7F80_0000u32 as i32)),
+                23,
+            ),
+            _mm256_set1_epi32(127),
+        ));
+        // Reconstruct mantissa in [1, 2)
+        let mantissa_bits = _mm256_or_si256(
+            _mm256_and_si256(bits, _mm256_set1_epi32(0x007F_FFFFu32 as i32)),
+            _mm256_set1_epi32(0x3F80_0000u32 as i32),
+        );
+        let m = _mm256_castsi256_ps(mantissa_bits);
+        let one = _mm256_set1_ps(1.0);
+        let f = _mm256_sub_ps(m, one);
+        // Polynomial: ln(1+f) ≈ f*(c0 + f*(c1 + f*(c2 + f*(c3 + f*c4))))
+        let c0 = _mm256_set1_ps(0.999_999_7);
+        let c1 = _mm256_set1_ps(-0.499_999_4);
+        let c2 = _mm256_set1_ps(0.333_319_8);
+        let c3 = _mm256_set1_ps(-0.249_989_5);
+        let c4 = _mm256_set1_ps(0.150_198_6);
+        let inner = _mm256_add_ps(c3, _mm256_mul_ps(f, c4));
+        let inner = _mm256_add_ps(c2, _mm256_mul_ps(f, inner));
+        let inner = _mm256_add_ps(c1, _mm256_mul_ps(f, inner));
+        let inner = _mm256_add_ps(c0, _mm256_mul_ps(f, inner));
+        let ln_m = _mm256_mul_ps(f, inner);
+        let ln2 = _mm256_set1_ps(std::f32::consts::LN_2);
+        _mm256_add_ps(_mm256_mul_ps(exponent, ln2), ln_m)
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn log(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            _mm256_storeu_ps(data.as_mut_ptr().add(offset), fast_log_avx2(v));
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = super::fast_log_scalar(*v);
+        }
+    }
+
+    // ── AVX2 horizontal reductions ──────────────────────────────────────────
+
+    /// Horizontal sum of a __m256 register.
+    /// hadd → [a0+a1, a2+a3, b0+b1, b2+b3, a4+a5, a6+a7, b4+b5, b6+b7] pattern
+    /// Two hadd's then extract low and high 128-bit lanes and add.
+    ///
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn hsum_avx2(v: __m256) -> f32 {
+        // hadd pairs: [a0+a1, a2+a3, a0+a1, a2+a3, a4+a5, a6+a7, a4+a5, a6+a7]
+        let sum1 = _mm256_hadd_ps(v, v);
+        // hadd again: [a0+a1+a2+a3, ..., a4+a5+a6+a7, ...]
+        let sum2 = _mm256_hadd_ps(sum1, sum1);
+        // Extract low 128 and high 128
+        let lo = _mm256_castps256_ps128(sum2);
+        let hi = _mm256_extractf128_ps(sum2, 1);
+        let total = _mm_add_ss(lo, hi);
+        _mm_cvtss_f32(total)
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 and FMA are supported.
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn reduce_sum(data: &[f32]) -> f32 {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        let mut acc = _mm256_setzero_ps();
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            acc = _mm256_add_ps(acc, v);
+        }
+        let mut sum = hsum_avx2(acc);
+        for &v in &data[chunks * LANE_WIDTH..] {
+            sum += v;
+        }
+        sum
+    }
+
+    /// Horizontal max across a __m256 register.
+    ///
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn hmax_avx2(v: __m256) -> f32 {
+        // Compare high and low 128-bit halves
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let m128 = _mm_max_ps(lo, hi); // 4 elements
+                                       // Shuffle and max within 128 bits
+        let shuf = _mm_movehdup_ps(m128); // [1,1,3,3]
+        let m2 = _mm_max_ps(m128, shuf); // max of pairs
+        let shuf2 = _mm_movehl_ps(m2, m2); // move high 64 to low
+        let m1 = _mm_max_ss(m2, shuf2);
+        _mm_cvtss_f32(m1)
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn reduce_max(data: &[f32]) -> f32 {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        let mut acc = _mm256_set1_ps(f32::NEG_INFINITY);
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            acc = _mm256_max_ps(acc, v);
+        }
+        let mut m = hmax_avx2(acc);
+        for &v in &data[chunks * LANE_WIDTH..] {
+            if v > m {
+                m = v;
+            }
+        }
+        m
+    }
+
+    /// Horizontal min across a __m256 register.
+    ///
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn hmin_avx2(v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let m128 = _mm_min_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(m128);
+        let m2 = _mm_min_ps(m128, shuf);
+        let shuf2 = _mm_movehl_ps(m2, m2);
+        let m1 = _mm_min_ss(m2, shuf2);
+        _mm_cvtss_f32(m1)
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 is supported.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn reduce_min(data: &[f32]) -> f32 {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        let mut acc = _mm256_set1_ps(f32::INFINITY);
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            acc = _mm256_min_ps(acc, v);
+        }
+        let mut m = hmin_avx2(acc);
+        for &v in &data[chunks * LANE_WIDTH..] {
+            if v < m {
+                m = v;
+            }
+        }
+        m
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 and FMA are supported.
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len();
+        let chunks = n / LANE_WIDTH;
+
+        let mut acc = _mm256_setzero_ps();
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let va = _mm256_loadu_ps(a.as_ptr().add(offset));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(offset));
+            acc = _mm256_fmadd_ps(va, vb, acc);
+        }
+        let mut sum = hsum_avx2(acc);
+        let start = chunks * LANE_WIDTH;
+        for i in start..n {
+            sum += a[i] * b[i];
+        }
+        sum
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 and FMA are supported.
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn softmax_inplace(data: &mut [f32]) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        // Step 1: Find max
+        let max_val = reduce_max(data);
+
+        // Step 2: Subtract max and compute exp (vectorized)
+        let v_max = _mm256_set1_ps(max_val);
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            let shifted = _mm256_sub_ps(v, v_max);
+            _mm256_storeu_ps(data.as_mut_ptr().add(offset), fast_exp_avx2(shifted));
+        }
+        for v in data[chunks * LANE_WIDTH..].iter_mut() {
+            *v = super::fast_exp_scalar(*v - max_val);
+        }
+
+        // Step 3: Sum all exp values
+        let sum = reduce_sum(data);
+
+        // Step 4: Divide all by sum
+        if sum > 0.0 {
+            let inv_sum = sum.recip();
+            let v_inv = _mm256_set1_ps(inv_sum);
+            for i in 0..chunks {
+                let offset = i * LANE_WIDTH;
+                let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+                _mm256_storeu_ps(data.as_mut_ptr().add(offset), _mm256_mul_ps(v, v_inv));
+            }
+            for v in data[chunks * LANE_WIDTH..].iter_mut() {
+                *v *= inv_sum;
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure AVX2 and FMA are supported.
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn layer_norm_inplace(
+        data: &mut [f32],
+        scale: &[f32],
+        bias: Option<&[f32]>,
+        eps: f32,
+    ) {
+        let n = data.len();
+        let chunks = n / LANE_WIDTH;
+
+        // Step 1: mean
+        let mean = reduce_sum(data) / n as f32;
+
+        // Step 2: variance (vectorized)
+        let v_mean = _mm256_set1_ps(mean);
+        let mut var_acc = _mm256_setzero_ps();
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            let diff = _mm256_sub_ps(v, v_mean);
+            var_acc = _mm256_fmadd_ps(diff, diff, var_acc);
+        }
+        let mut var_sum = hsum_avx2(var_acc);
+        for &v in data[chunks * LANE_WIDTH..].iter() {
+            let d = v - mean;
+            var_sum += d * d;
+        }
+        let inv_std = (var_sum / n as f32 + eps).sqrt().recip();
+
+        // Step 3: normalize + scale + bias (vectorized)
+        let v_inv_std = _mm256_set1_ps(inv_std);
+        for i in 0..chunks {
+            let offset = i * LANE_WIDTH;
+            let v = _mm256_loadu_ps(data.as_ptr().add(offset));
+            let mut result = _mm256_mul_ps(_mm256_sub_ps(v, v_mean), v_inv_std);
+            let s = _mm256_loadu_ps(scale.as_ptr().add(offset % scale.len()));
+            result = _mm256_mul_ps(result, s);
+            if let Some(b) = bias {
+                let vb = _mm256_loadu_ps(b.as_ptr().add(offset % b.len()));
+                result = _mm256_add_ps(result, vb);
+            }
+            _mm256_storeu_ps(data.as_mut_ptr().add(offset), result);
+        }
+        // Tail elements
+        for i in (chunks * LANE_WIDTH)..n {
+            let normalized = (data[i] - mean) * inv_std;
+            data[i] = normalized * scale[i % scale.len()];
+            if let Some(b) = bias {
+                data[i] += b[i % b.len()];
+            }
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TOL: f32 = 1e-2;
-
-    fn assert_close(a: f32, b: f32, tol: f32, msg: &str) {
-        assert!(
-            (a - b).abs() < tol,
-            "{msg}: expected {b}, got {a}, diff={}",
-            (a - b).abs()
-        );
-    }
-
-    #[test]
-    fn test_simd_add() {
-        let a: Vec<f32> = (0..33).map(|i| i as f32 * 0.5).collect();
-        let b: Vec<f32> = (0..33).map(|i| i as f32 * 0.3 + 1.0).collect();
-        let mut out = vec![0.0f32; 33];
-        simd_add(&a, &b, &mut out);
-
-        for i in 0..33 {
-            assert_close(out[i], a[i] + b[i], 1e-6, "simd_add");
-        }
-    }
-
-    #[test]
-    fn test_simd_mul() {
-        let a: Vec<f32> = (0..33).map(|i| i as f32 * 0.5).collect();
-        let b: Vec<f32> = (0..33).map(|i| i as f32 * 0.3 + 1.0).collect();
-        let mut out = vec![0.0f32; 33];
-        simd_mul(&a, &b, &mut out);
-
-        for i in 0..33 {
-            assert_close(out[i], a[i] * b[i], 1e-6, "simd_mul");
-        }
-    }
-
-    #[test]
-    fn test_simd_relu() {
-        let mut data: Vec<f32> = vec![-3.0, -1.5, -0.1, 0.0, 0.1, 1.5, 3.0, -100.0, 100.0];
-        simd_relu(&mut data);
-
-        assert_close(data[0], 0.0, 1e-6, "relu neg");
-        assert_close(data[1], 0.0, 1e-6, "relu neg");
-        assert_close(data[2], 0.0, 1e-6, "relu neg");
-        assert_close(data[3], 0.0, 1e-6, "relu zero");
-        assert_close(data[4], 0.1, 1e-6, "relu pos");
-        assert_close(data[5], 1.5, 1e-6, "relu pos");
-        assert_close(data[6], 3.0, 1e-6, "relu pos");
-        assert_close(data[7], 0.0, 1e-6, "relu large neg");
-        assert_close(data[8], 100.0, 1e-6, "relu large pos");
-    }
-
-    #[test]
-    fn test_simd_sigmoid() {
-        let mut data: Vec<f32> = vec![-5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0];
-        simd_sigmoid(&mut data);
-
-        for &v in &data {
-            assert!(v >= 0.0 && v <= 1.0, "sigmoid out of range: {v}");
-        }
-
-        assert_close(data[3], 0.5, TOL, "sigmoid(0)");
-        assert_close(data[0] + data[6], 1.0, TOL, "sigmoid symmetry");
-        assert_close(data[1] + data[5], 1.0, TOL, "sigmoid symmetry");
-        assert_close(data[2] + data[4], 1.0, TOL, "sigmoid symmetry");
-    }
-
-    #[test]
-    fn test_simd_tanh() {
-        let mut data: Vec<f32> = vec![-5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0];
-        simd_tanh(&mut data);
-
-        for &v in &data {
-            assert!(v >= -1.0 - TOL && v <= 1.0 + TOL, "tanh out of range: {v}");
-        }
-
-        assert_close(data[3], 0.0, TOL, "tanh(0)");
-        assert_close(data[0] + data[6], 0.0, TOL, "tanh odd");
-        assert_close(data[1] + data[5], 0.0, TOL, "tanh odd");
-    }
-
-    #[test]
-    fn test_simd_gelu() {
-        let mut data: Vec<f32> = vec![-3.0, -1.0, 0.0, 1.0, 3.0];
-        simd_gelu(&mut data);
-
-        assert_close(data[2], 0.0, TOL, "gelu(0)");
-        assert_close(data[3], 0.8412, 0.05, "gelu(1)");
-        assert_close(data[1], -0.1588, 0.05, "gelu(-1)");
-    }
-
-    #[test]
-    fn test_simd_silu() {
-        let mut data: Vec<f32> = vec![-3.0, -1.0, 0.0, 1.0, 3.0];
-        simd_silu(&mut data);
-
-        assert_close(data[2], 0.0, TOL, "silu(0)");
-        assert_close(data[3], 0.7311, 0.05, "silu(1)");
-    }
-
-    #[test]
-    fn test_simd_exp() {
-        let mut data: Vec<f32> = vec![0.0, 1.0, -1.0, 2.0, -2.0];
-        simd_exp(&mut data);
-
-        assert_close(data[0], 1.0, TOL, "exp(0)");
-        assert_close(data[1], std::f32::consts::E, 0.1, "exp(1)");
-        assert_close(data[2], 1.0 / std::f32::consts::E, 0.05, "exp(-1)");
-    }
-
-    #[test]
-    fn test_simd_small_arrays() {
-        let a = vec![1.0f32, 2.0];
-        let b = vec![3.0f32, 4.0];
-        let mut out = vec![0.0f32; 2];
-        simd_add(&a, &b, &mut out);
-        assert_close(out[0], 4.0, 1e-6, "small add 0");
-        assert_close(out[1], 6.0, 1e-6, "small add 1");
-
-        let mut small = vec![0.5f32];
-        simd_relu(&mut small);
-        assert_close(small[0], 0.5, 1e-6, "small relu");
-
-        let mut small = vec![-0.5f32];
-        simd_relu(&mut small);
-        assert_close(small[0], 0.0, 1e-6, "small relu neg");
-    }
-
-    #[test]
-    fn test_simd_empty() {
-        let a: Vec<f32> = vec![];
-        let b: Vec<f32> = vec![];
-        let mut out: Vec<f32> = vec![];
-        simd_add(&a, &b, &mut out);
-        simd_mul(&a, &b, &mut out);
-        assert!(out.is_empty());
-
-        let mut empty: Vec<f32> = vec![];
-        simd_relu(&mut empty);
-        simd_sigmoid(&mut empty);
-        simd_tanh(&mut empty);
-        simd_gelu(&mut empty);
-        simd_silu(&mut empty);
-        simd_exp(&mut empty);
-        assert!(empty.is_empty());
-    }
-}

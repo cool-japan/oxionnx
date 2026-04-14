@@ -178,9 +178,19 @@ pub fn softmax(x: &Tensor, axis: i64) -> Result<Tensor, String> {
     }
 
     let mut data = x.data.clone();
-    let outer: usize = x.shape[..ax].iter().product();
     let inner: usize = x.shape[ax + 1..].iter().product();
     let axis_len = x.shape[ax];
+
+    // SIMD fast path: softmax along the last axis (contiguous in memory)
+    #[cfg(feature = "simd")]
+    {
+        if inner == 1 {
+            crate::simd_ops::simd_softmax_strided(&mut data, axis_len);
+            return Ok(Tensor::new(data, x.shape.clone()));
+        }
+    }
+
+    let outer: usize = x.shape[..ax].iter().product();
 
     for o in 0..outer {
         for i in 0..inner {
@@ -227,37 +237,48 @@ pub fn layer_norm(
         axis as usize
     };
 
-    let outer: usize = x.shape[..ax].iter().product();
     let norm_size: usize = x.shape[ax..].iter().product();
 
     let mut data = x.data.clone();
 
-    for o in 0..outer {
-        let slice = &mut data[o * norm_size..(o + 1) * norm_size];
-        // mean
-        let mean = slice.iter().sum::<f32>() / norm_size as f32;
-        // variance
-        let var = slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / norm_size as f32;
-        let inv_std = (var + eps).sqrt().recip();
-        for v in slice.iter_mut() {
-            *v = (*v - mean) * inv_std;
-        }
+    // SIMD fast path: LayerNorm over last `norm_size` elements per chunk
+    #[cfg(feature = "simd")]
+    {
+        let bias_data = bias.map(|b| b.data.as_slice());
+        crate::simd_ops::simd_layer_norm_strided(&mut data, norm_size, &scale.data, bias_data, eps);
+        Ok(Tensor::new(data, x.shape.clone()))
     }
 
-    // scale and bias (broadcast over outer dims)
-    let scale_len = scale.numel();
-    for (i, v) in data.iter_mut().enumerate() {
-        let s = scale.data[i % scale_len];
-        *v *= s;
-    }
-    if let Some(bias) = bias {
-        let bias_len = bias.numel();
+    #[cfg(not(feature = "simd"))]
+    {
+        let outer: usize = x.shape[..ax].iter().product();
+        for o in 0..outer {
+            let slice = &mut data[o * norm_size..(o + 1) * norm_size];
+            // mean
+            let mean = slice.iter().sum::<f32>() / norm_size as f32;
+            // variance
+            let var = slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / norm_size as f32;
+            let inv_std = (var + eps).sqrt().recip();
+            for v in slice.iter_mut() {
+                *v = (*v - mean) * inv_std;
+            }
+        }
+
+        // scale and bias (broadcast over outer dims)
+        let scale_len = scale.numel();
         for (i, v) in data.iter_mut().enumerate() {
-            *v += bias.data[i % bias_len];
+            let s = scale.data[i % scale_len];
+            *v *= s;
         }
-    }
+        if let Some(bias) = bias {
+            let bias_len = bias.numel();
+            for (i, v) in data.iter_mut().enumerate() {
+                *v += bias.data[i % bias_len];
+            }
+        }
 
-    Ok(Tensor::new(data, x.shape.clone()))
+        Ok(Tensor::new(data, x.shape.clone()))
+    }
 }
 
 /// Group normalization (special case: group_norm with groups=1 = layer_norm over C*H*W).
@@ -780,28 +801,87 @@ pub fn batch_norm(
     Ok(Tensor::new(data, x.shape.clone()))
 }
 
+/// Hardmax: along `axis`, produces a one-hot tensor with 1.0 at the argmax, 0.0 elsewhere.
+///
+/// ONNX spec: same shape as input, 1.0 at position of maximum value along `axis`.
+pub fn hardmax(x: &Tensor, axis: i64) -> Result<Tensor, String> {
+    let ndim = x.ndim();
+    let ax = if axis < 0 {
+        (axis + ndim as i64) as usize
+    } else {
+        axis as usize
+    };
+    if ax >= ndim {
+        return Err(format!(
+            "hardmax: axis {axis} out of range for {ndim}D tensor"
+        ));
+    }
+    let outer: usize = x.shape[..ax].iter().product::<usize>().max(1);
+    let inner: usize = x.shape[ax + 1..].iter().product::<usize>().max(1);
+    let axis_len = x.shape[ax];
+    let mut out = vec![0.0f32; x.numel()];
+    for o in 0..outer {
+        for i in 0..inner {
+            let mut best_k = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for k in 0..axis_len {
+                let idx = o * axis_len * inner + k * inner + i;
+                if x.data[idx] > best_v {
+                    best_v = x.data[idx];
+                    best_k = k;
+                }
+            }
+            out[o * axis_len * inner + best_k * inner + i] = 1.0;
+        }
+    }
+    Ok(Tensor::new(out, x.shape.clone()))
+}
+
+/// Shrink activation: y = x + bias if x < -lambd; x - bias if x > lambd; else 0.
+///
+/// ONNX spec defaults: bias=0.0, lambd=0.5.
+pub fn shrink(x: &Tensor, bias: f32, lambd: f32) -> Tensor {
+    let data: Vec<f32> = x
+        .data
+        .iter()
+        .map(|&v| {
+            if v < -lambd {
+                v + bias
+            } else if v > lambd {
+                v - bias
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    Tensor::new(data, x.shape.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxionnx_core::OnnxError;
 
     #[test]
-    fn test_softmax_last_dim() {
+    fn test_softmax_last_dim() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
-        let y = softmax(&x, -1).unwrap();
+        let y = softmax(&x, -1)?;
         let sum: f32 = y.data.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
         assert!(y.data[2] > y.data[1] && y.data[1] > y.data[0]);
+        Ok(())
     }
 
     #[test]
-    fn test_layer_norm() {
+    fn test_layer_norm() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
         let scale = Tensor::new(vec![1.0, 1.0, 1.0], vec![3]);
         let bias = Tensor::new(vec![0.0, 0.0, 0.0], vec![3]);
-        let y = layer_norm(&x, &scale, Some(&bias), 1e-5, -1).unwrap();
+        let y = layer_norm(&x, &scale, Some(&bias), 1e-5, -1)?;
         // Each row should have mean≈0
         let mean0: f32 = y.data[..3].iter().sum::<f32>() / 3.0;
         assert!(mean0.abs() < 1e-5, "mean={mean0}");
+        Ok(())
     }
 
     #[test]
@@ -855,13 +935,14 @@ mod tests {
     }
 
     #[test]
-    fn test_rms_norm() {
+    fn test_rms_norm() -> Result<(), OnnxError> {
         let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]);
         let scale = Tensor::new(vec![1.0; 4], vec![4]);
-        let y = rms_norm(&x, &scale, 1e-6).unwrap();
+        let y = rms_norm(&x, &scale, 1e-6)?;
         // Each row should have RMS ≈ 1
         let sq_mean: f32 = y.data.iter().map(|&v| v * v).sum::<f32>() / 4.0;
         assert!((sq_mean - 1.0).abs() < 1e-4, "sq_mean={sq_mean}");
+        Ok(())
     }
 
     #[test]
@@ -912,6 +993,7 @@ mod tests {
         assert!(log_softmax(&t, 5).is_err());
     }
 
+    #[allow(clippy::approx_constant)]
     #[test]
     fn test_softplus() {
         let t = Tensor::new(vec![0.0, 1.0, -1.0, 20.0, -20.0], vec![5]);
@@ -978,8 +1060,8 @@ mod tests {
     #[test]
     fn test_selu() {
         let t = Tensor::new(vec![1.0, 0.0, -1.0], vec![3]);
-        let alpha = 1.6732632423543772_f32;
-        let gamma = 1.0507009873554805_f32;
+        let alpha = 1.673_263_2_f32;
+        let gamma = 1.050_701_f32;
         let out = selu(&t, alpha, gamma);
         assert!((out.data[0] - gamma).abs() < 1e-4);
         // selu(0) = gamma * (alpha*exp(0) - alpha) = gamma * 0 = 0
@@ -1101,5 +1183,33 @@ mod tests {
         let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         let out = dropout(&t);
         assert_eq!(out.data, t.data);
+    }
+
+    // ── J-phase nn ops tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_hardmax_basic() {
+        let x = Tensor::new(vec![1.0, 3.0, 2.0], vec![3]);
+        let out = hardmax(&x, 0).unwrap();
+        assert_eq!(out.data, vec![0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_hardmax_negative_axis() {
+        let x = Tensor::new(vec![1.0, 3.0, 2.0, 4.0], vec![2, 2]);
+        let out = hardmax(&x, -1).unwrap();
+        // row0: [1,3] → max at idx 1 → [0,1]
+        // row1: [2,4] → max at idx 1 → [0,1]
+        assert_eq!(out.data, vec![0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_shrink_basic() {
+        let x = Tensor::new(vec![-2.0, -0.3, 0.0, 0.3, 2.0], vec![5]);
+        let out = shrink(&x, 0.0, 0.5);
+        // -2 < -0.5 → -2+0=-2; -0.3 in [-0.5, 0.5] → 0; 0 → 0; 0.3 → 0; 2 > 0.5 → 2-0=2
+        assert!((out.data[0] - (-2.0)).abs() < 1e-5);
+        assert!((out.data[1] - 0.0).abs() < 1e-5);
+        assert!((out.data[4] - 2.0).abs() < 1e-5);
     }
 }

@@ -1,5 +1,31 @@
 use oxionnx_core::Tensor;
 
+/// Check if the reduction covers all dimensions (full-tensor reduction).
+/// This is true when axes is empty (ONNX convention: all axes)
+/// or when axes lists every dimension index.
+#[cfg(feature = "simd")]
+fn is_full_reduction(x: &Tensor, axes: &[i64]) -> bool {
+    if axes.is_empty() {
+        return true;
+    }
+    let ndim = x.ndim();
+    if axes.len() < ndim {
+        return false;
+    }
+    let mut seen = vec![false; ndim];
+    for &a in axes {
+        let idx = if a < 0 {
+            (a + ndim as i64) as usize
+        } else {
+            a as usize
+        };
+        if idx < ndim {
+            seen[idx] = true;
+        }
+    }
+    seen.iter().all(|&s| s)
+}
+
 /// Broadcast a tensor to the given shape.
 pub fn broadcast_to(t: &Tensor, out_shape: &[usize]) -> Tensor {
     if t.shape == out_shape {
@@ -75,6 +101,12 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
 }
 
 pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
+    #[cfg(feature = "simd")]
+    if a.shape == b.shape {
+        let mut out = vec![0.0f32; a.data.len()];
+        crate::simd_ops::simd_sub(&a.data, &b.data, &mut out);
+        return Ok(Tensor::new(out, a.shape.clone()));
+    }
     elementwise_binary(a, b, |x, y| x - y)
 }
 
@@ -89,6 +121,12 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
 }
 
 pub fn div(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
+    #[cfg(feature = "simd")]
+    if a.shape == b.shape {
+        let mut out = vec![0.0f32; a.data.len()];
+        crate::simd_ops::simd_div(&a.data, &b.data, &mut out);
+        return Ok(Tensor::new(out, a.shape.clone()));
+    }
     elementwise_binary(a, b, |x, y| x / y)
 }
 
@@ -97,6 +135,13 @@ pub fn pow(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
 }
 
 pub fn sqrt(a: &Tensor) -> Tensor {
+    #[cfg(feature = "simd")]
+    {
+        let mut data = a.data.clone();
+        crate::simd_ops::simd_sqrt(&mut data);
+        Tensor::new(data, a.shape.clone())
+    }
+    #[cfg(not(feature = "simd"))]
     Tensor::new(a.data.iter().map(|x| x.sqrt()).collect(), a.shape.clone())
 }
 
@@ -105,6 +150,13 @@ pub fn reciprocal(a: &Tensor) -> Tensor {
 }
 
 pub fn neg(a: &Tensor) -> Tensor {
+    #[cfg(feature = "simd")]
+    {
+        let mut data = a.data.clone();
+        crate::simd_ops::simd_neg(&mut data);
+        Tensor::new(data, a.shape.clone())
+    }
+    #[cfg(not(feature = "simd"))]
     Tensor::new(a.data.iter().map(|x| -x).collect(), a.shape.clone())
 }
 
@@ -197,14 +249,38 @@ where
 }
 
 pub fn reduce_mean(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    #[cfg(feature = "simd")]
+    {
+        if is_full_reduction(x, axes) {
+            let val = crate::simd_ops::simd_reduce_mean(&x.data);
+            let shape = if keepdims { vec![1; x.ndim()] } else { vec![1] };
+            return Ok(Tensor::new(vec![val], shape));
+        }
+    }
     reduce_with(x, axes, keepdims, 0.0, |a, v| a + v, |s, c| s / c as f32)
 }
 
 pub fn reduce_sum(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    #[cfg(feature = "simd")]
+    {
+        if is_full_reduction(x, axes) {
+            let val = crate::simd_ops::simd_reduce_sum(&x.data);
+            let shape = if keepdims { vec![1; x.ndim()] } else { vec![1] };
+            return Ok(Tensor::new(vec![val], shape));
+        }
+    }
     reduce_with(x, axes, keepdims, 0.0, |a, v| a + v, |s, _| s)
 }
 
 pub fn reduce_max(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    #[cfg(feature = "simd")]
+    {
+        if is_full_reduction(x, axes) {
+            let val = crate::simd_ops::simd_reduce_max(&x.data);
+            let shape = if keepdims { vec![1; x.ndim()] } else { vec![1] };
+            return Ok(Tensor::new(vec![val], shape));
+        }
+    }
     reduce_with(
         x,
         axes,
@@ -216,11 +292,64 @@ pub fn reduce_max(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, St
 }
 
 pub fn reduce_min(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    #[cfg(feature = "simd")]
+    {
+        if is_full_reduction(x, axes) {
+            let val = crate::simd_ops::simd_reduce_min(&x.data);
+            let shape = if keepdims { vec![1; x.ndim()] } else { vec![1] };
+            return Ok(Tensor::new(vec![val], shape));
+        }
+    }
     reduce_with(x, axes, keepdims, f32::INFINITY, |a, v| a.min(v), |s, _| s)
 }
 
 pub fn reduce_prod(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
     reduce_with(x, axes, keepdims, 1.0, |a, v| a * v, |s, _| s)
+}
+
+/// ReduceL1: sum(|x|)
+pub fn reduce_l1(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    reduce_with(x, axes, keepdims, 0.0, |a, v| a + v.abs(), |s, _| s)
+}
+
+/// ReduceL2: sqrt(sum(x^2))
+pub fn reduce_l2(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    reduce_with(x, axes, keepdims, 0.0, |a, v| a + v * v, |s, _| s.sqrt())
+}
+
+/// ReduceLogSum: log(sum(x))
+pub fn reduce_log_sum(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    reduce_with(x, axes, keepdims, 0.0, |a, v| a + v, |s, _| s.ln())
+}
+
+/// ReduceSumSquare: sum(x^2)
+pub fn reduce_sum_square(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    reduce_with(x, axes, keepdims, 0.0, |a, v| a + v * v, |s, _| s)
+}
+
+/// ReduceLogSumExp: log(sum(exp(x))) — numerically stable via max-subtract trick.
+pub fn reduce_log_sum_exp(x: &Tensor, axes: &[i64], keepdims: bool) -> Result<Tensor, String> {
+    // Step 1: max with keepdims=true for broadcasting
+    let max_keep = reduce_max(x, axes, true)?;
+    // Step 2: x - max (sub handles broadcasting internally)
+    let shifted = sub(x, &max_keep)?;
+    // Step 3: sum(exp(shifted)) with requested keepdims
+    let exp_data: Vec<f32> = shifted.data.iter().map(|v| v.exp()).collect();
+    let exp_tensor = Tensor::new(exp_data, shifted.shape.clone());
+    let sum_exp = reduce_sum(&exp_tensor, axes, keepdims)?;
+    // Step 4: log(sum_exp) + max_final
+    let max_final = if keepdims {
+        max_keep
+    } else {
+        reduce_max(x, axes, false)?
+    };
+    let out_data: Vec<f32> = sum_exp
+        .data
+        .iter()
+        .zip(max_final.data.iter())
+        .map(|(&s, &m)| s.ln() + m)
+        .collect();
+    Ok(Tensor::new(out_data, sum_exp.shape.clone()))
 }
 
 // ── ArgMax / ArgMin ─────────────────────────────────────────────────────────
@@ -428,6 +557,9 @@ pub fn top_k(
 
 /// Matrix multiplication supporting batched tensors.
 /// Last two dims: [M, K] @ [K, N] = [M, N]
+///
+/// When `batch_size >= 4` and not targeting wasm32, batch iterations are
+/// parallelised with rayon for throughput.
 #[allow(unsafe_code)] // matrixmultiply::sgemm requires unsafe
 pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
     let an = a.ndim();
@@ -456,51 +588,118 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
     let batch_size: usize = out_batch.iter().product::<usize>().max(1);
     let a_batch_stride = m * k;
     let b_batch_stride = k * n;
-    let out_size = batch_size * m * n;
+    let mn = m * n;
+    let out_size = batch_size * mn;
 
-    let mut out = vec![0.0f32; out_size];
+    let a_batches = a.numel() / (m * k);
+    let b_batches = b.numel() / (k * n);
 
-    if m >= 4 {
-        for b_idx in 0..batch_size {
-            let a_off = (b_idx % (a.numel() / (m * k))) * a_batch_stride;
-            let b_off = (b_idx % (b.numel() / (k * n))) * b_batch_stride;
-            let c_off = b_idx * m * n;
+    // Helper: compute a single batch slice into `dst`
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_batch_slice(
+        a_data: &[f32],
+        b_data: &[f32],
+        dst: &mut [f32],
+        a_off: usize,
+        b_off: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        if m >= 4 {
             unsafe {
                 matrixmultiply::sgemm(
                     m,
                     k,
                     n,
                     1.0,
-                    a.data[a_off..].as_ptr(),
+                    a_data[a_off..].as_ptr(),
                     k as isize,
                     1,
-                    b.data[b_off..].as_ptr(),
+                    b_data[b_off..].as_ptr(),
                     n as isize,
                     1,
                     0.0,
-                    out[c_off..].as_mut_ptr(),
+                    dst.as_mut_ptr(),
                     n as isize,
                     1,
                 );
             }
-        }
-    } else {
-        for b_idx in 0..batch_size {
-            let a_off = (b_idx % (a.numel() / (m * k))) * a_batch_stride;
-            let b_off = (b_idx % (b.numel() / (k * n))) * b_batch_stride;
-            let c_off = b_idx * m * n;
+        } else {
             for i in 0..m {
-                let a_row = &a.data[a_off + i * k..a_off + (i + 1) * k];
+                let a_row = &a_data[a_off + i * k..a_off + (i + 1) * k];
                 for j in 0..n {
                     let mut s = 0.0f32;
                     for (kk, &a_val) in a_row.iter().enumerate() {
-                        s += a_val * b.data[b_off + kk * n + j];
+                        s += a_val * b_data[b_off + kk * n + j];
                     }
-                    out[c_off + i * n + j] = s;
+                    dst[i * n + j] = s;
                 }
             }
         }
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let out = if batch_size >= 4 {
+        use rayon::prelude::*;
+        let a_data = &a.data;
+        let b_data = &b.data;
+        let results: Vec<Vec<f32>> = (0..batch_size)
+            .into_par_iter()
+            .map(|b_idx| {
+                let a_off = (b_idx % a_batches) * a_batch_stride;
+                let b_off = (b_idx % b_batches) * b_batch_stride;
+                let mut buf = vec![0.0f32; mn];
+                matmul_batch_slice(a_data, b_data, &mut buf, a_off, b_off, m, k, n);
+                buf
+            })
+            .collect();
+        let mut out = Vec::with_capacity(out_size);
+        for r in results {
+            out.extend_from_slice(&r);
+        }
+        out
+    } else {
+        let mut out = vec![0.0f32; out_size];
+        for b_idx in 0..batch_size {
+            let a_off = (b_idx % a_batches) * a_batch_stride;
+            let b_off = (b_idx % b_batches) * b_batch_stride;
+            let c_off = b_idx * mn;
+            matmul_batch_slice(
+                &a.data,
+                &b.data,
+                &mut out[c_off..c_off + mn],
+                a_off,
+                b_off,
+                m,
+                k,
+                n,
+            );
+        }
+        out
+    };
+
+    #[cfg(target_arch = "wasm32")]
+    let out = {
+        let mut out = vec![0.0f32; out_size];
+        for b_idx in 0..batch_size {
+            let a_off = (b_idx % a_batches) * a_batch_stride;
+            let b_off = (b_idx % b_batches) * b_batch_stride;
+            let c_off = b_idx * mn;
+            matmul_batch_slice(
+                &a.data,
+                &b.data,
+                &mut out[c_off..c_off + mn],
+                a_off,
+                b_off,
+                m,
+                k,
+                n,
+            );
+        }
+        out
+    };
 
     let mut out_shape = out_batch;
     out_shape.push(m);
@@ -534,17 +733,27 @@ pub fn gemm(
 }
 
 fn transpose_2d(t: &Tensor) -> Result<Tensor, String> {
-    if t.ndim() != 2 {
-        return Err(format!("transpose_2d: expected 2D, got {}D", t.ndim()));
+    let nd = t.ndim();
+    if nd < 2 {
+        return Err(format!("transpose_2d: expected at least 2D, got {nd}D"));
     }
-    let (rows, cols) = (t.shape[0], t.shape[1]);
-    let mut out = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c * rows + r] = t.data[r * cols + c];
+    let rows = t.shape[nd - 2];
+    let cols = t.shape[nd - 1];
+    let batch: usize = t.shape[..nd - 2].iter().product::<usize>().max(1);
+    let slice = rows * cols;
+    let mut out = vec![0.0f32; t.data.len()];
+    for b in 0..batch {
+        let base = b * slice;
+        for r in 0..rows {
+            for c in 0..cols {
+                out[base + c * rows + r] = t.data[base + r * cols + c];
+            }
         }
     }
-    Ok(Tensor::new(out, vec![cols, rows]))
+    let mut new_shape = t.shape[..nd - 2].to_vec();
+    new_shape.push(cols);
+    new_shape.push(rows);
+    Ok(Tensor::new(out, new_shape))
 }
 
 // ── Unary element-wise: trig & rounding ─────────────────────────────────────
@@ -789,139 +998,156 @@ pub fn variadic_mean(tensors: &[&Tensor]) -> Result<Tensor, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxionnx_core::OnnxError;
 
     #[test]
-    fn test_add_same_shape() {
+    fn test_add_same_shape() -> Result<(), OnnxError> {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         let b = Tensor::new(vec![4.0, 5.0, 6.0], vec![3]);
-        let c = add(&a, &b).unwrap();
+        let c = add(&a, &b)?;
         assert_eq!(c.data, vec![5.0, 7.0, 9.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_add_broadcast_scalar() {
+    fn test_add_broadcast_scalar() -> Result<(), OnnxError> {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         let b = Tensor::new(vec![10.0], vec![1]);
-        let c = add(&a, &b).unwrap();
+        let c = add(&a, &b)?;
         assert_eq!(c.data, vec![11.0, 12.0, 13.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_matmul_2x3_3x4() {
+    fn test_matmul_2x3_3x4() -> Result<(), OnnxError> {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
         let b = Tensor::new(
             vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             vec![3, 4],
         );
-        let c = matmul(&a, &b).unwrap();
+        let c = matmul(&a, &b)?;
         assert_eq!(c.shape, vec![2, 4]);
         assert!((c.data[0] - 1.0).abs() < 1e-5);
         assert!((c.data[1] - 2.0).abs() < 1e-5);
         assert!((c.data[4] - 4.0).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
-    fn test_reduce_mean() {
+    fn test_reduce_mean() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
-        let m = reduce_mean(&t, &[1], false).unwrap();
+        let m = reduce_mean(&t, &[1], false)?;
         assert_eq!(m.shape, vec![2]);
         assert!((m.data[0] - 2.0).abs() < 1e-5);
         assert!((m.data[1] - 5.0).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
-    fn test_reduce_sum() {
+    fn test_reduce_sum() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
-        let s = reduce_sum(&t, &[1], false).unwrap();
+        let s = reduce_sum(&t, &[1], false)?;
         assert_eq!(s.shape, vec![2]);
         assert!((s.data[0] - 6.0).abs() < 1e-5);
         assert!((s.data[1] - 15.0).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
-    fn test_reduce_max_keepdims() {
+    fn test_reduce_max_keepdims() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 5.0, 3.0, 2.0], vec![2, 2]);
-        let m = reduce_max(&t, &[1], true).unwrap();
+        let m = reduce_max(&t, &[1], true)?;
         assert_eq!(m.shape, vec![2, 1]);
         assert_eq!(m.data, vec![5.0, 3.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_reduce_min() {
+    fn test_reduce_min() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 5.0, 3.0, 2.0], vec![2, 2]);
-        let m = reduce_min(&t, &[1], false).unwrap();
+        let m = reduce_min(&t, &[1], false)?;
         assert_eq!(m.data, vec![1.0, 2.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_reduce_prod() {
+    fn test_reduce_prod() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
-        let p = reduce_prod(&t, &[1], false).unwrap();
+        let p = reduce_prod(&t, &[1], false)?;
         assert_eq!(p.data, vec![2.0, 12.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_arg_max() {
+    fn test_arg_max() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 5.0, 3.0, 2.0, 4.0, 0.0], vec![2, 3]);
-        let idx = arg_max(&t, 1, false).unwrap();
+        let idx = arg_max(&t, 1, false)?;
         assert_eq!(idx.shape, vec![2]);
         assert_eq!(idx.data[0], 1.0); // max of [1,5,3] is at index 1
         assert_eq!(idx.data[1], 1.0); // max of [2,4,0] is at index 1
+        Ok(())
     }
 
     #[test]
-    fn test_arg_min() {
+    fn test_arg_min() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 5.0, 3.0, 2.0, 4.0, 0.0], vec![2, 3]);
-        let idx = arg_min(&t, 1, false).unwrap();
+        let idx = arg_min(&t, 1, false)?;
         assert_eq!(idx.data[0], 0.0); // min of [1,5,3] is at index 0
         assert_eq!(idx.data[1], 2.0); // min of [2,4,0] is at index 2
+        Ok(())
     }
 
     #[test]
-    fn test_cumsum_inclusive() {
+    fn test_cumsum_inclusive() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
-        let c = cumsum(&t, 0, false, false).unwrap();
+        let c = cumsum(&t, 0, false, false)?;
         assert_eq!(c.data, vec![1.0, 3.0, 6.0, 10.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_cumsum_exclusive() {
+    fn test_cumsum_exclusive() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
-        let c = cumsum(&t, 0, true, false).unwrap();
+        let c = cumsum(&t, 0, true, false)?;
         assert_eq!(c.data, vec![0.0, 1.0, 3.0, 6.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_range() {
-        let r = range(0.0, 5.0, 1.0).unwrap();
+    fn test_range() -> Result<(), OnnxError> {
+        let r = range(0.0, 5.0, 1.0)?;
         assert_eq!(r.data, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
         assert_eq!(r.shape, vec![5]);
+        Ok(())
     }
 
     #[test]
-    fn test_range_negative_delta() {
-        let r = range(5.0, 0.0, -1.0).unwrap();
+    fn test_range_negative_delta() -> Result<(), OnnxError> {
+        let r = range(5.0, 0.0, -1.0)?;
         assert_eq!(r.data, vec![5.0, 4.0, 3.0, 2.0, 1.0]);
+        Ok(())
     }
 
     #[test]
-    fn test_top_k_largest() {
+    fn test_top_k_largest() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0], vec![8]);
-        let (vals, idxs) = top_k(&t, 3, 0, true, true).unwrap();
+        let (vals, idxs) = top_k(&t, 3, 0, true, true)?;
         assert_eq!(vals.shape, vec![3]);
         assert!((vals.data[0] - 9.0).abs() < 1e-5);
         assert!((vals.data[1] - 6.0).abs() < 1e-5);
         assert!((vals.data[2] - 5.0).abs() < 1e-5);
         assert_eq!(idxs.data[0], 5.0); // 9 is at index 5
+        Ok(())
     }
 
     #[test]
-    fn test_top_k_smallest() {
+    fn test_top_k_smallest() -> Result<(), OnnxError> {
         let t = Tensor::new(vec![3.0, 1.0, 4.0, 1.0, 5.0], vec![5]);
-        let (vals, _) = top_k(&t, 2, 0, false, true).unwrap();
+        let (vals, _) = top_k(&t, 2, 0, false, true)?;
         assert_eq!(vals.shape, vec![2]);
         assert!((vals.data[0] - 1.0).abs() < 1e-5);
         assert!((vals.data[1] - 1.0).abs() < 1e-5);
+        Ok(())
     }
 
     // ── Unary math ops tests ────────────────────────────────────────────────
@@ -1090,5 +1316,123 @@ mod tests {
         assert!(variadic_max(&[]).is_err());
         assert!(variadic_sum(&[]).is_err());
         assert!(variadic_mean(&[]).is_err());
+    }
+
+    // ── J-phase reduce ops tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_reduce_l1_basic() {
+        let x = Tensor::new(vec![-1.0, 2.0, -3.0, 4.0], vec![2, 2]);
+        let out = reduce_l1(&x, &[1], false).unwrap();
+        // row0: |-1|+|2|=3, row1: |-3|+|4|=7
+        assert_eq!(out.shape, vec![2]);
+        assert!((out.data[0] - 3.0).abs() < 1e-5);
+        assert!((out.data[1] - 7.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_reduce_l2_basic() {
+        let x = Tensor::new(vec![3.0, 4.0], vec![2]);
+        let out = reduce_l2(&x, &[], false).unwrap();
+        assert!((out.data[0] - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_reduce_log_sum_basic() {
+        let x = Tensor::new(vec![1.0, 1.0], vec![2]);
+        let out = reduce_log_sum(&x, &[], false).unwrap();
+        assert!((out.data[0] - (2.0f32).ln()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_reduce_sum_square_basic() {
+        let x = Tensor::new(vec![2.0, 3.0], vec![2]);
+        let out = reduce_sum_square(&x, &[], false).unwrap();
+        assert!((out.data[0] - 13.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_reduce_log_sum_exp_stability() {
+        // Naive exp(1000) overflows; stable impl must stay finite.
+        // x = [1000, 1001, 1002], max = 1002
+        // shifted = [-2, -1, 0]
+        // result = 1002 + log(exp(-2) + exp(-1) + exp(0))
+        let x = Tensor::new(vec![1000.0, 1001.0, 1002.0], vec![3]);
+        let out = reduce_log_sum_exp(&x, &[], false).unwrap();
+        let expected = 1002.0f32 + ((-2.0f32).exp() + (-1.0f32).exp() + 1.0f32).ln();
+        assert!(
+            (out.data[0] - expected).abs() < 1e-3,
+            "got {}, expected {}",
+            out.data[0],
+            expected
+        );
+        // Also verify it is finite (the key stability property)
+        assert!(out.data[0].is_finite(), "result must be finite");
+    }
+
+    // ── Batched MatMul parallel tests ───────────────────────────────────────
+
+    #[test]
+    fn test_batched_matmul_parallel() {
+        // batch=8, each [2,3] @ [3,2] = [2,2]
+        let batch = 8;
+        let m = 2;
+        let k = 3;
+        let n = 2;
+        let a_data: Vec<f32> = (0..batch * m * k).map(|i| (i as f32) * 0.1).collect();
+        let b_data: Vec<f32> = (0..batch * k * n).map(|i| (i as f32) * 0.1 + 0.5).collect();
+        let a = Tensor::new(a_data, vec![batch, m, k]);
+        let b = Tensor::new(b_data, vec![batch, k, n]);
+        let out = matmul(&a, &b).expect("matmul failed");
+        assert_eq!(out.shape, vec![batch, m, n]);
+        // Verify first batch manually: a[0] = [[0,0.1,0.2],[0.3,0.4,0.5]]
+        // b[0] = [[0.5,0.6],[0.7,0.8],[0.9,1.0]]
+        // c[0,0,0] = 0*0.5 + 0.1*0.7 + 0.2*0.9 = 0 + 0.07 + 0.18 = 0.25
+        assert!(
+            (out.data[0] - 0.25).abs() < 1e-4,
+            "matmul batch 0 [0,0]={}",
+            out.data[0]
+        );
+    }
+
+    #[test]
+    fn test_batched_matmul_single_batch() {
+        // batch=1 uses sequential path
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]);
+        let b = Tensor::new(vec![5.0, 6.0, 7.0, 8.0], vec![1, 2, 2]);
+        let out = matmul(&a, &b).expect("matmul failed");
+        assert_eq!(out.shape, vec![1, 2, 2]);
+        // [[1,2],[3,4]] @ [[5,6],[7,8]] = [[19,22],[43,50]]
+        assert!((out.data[0] - 19.0).abs() < 1e-4);
+        assert!((out.data[1] - 22.0).abs() < 1e-4);
+        assert!((out.data[2] - 43.0).abs() < 1e-4);
+        assert!((out.data[3] - 50.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_batched_matmul_large_batch() {
+        // batch=32, [4,4] @ [4,4] identity check
+        let batch = 32;
+        let sz = 4;
+        // Identity matrix tiled
+        let mut eye = vec![0.0f32; sz * sz];
+        for i in 0..sz {
+            eye[i * sz + i] = 1.0;
+        }
+        let b_data: Vec<f32> = (0..batch).flat_map(|_| eye.iter().copied()).collect();
+        let a_data: Vec<f32> = (0..batch * sz * sz).map(|i| (i as f32) * 0.01).collect();
+        let a = Tensor::new(a_data.clone(), vec![batch, sz, sz]);
+        let b = Tensor::new(b_data, vec![batch, sz, sz]);
+        let out = matmul(&a, &b).expect("matmul failed");
+        assert_eq!(out.shape, vec![batch, sz, sz]);
+        // A @ I = A
+        for i in 0..a_data.len() {
+            assert!(
+                (out.data[i] - a_data[i]).abs() < 1e-4,
+                "matmul identity [{i}]: got {}, expected {}",
+                out.data[i],
+                a_data[i]
+            );
+        }
     }
 }

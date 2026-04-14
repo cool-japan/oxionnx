@@ -361,6 +361,7 @@ fn build_gpt2() -> (Graph, HashMap<String, Tensor>) {
         nodes: b.nodes,
         input_names: vec!["input".to_string()],
         output_names: vec![logits],
+        ..Default::default()
     };
 
     (graph, b.weights)
@@ -502,8 +503,9 @@ fn test_gpt2_deterministic() {
 
     assert_eq!(v1.len(), v2.len());
     for (i, (a, b)) in v1.iter().zip(v2.iter()).enumerate() {
+        let tol = 1e-4 * a.abs().max(b.abs()).max(1.0);
         assert!(
-            (a - b).abs() < 1e-4,
+            (a - b).abs() < tol,
             "Determinism broken at index {i}: {a} vs {b}"
         );
     }

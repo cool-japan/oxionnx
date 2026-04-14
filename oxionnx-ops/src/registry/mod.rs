@@ -176,10 +176,36 @@ pub fn default_registry() -> OperatorRegistry {
     r.register_as("CeLU", Box::new(nn_ops::CeluOp));
     r.register_as("Expand", Box::new(shape_ops::ExpandOp));
 
+    // ── Audio / DSP ops ────────────────────────────────────────────────────
+    r.register(Box::new(crate::dsp::DFTOp));
+    r.register(Box::new(crate::dsp::STFTOp));
+    r.register(Box::new(crate::dsp::HannWindowOp));
+    r.register(Box::new(crate::dsp::HammingWindowOp));
+    r.register(Box::new(crate::dsp::BlackmanWindowOp));
+    r.register(Box::new(crate::dsp::MelWeightMatrixOp));
+    r.register(Box::new(crate::dsp::BernoulliOp));
+
     // ── Control flow ops ───────────────────────────────────────────────────
     r.register(Box::new(crate::control_flow::IfOp));
     r.register(Box::new(crate::control_flow::LoopOp));
     r.register(Box::new(crate::control_flow::ScanOp));
+
+    // ── J-phase additions ──────────────────────────────────────────────────
+    // Reduce (J-phase additions)
+    r.register(Box::new(math_ops::ReduceL1Op));
+    r.register(Box::new(math_ops::ReduceL2Op));
+    r.register(Box::new(math_ops::ReduceLogSumOp));
+    r.register(Box::new(math_ops::ReduceLogSumExpOp));
+    r.register(Box::new(math_ops::ReduceSumSquareOp));
+    // Bitwise (J-phase additions)
+    r.register(Box::new(misc_ops::BitwiseAndOp));
+    r.register(Box::new(misc_ops::BitwiseOrOp));
+    r.register(Box::new(misc_ops::BitwiseXorOp));
+    r.register(Box::new(misc_ops::BitwiseNotOp));
+    r.register(Box::new(misc_ops::SizeOp));
+    // Utility (J-phase additions)
+    r.register(Box::new(nn_ops::HardmaxOp));
+    r.register(Box::new(nn_ops::ShrinkOp));
 
     // ── ML ops ──────────────────────────────────────────────────────────────
     r.register(Box::new(ml_ops::LinearClassifierOp));

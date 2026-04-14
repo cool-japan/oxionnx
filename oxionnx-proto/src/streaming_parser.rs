@@ -544,6 +544,7 @@ pub fn parse_streaming<R: Read>(
         initializers: Vec::new(), // weights already extracted above
         inputs,
         outputs,
+        ..Default::default()
     };
 
     Ok((graph, weights))
@@ -606,6 +607,7 @@ where
         initializers: Vec::new(),
         inputs,
         outputs,
+        ..Default::default()
     };
 
     Ok((graph, weights))
@@ -638,7 +640,7 @@ mod tests {
     }
 
     fn encode_varint_field(field: u32, val: u64) -> Vec<u8> {
-        let tag = (field << 3) | 0;
+        let tag = field << 3;
         let mut buf = encode_varint(tag as u64);
         buf.extend(encode_varint(val));
         buf
@@ -926,9 +928,11 @@ mod tests {
         );
 
         for (name, batch_tensor) in &batch_weights {
-            let stream_tensor = stream_weights
-                .get(name)
-                .unwrap_or_else(|| panic!("streaming missing weight '{name}'"));
+            assert!(
+                stream_weights.contains_key(name),
+                "streaming missing weight '{name}'"
+            );
+            let stream_tensor = &stream_weights[name];
             assert_eq!(
                 batch_tensor.shape, stream_tensor.shape,
                 "shape mismatch for weight '{name}'"

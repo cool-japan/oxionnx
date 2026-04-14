@@ -5,6 +5,20 @@ use oxionnx_core::{Attributes, Graph, Node, OpKind};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Raw metadata extracted from a `ModelProto`, before conversion to the session-layer type.
+///
+/// Returned alongside graph and weights by [`load_with_metadata`] and
+/// [`load_with_metadata_and_path`].
+pub struct RawModelMeta {
+    pub producer_name: String,
+    pub producer_version: String,
+    pub domain: String,
+    pub graph_name: String,
+    pub ir_version: i64,
+    pub opset_imports: Vec<(String, i64)>,
+    pub metadata_props: Vec<(String, String)>,
+}
+
 /// Supported opset version range (inclusive).
 pub const SUPPORTED_OPSET_RANGE: (i64, i64) = (7, 21);
 
@@ -14,9 +28,11 @@ fn validate_opset(opset_imports: &[OpsetImport]) {
         if import.domain.is_empty() {
             let (min, max) = SUPPORTED_OPSET_RANGE;
             if import.version < min || import.version > max {
-                eprintln!(
-                    "Warning: model uses opset {}, supported range is {}-{}",
-                    import.version, min, max
+                tracing::warn!(
+                    opset = import.version,
+                    min,
+                    max,
+                    "model uses opset outside supported range",
                 );
             }
         }
@@ -26,11 +42,46 @@ fn validate_opset(opset_imports: &[OpsetImport]) {
 /// Load an ONNX model file and return (Graph, weight_tensors).
 /// External data is NOT supported; use `load_with_path` for models with external data.
 pub fn load(bytes: &[u8]) -> Result<(Graph, HashMap<String, Tensor>), String> {
+    let (_, graph, weights) = load_with_metadata(bytes)?;
+    Ok((graph, weights))
+}
+
+/// Load an ONNX model from bytes, resolving external data relative to `base_path`.
+pub fn load_with_path(
+    bytes: &[u8],
+    base_path: &Path,
+) -> Result<(Graph, HashMap<String, Tensor>), String> {
+    let (_, graph, weights) = load_with_metadata_and_path(bytes, base_path)?;
+    Ok((graph, weights))
+}
+
+/// Load an ONNX model file and return `(RawModelMeta, Graph, weight_tensors)`.
+///
+/// External data is NOT supported; use [`load_with_metadata_and_path`] for models
+/// that store weights in separate external files.
+pub fn load_with_metadata(
+    bytes: &[u8],
+) -> Result<(RawModelMeta, Graph, HashMap<String, Tensor>), String> {
     let model = parser::parse_model(bytes)?;
     validate_opset(&model.opset_imports);
+
+    let meta = RawModelMeta {
+        producer_name: model.producer_name.clone(),
+        producer_version: model.producer_version.clone(),
+        domain: model.domain.clone(),
+        graph_name: model.graph.name.clone(),
+        ir_version: model.ir_version,
+        opset_imports: model
+            .opset_imports
+            .iter()
+            .map(|o| (o.domain.clone(), o.version))
+            .collect(),
+        metadata_props: model.metadata_props.clone(),
+    };
+
     let graph_proto = model.graph;
 
-    // Collect initializer (weight) tensors
+    // Collect initializer (weight) tensors first (needed for input_names filter and node attrs).
     let mut weights: HashMap<String, Tensor> = HashMap::new();
     for init in &graph_proto.initializers {
         if init.data_location == 1 {
@@ -39,12 +90,22 @@ pub fn load(bytes: &[u8]) -> Result<(Graph, HashMap<String, Tensor>), String> {
         weights.insert(init.name.clone(), init.to_tensor());
     }
 
-    // Convert nodes
+    let (graph, weights_out) = build_graph_and_weights(graph_proto, weights)?;
+    Ok((meta, graph, weights_out))
+}
+
+/// Internal helper: build Graph + return weights map from a GraphProto and pre-collected
+/// weights.  The caller hands ownership of `weights` in; this function clones them for
+/// attribute resolution and returns the (possibly augmented) map together with the Graph.
+fn build_graph_and_weights(
+    graph_proto: crate::types::GraphProto,
+    weights: HashMap<String, Tensor>,
+) -> Result<(Graph, HashMap<String, Tensor>), String> {
     let mut nodes: Vec<Node> = Vec::with_capacity(graph_proto.nodes.len());
     for np in &graph_proto.nodes {
         let op = OpKind::parse(&np.op_type);
         if let OpKind::Unknown(ref name) = op {
-            eprintln!("oxionnx: unsupported op '{name}' (will be skipped)");
+            tracing::debug!(op = %name, "unsupported op, will be skipped");
         }
         let attrs = convert_attributes(&np.attributes, &weights)?;
         nodes.push(Node {
@@ -56,7 +117,6 @@ pub fn load(bytes: &[u8]) -> Result<(Graph, HashMap<String, Tensor>), String> {
         });
     }
 
-    // Input names: graph inputs that are NOT initializers (i.e. actual user inputs)
     let input_names: Vec<String> = graph_proto
         .inputs
         .iter()
@@ -64,22 +124,52 @@ pub fn load(bytes: &[u8]) -> Result<(Graph, HashMap<String, Tensor>), String> {
         .cloned()
         .collect();
 
+    let input_infos = graph_proto
+        .input_value_infos
+        .iter()
+        .map(|vi| vi.to_tensor_info())
+        .collect();
+    let output_infos = graph_proto
+        .output_value_infos
+        .iter()
+        .map(|vi| vi.to_tensor_info())
+        .collect();
+
     let graph = Graph {
+        name: graph_proto.name,
         nodes,
         input_names,
         output_names: graph_proto.outputs,
+        input_infos,
+        output_infos,
     };
 
     Ok((graph, weights))
 }
 
-/// Load an ONNX model from bytes, resolving external data relative to `base_path`.
-pub fn load_with_path(
+/// Load an ONNX model from bytes (resolving external data relative to `base_path`)
+/// and return `(RawModelMeta, Graph, weight_tensors)`.
+pub fn load_with_metadata_and_path(
     bytes: &[u8],
     base_path: &Path,
-) -> Result<(Graph, HashMap<String, Tensor>), String> {
+) -> Result<(RawModelMeta, Graph, HashMap<String, Tensor>), String> {
     let model = parser::parse_model(bytes)?;
     validate_opset(&model.opset_imports);
+
+    let meta = RawModelMeta {
+        producer_name: model.producer_name.clone(),
+        producer_version: model.producer_version.clone(),
+        domain: model.domain.clone(),
+        graph_name: model.graph.name.clone(),
+        ir_version: model.ir_version,
+        opset_imports: model
+            .opset_imports
+            .iter()
+            .map(|o| (o.domain.clone(), o.version))
+            .collect(),
+        metadata_props: model.metadata_props.clone(),
+    };
+
     let graph_proto = model.graph;
 
     // Collect initializer (weight) tensors
@@ -93,38 +183,8 @@ pub fn load_with_path(
         }
     }
 
-    // Convert nodes
-    let mut nodes: Vec<Node> = Vec::with_capacity(graph_proto.nodes.len());
-    for np in &graph_proto.nodes {
-        let op = OpKind::parse(&np.op_type);
-        if let OpKind::Unknown(ref name) = op {
-            eprintln!("oxionnx: unsupported op '{name}' (will be skipped)");
-        }
-        let attrs = convert_attributes(&np.attributes, &weights)?;
-        nodes.push(Node {
-            op,
-            name: np.name.clone(),
-            inputs: np.inputs.clone(),
-            outputs: np.outputs.clone(),
-            attrs,
-        });
-    }
-
-    // Input names: graph inputs that are NOT initializers
-    let input_names: Vec<String> = graph_proto
-        .inputs
-        .iter()
-        .filter(|name| !weights.contains_key(name.as_str()))
-        .cloned()
-        .collect();
-
-    let graph = Graph {
-        nodes,
-        input_names,
-        output_names: graph_proto.outputs,
-    };
-
-    Ok((graph, weights))
+    let (graph, weights_out) = build_graph_and_weights(graph_proto, weights)?;
+    Ok((meta, graph, weights_out))
 }
 
 /// Load tensor data from an external file referenced by the TensorProto.
@@ -211,9 +271,10 @@ fn load_external_tensor(tensor_proto: &TensorProto, base_path: &Path) -> Result<
             Ok(Tensor::new(data, shape))
         }
         dt => {
-            eprintln!(
-                "External tensor '{}': unsupported dtype {dt}, returning zeros",
-                tensor_proto.name
+            tracing::warn!(
+                tensor = %tensor_proto.name,
+                dtype = dt,
+                "external tensor: unsupported dtype, returning zeros",
             );
             Ok(Tensor::zeros(&shape))
         }
@@ -232,7 +293,7 @@ pub fn build_graph(
     for np in &graph_proto.nodes {
         let op = OpKind::parse(&np.op_type);
         if let OpKind::Unknown(ref name) = op {
-            eprintln!("oxionnx: unsupported op '{name}' (will be skipped)");
+            tracing::debug!(op = %name, "unsupported op, will be skipped");
         }
         let attrs = convert_attributes(&np.attributes, weights)?;
         nodes.push(Node {
@@ -251,10 +312,24 @@ pub fn build_graph(
         .cloned()
         .collect();
 
+    let input_infos = graph_proto
+        .input_value_infos
+        .iter()
+        .map(|vi| vi.to_tensor_info())
+        .collect();
+    let output_infos = graph_proto
+        .output_value_infos
+        .iter()
+        .map(|vi| vi.to_tensor_info())
+        .collect();
+
     Ok(Graph {
+        name: graph_proto.name.clone(),
         nodes,
         input_names,
         output_names: graph_proto.outputs.clone(),
+        input_infos,
+        output_infos,
     })
 }
 
@@ -345,7 +420,7 @@ mod tests {
     }
 
     fn encode_varint_field(field: u32, val: u64) -> Vec<u8> {
-        let tag = (field << 3) | 0;
+        let tag = field << 3;
         let mut buf = encode_varint(tag as u64);
         buf.extend(encode_varint(val));
         buf
@@ -441,7 +516,7 @@ mod tests {
 
         let result = load(&model_bytes);
         assert!(result.is_err());
-        let err = result.err().expect("should be error");
+        let err = result.expect_err("should be error");
         assert!(
             err.contains("External data requires load_with_path()"),
             "got: {err}"

@@ -40,6 +40,7 @@ fn run_op(
         nodes: vec![node],
         input_names: graph_inputs.iter().map(|s| s.to_string()).collect(),
         output_names: node_outputs.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     };
     let mut w: HashMap<String, Tensor> = HashMap::new();
     for (name, tensor) in weights {
@@ -663,6 +664,7 @@ fn conformance_concat_axis1() {
         nodes: vec![node],
         input_names: vec!["a".to_string(), "b".to_string()],
         output_names: vec!["out".to_string()],
+        ..Default::default()
     };
     let session = Session::builder()
         .with_optimization_level(OptLevel::None)

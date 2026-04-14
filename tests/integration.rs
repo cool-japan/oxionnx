@@ -40,6 +40,7 @@ fn test_identity_graph() {
         nodes: vec![make_node(OpKind::Identity, "id0", &["x"], &["y"])],
         input_names: vec!["x".to_string()],
         output_names: vec!["y".to_string()],
+        ..Default::default()
     };
     let weights: HashMap<String, Tensor> = HashMap::new();
 
@@ -60,6 +61,7 @@ fn test_add_two_constants() {
         nodes: vec![make_node(OpKind::Add, "add0", &["a", "b"], &["sum"])],
         input_names: vec![],
         output_names: vec!["sum".to_string()],
+        ..Default::default()
     };
     let mut weights: HashMap<String, Tensor> = HashMap::new();
     weights.insert("a".to_string(), Tensor::new(vec![1.0, 2.0, 3.0], vec![3]));
@@ -89,6 +91,7 @@ fn test_linear_layer() {
         ],
         input_names: vec!["x".to_string()],
         output_names: vec!["out".to_string()],
+        ..Default::default()
     };
 
     // W = [[1, 0],
@@ -144,6 +147,7 @@ fn test_conv2d_relu() {
         ],
         input_names: vec!["input".to_string()],
         output_names: vec!["relu_out".to_string()],
+        ..Default::default()
     };
 
     // Input: 5x5 image, all ones
@@ -196,6 +200,7 @@ fn test_split() {
         )],
         input_names: vec!["x".to_string()],
         output_names: vec!["a".to_string(), "b".to_string()],
+        ..Default::default()
     };
     let weights: HashMap<String, Tensor> = HashMap::new();
 
@@ -222,6 +227,7 @@ fn test_session_builder_and_introspection() {
         ],
         input_names: vec!["x".to_string()],
         output_names: vec!["out".to_string()],
+        ..Default::default()
     };
     let mut weights: HashMap<String, Tensor> = HashMap::new();
     weights.insert("W".to_string(), Tensor::new(vec![1.0; 6], vec![3, 2]));
@@ -269,6 +275,7 @@ fn test_profiling() {
         ],
         input_names: vec!["x".to_string()],
         output_names: vec!["y".to_string()],
+        ..Default::default()
     };
     let weights: HashMap<String, Tensor> = HashMap::new();
 

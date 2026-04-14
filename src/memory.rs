@@ -269,6 +269,331 @@ impl Default for BufferPool {
     }
 }
 
+// ── Size-class bucketing allocator ───────────────────────────────────────────
+
+/// Size class categories for the bucketing allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeClass {
+    /// < 128 elements
+    Tiny,
+    /// < 1024 elements
+    Small,
+    /// < 16384 elements
+    Medium,
+    /// ≥ 16384 elements
+    Large,
+}
+
+impl SizeClass {
+    /// Return the exclusive upper bound for this size class (elements).
+    /// For `Large`, returns `usize::MAX` since there is no upper bound.
+    pub fn max_elements(self) -> usize {
+        match self {
+            SizeClass::Tiny => 128,
+            SizeClass::Small => 1024,
+            SizeClass::Medium => 16384,
+            SizeClass::Large => usize::MAX,
+        }
+    }
+}
+
+/// Determine the size class for a given number of elements.
+pub fn bucket_for(size: usize) -> SizeClass {
+    if size < 128 {
+        SizeClass::Tiny
+    } else if size < 1024 {
+        SizeClass::Small
+    } else if size < 16384 {
+        SizeClass::Medium
+    } else {
+        SizeClass::Large
+    }
+}
+
+/// Per-pool allocation and reuse statistics.
+#[derive(Debug, Clone, Default)]
+pub struct PoolStats {
+    /// Total number of allocations (new buffers created).
+    pub alloc_count: u64,
+    /// Number of times a buffer was reused from the pool.
+    pub reuse_count: u64,
+    /// Peak total bytes held by the pool (cached + in-flight).
+    pub peak_bytes: usize,
+    /// Current bytes held in the pool's free lists.
+    pub current_bytes: usize,
+    /// Fragmentation ratio: wasted bytes / total cached bytes. 0.0 = perfect.
+    pub fragmentation_ratio: f32,
+}
+
+/// Size-class-based memory pool that reduces fragmentation.
+///
+/// Buckets: tiny (<128 elements), small (<1024), medium (<16384), large (≥16384).
+/// Within each bucket, best-fit allocation picks the smallest buffer ≥ requested size.
+pub struct SizeClassPool {
+    /// Free lists per size class. Each entry is a `Vec<f32>` buffer.
+    tiny: Vec<Vec<f32>>,
+    small: Vec<Vec<f32>>,
+    medium: Vec<Vec<f32>>,
+    large: Vec<Vec<f32>>,
+    /// Allocation and reuse statistics.
+    stats: PoolStats,
+}
+
+/// Maximum buffers per size class to prevent unbounded growth.
+const MAX_BUCKETS_PER_CLASS: usize = 32;
+
+impl SizeClassPool {
+    /// Create a new empty size-class pool.
+    pub fn new() -> Self {
+        Self {
+            tiny: Vec::new(),
+            small: Vec::new(),
+            medium: Vec::new(),
+            large: Vec::new(),
+            stats: PoolStats::default(),
+        }
+    }
+
+    /// Acquire a buffer with at least `size` f32 elements.
+    ///
+    /// Searches the appropriate size-class bucket for the smallest buffer
+    /// that satisfies the request (best-fit). If no suitable buffer is cached,
+    /// a fresh allocation is made. The returned buffer is zeroed and has
+    /// exactly `size` elements.
+    pub fn acquire(&mut self, size: usize) -> Vec<f32> {
+        let class = bucket_for(size);
+        let bucket = self.bucket_mut(class);
+
+        // Best-fit: find the smallest buffer with capacity >= size
+        let best_idx = Self::best_fit_index(bucket, size);
+
+        if let Some(idx) = best_idx {
+            let mut buf = bucket.remove(idx);
+            self.stats.reuse_count += 1;
+            let freed_bytes = buf.capacity() * std::mem::size_of::<f32>();
+            self.stats.current_bytes = self.stats.current_bytes.saturating_sub(freed_bytes);
+            buf.clear();
+            buf.resize(size, 0.0);
+            buf
+        } else {
+            // No suitable buffer in the primary bucket; check larger buckets
+            if let Some((found_class, idx)) = self.find_in_larger_buckets(class, size) {
+                let bucket = self.bucket_mut(found_class);
+                let mut buf = bucket.remove(idx);
+                self.stats.reuse_count += 1;
+                let freed_bytes = buf.capacity() * std::mem::size_of::<f32>();
+                self.stats.current_bytes = self.stats.current_bytes.saturating_sub(freed_bytes);
+                buf.clear();
+                buf.resize(size, 0.0);
+                buf
+            } else {
+                // Allocate fresh
+                self.stats.alloc_count += 1;
+                let buf = vec![0.0_f32; size];
+                let allocated_bytes = buf.capacity() * std::mem::size_of::<f32>();
+                let total = self.stats.current_bytes + allocated_bytes;
+                if total > self.stats.peak_bytes {
+                    self.stats.peak_bytes = total;
+                }
+                buf
+            }
+        }
+    }
+
+    /// Release a buffer back into the pool.
+    ///
+    /// The buffer is placed into the bucket corresponding to its length (requested size).
+    /// Buffers are not shrunk on return. Per-class limits prevent unbounded growth.
+    pub fn release(&mut self, buf: Vec<f32>) {
+        if buf.capacity() == 0 {
+            return;
+        }
+        let class = bucket_for(buf.len());
+        let added_bytes = buf.capacity() * std::mem::size_of::<f32>();
+
+        let bucket = self.bucket_mut(class);
+        if bucket.len() >= MAX_BUCKETS_PER_CLASS {
+            // Drop the smallest buffer in the bucket to make room
+            if let Some(smallest_cap) = bucket.first().map(|b| b.capacity()) {
+                if buf.capacity() > smallest_cap {
+                    let evicted = bucket.remove(0);
+                    let evicted_bytes = evicted.capacity() * std::mem::size_of::<f32>();
+                    self.stats.current_bytes =
+                        self.stats.current_bytes.saturating_sub(evicted_bytes);
+                } else {
+                    // Incoming buffer is smallest — just drop it
+                    return;
+                }
+            }
+        }
+
+        // Insert in sorted order by capacity (ascending) for best-fit search
+        let cap = buf.capacity();
+        let bucket = self.bucket_mut(class);
+        let pos = bucket.partition_point(|b| b.capacity() < cap);
+        bucket.insert(pos, buf);
+        self.stats.current_bytes += added_bytes;
+
+        // Update peak
+        if self.stats.current_bytes > self.stats.peak_bytes {
+            self.stats.peak_bytes = self.stats.current_bytes;
+        }
+
+        // Recompute fragmentation ratio
+        self.update_fragmentation();
+    }
+
+    /// Return a reference to the pool statistics.
+    pub fn stats(&self) -> &PoolStats {
+        &self.stats
+    }
+
+    /// Drop all cached buffers, resetting the pool.
+    pub fn clear(&mut self) {
+        self.tiny.clear();
+        self.small.clear();
+        self.medium.clear();
+        self.large.clear();
+        self.stats.current_bytes = 0;
+    }
+
+    /// Compact the pool by dropping oversized buffers.
+    ///
+    /// If fragmentation exceeds 20%, removes buffers whose capacity is more
+    /// than 2× the upper bound of their size class. For the `Large` class,
+    /// no compaction is applied since there is no meaningful upper bound.
+    pub fn compact(&mut self) {
+        if self.stats.fragmentation_ratio <= 0.20 {
+            return;
+        }
+
+        self.compact_bucket(SizeClass::Tiny);
+        self.compact_bucket(SizeClass::Small);
+        self.compact_bucket(SizeClass::Medium);
+        // Large has no upper bound — skip compaction
+
+        self.update_fragmentation();
+    }
+
+    // ── internal helpers ─────────────────────────────────────────────────────
+
+    fn bucket_mut(&mut self, class: SizeClass) -> &mut Vec<Vec<f32>> {
+        match class {
+            SizeClass::Tiny => &mut self.tiny,
+            SizeClass::Small => &mut self.small,
+            SizeClass::Medium => &mut self.medium,
+            SizeClass::Large => &mut self.large,
+        }
+    }
+
+    fn bucket_ref(&self, class: SizeClass) -> &Vec<Vec<f32>> {
+        match class {
+            SizeClass::Tiny => &self.tiny,
+            SizeClass::Small => &self.small,
+            SizeClass::Medium => &self.medium,
+            SizeClass::Large => &self.large,
+        }
+    }
+
+    /// Find the index of the smallest buffer with capacity >= `size` in a bucket.
+    fn best_fit_index(bucket: &[Vec<f32>], size: usize) -> Option<usize> {
+        // Bucket is sorted by capacity ascending, so partition_point gives us
+        // the first buffer with capacity >= size.
+        let pos = bucket.partition_point(|b| b.capacity() < size);
+        if pos < bucket.len() {
+            Some(pos)
+        } else {
+            None
+        }
+    }
+
+    /// Search buckets larger than `class` for a buffer with capacity >= `size`.
+    fn find_in_larger_buckets(&self, class: SizeClass, size: usize) -> Option<(SizeClass, usize)> {
+        let larger_classes: &[SizeClass] = match class {
+            SizeClass::Tiny => &[SizeClass::Small, SizeClass::Medium, SizeClass::Large],
+            SizeClass::Small => &[SizeClass::Medium, SizeClass::Large],
+            SizeClass::Medium => &[SizeClass::Large],
+            SizeClass::Large => &[],
+        };
+
+        for &lc in larger_classes {
+            let bucket = self.bucket_ref(lc);
+            if let Some(idx) = Self::best_fit_index(bucket, size) {
+                return Some((lc, idx));
+            }
+        }
+        None
+    }
+
+    /// Compact a single bucket by removing buffers whose capacity exceeds
+    /// 2× the class maximum.
+    fn compact_bucket(&mut self, class: SizeClass) {
+        let threshold = class.max_elements().saturating_mul(2);
+        let bucket = self.bucket_mut(class);
+
+        // Collect freed bytes first, then update stats
+        let mut freed_bytes: usize = 0;
+        bucket.retain(|buf| {
+            if buf.capacity() > threshold {
+                freed_bytes += buf.capacity() * std::mem::size_of::<f32>();
+                false
+            } else {
+                true
+            }
+        });
+        self.stats.current_bytes = self.stats.current_bytes.saturating_sub(freed_bytes);
+    }
+
+    /// Recompute fragmentation ratio as (wasted elements) / (total cached elements).
+    /// Wasted = sum of (capacity − len) for all cached buffers.
+    fn update_fragmentation(&mut self) {
+        let mut total_capacity: usize = 0;
+        let mut total_wasted: usize = 0;
+
+        for bucket in [&self.tiny, &self.small, &self.medium, &self.large] {
+            for buf in bucket {
+                total_capacity += buf.capacity();
+                // Buffers in the pool are "empty" (released), so all capacity is "available".
+                // Fragmentation here means capacity exceeds what was requested.
+                // We track capacity vs the class max as a proxy: a buffer in the Tiny
+                // class with capacity 1000 wastes ~872 elements.
+            }
+        }
+
+        // A simpler metric: measure capacity spread within each class.
+        // For each buffer, the minimum useful capacity is 1 element.
+        // We measure wasted = sum(capacity) − number_of_buffers * min_useful_in_class.
+        for (class, bucket) in [
+            (SizeClass::Tiny, &self.tiny),
+            (SizeClass::Small, &self.small),
+            (SizeClass::Medium, &self.medium),
+            (SizeClass::Large, &self.large),
+        ] {
+            let class_min = match class {
+                SizeClass::Tiny => 1,
+                SizeClass::Small => 128,
+                SizeClass::Medium => 1024,
+                SizeClass::Large => 16384,
+            };
+            for buf in bucket {
+                total_wasted += buf.capacity().saturating_sub(class_min);
+            }
+        }
+
+        if total_capacity == 0 {
+            self.stats.fragmentation_ratio = 0.0;
+        } else {
+            self.stats.fragmentation_ratio = total_wasted as f32 / total_capacity as f32;
+        }
+    }
+}
+
+impl Default for SizeClassPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +875,7 @@ mod tests {
             nodes,
             input_names: vec!["x".to_string()],
             output_names: vec!["output".to_string()],
+            ..Default::default()
         };
         let weights: HashMap<String, Tensor> = HashMap::new();
 
@@ -585,5 +911,302 @@ mod tests {
         assert!(plan.buffer_assignments.is_empty());
         assert!(plan.buffer_sizes.is_empty());
         assert_eq!(plan.peak_memory_elements, 0);
+    }
+
+    // ── SizeClassPool tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_size_class_acquire_release_preserves_content() {
+        let mut pool = SizeClassPool::new();
+        let mut buf = pool.acquire(100);
+        // Write some data
+        for (i, val) in buf.iter_mut().enumerate() {
+            *val = i as f32;
+        }
+        // Verify content before release
+        for (i, val) in buf.iter().enumerate() {
+            assert_eq!(*val, i as f32);
+        }
+        pool.release(buf);
+
+        // Acquire again — buffer is zeroed on acquire
+        let buf2 = pool.acquire(100);
+        assert_eq!(buf2.len(), 100);
+        assert!(buf2.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_size_class_reuse_increments_count() {
+        let mut pool = SizeClassPool::new();
+        assert_eq!(pool.stats().alloc_count, 0);
+        assert_eq!(pool.stats().reuse_count, 0);
+
+        // First acquire: fresh allocation
+        let buf = pool.acquire(64);
+        assert_eq!(pool.stats().alloc_count, 1);
+        assert_eq!(pool.stats().reuse_count, 0);
+
+        // Release and re-acquire: should reuse
+        pool.release(buf);
+        let _buf2 = pool.acquire(64);
+        assert_eq!(pool.stats().alloc_count, 1);
+        assert_eq!(pool.stats().reuse_count, 1);
+    }
+
+    #[test]
+    fn test_size_class_selection_tiny() {
+        assert_eq!(bucket_for(0), SizeClass::Tiny);
+        assert_eq!(bucket_for(1), SizeClass::Tiny);
+        assert_eq!(bucket_for(127), SizeClass::Tiny);
+    }
+
+    #[test]
+    fn test_size_class_selection_small() {
+        assert_eq!(bucket_for(128), SizeClass::Small);
+        assert_eq!(bucket_for(500), SizeClass::Small);
+        assert_eq!(bucket_for(1023), SizeClass::Small);
+    }
+
+    #[test]
+    fn test_size_class_selection_medium() {
+        assert_eq!(bucket_for(1024), SizeClass::Medium);
+        assert_eq!(bucket_for(8000), SizeClass::Medium);
+        assert_eq!(bucket_for(16383), SizeClass::Medium);
+    }
+
+    #[test]
+    fn test_size_class_selection_large() {
+        assert_eq!(bucket_for(16384), SizeClass::Large);
+        assert_eq!(bucket_for(100_000), SizeClass::Large);
+        assert_eq!(bucket_for(1_000_000), SizeClass::Large);
+    }
+
+    #[test]
+    fn test_size_class_best_fit() {
+        let mut pool = SizeClassPool::new();
+
+        // Create a 1000-element buffer (Small class: 128..1024)
+        let buf = vec![0.0_f32; 1000];
+        pool.release(buf);
+
+        // Acquire 500 elements — should get the 1000-element buffer (best fit in Small)
+        let acquired = pool.acquire(500);
+        assert_eq!(acquired.len(), 500);
+        // The underlying capacity should be >= 1000 (the original allocation)
+        assert!(acquired.capacity() >= 500);
+        assert_eq!(pool.stats().reuse_count, 1);
+    }
+
+    #[test]
+    fn test_size_class_compact() {
+        let mut pool = SizeClassPool::new();
+
+        // Add an oversized buffer to the Tiny class
+        // Tiny max is 128. A buffer with capacity > 256 (2×128) should be compacted.
+        let mut oversized = Vec::with_capacity(512);
+        oversized.resize(50, 0.0_f32); // len=50 (tiny), but capacity=512
+        pool.release(oversized);
+
+        // Also add a normal tiny buffer
+        let normal = vec![0.0_f32; 32];
+        pool.release(normal);
+
+        let bytes_before = pool.stats().current_bytes;
+        assert!(bytes_before > 0);
+
+        // Force compaction by setting a high fragmentation ratio
+        // The fragmentation should already be high since we have a 512-cap buffer in tiny
+        // If fragmentation > 20%, compact will drop oversized buffers
+        pool.compact();
+
+        // After compaction the oversized buffer (cap=512 > 2*128=256) should be dropped
+        let bytes_after = pool.stats().current_bytes;
+        assert!(
+            bytes_after < bytes_before,
+            "compact should free oversized buffers: before={bytes_before} after={bytes_after}"
+        );
+    }
+
+    #[test]
+    fn test_size_class_stats_tracking() {
+        let mut pool = SizeClassPool::new();
+
+        // Allocate 3 buffers of different classes
+        let b1 = pool.acquire(50); // Tiny, alloc
+        let b2 = pool.acquire(500); // Small, alloc
+        let b3 = pool.acquire(5000); // Medium, alloc
+        assert_eq!(pool.stats().alloc_count, 3);
+        assert_eq!(pool.stats().reuse_count, 0);
+
+        // Release all
+        pool.release(b1);
+        pool.release(b2);
+        pool.release(b3);
+        assert!(pool.stats().current_bytes > 0);
+
+        // Re-acquire — should reuse
+        let _b4 = pool.acquire(50);
+        let _b5 = pool.acquire(500);
+        assert_eq!(pool.stats().alloc_count, 3);
+        assert_eq!(pool.stats().reuse_count, 2);
+    }
+
+    #[test]
+    fn test_size_class_default_enable() {
+        // Verify SessionBuilder default has memory pool enabled
+        let builder = crate::session::SessionBuilder::new();
+        assert!(
+            builder.enable_memory_pool,
+            "memory pool should be enabled by default"
+        );
+    }
+
+    #[test]
+    fn test_size_class_multiple_cycles_no_leak() {
+        let mut pool = SizeClassPool::new();
+
+        // Do 100 acquire/release cycles
+        for _ in 0..100 {
+            let b1 = pool.acquire(64);
+            let b2 = pool.acquire(256);
+            let b3 = pool.acquire(2048);
+            let b4 = pool.acquire(32768);
+            pool.release(b1);
+            pool.release(b2);
+            pool.release(b3);
+            pool.release(b4);
+        }
+
+        // After cycles, the pool should hold at most MAX_BUCKETS_PER_CLASS * 4 buffers
+        // and alloc_count should be small (only first cycle allocates, rest reuse)
+        assert_eq!(
+            pool.stats().alloc_count,
+            4,
+            "only first cycle should allocate new buffers"
+        );
+        assert_eq!(
+            pool.stats().reuse_count,
+            396,
+            "remaining cycles should reuse"
+        );
+
+        // Clear and verify
+        pool.clear();
+        assert_eq!(pool.stats().current_bytes, 0);
+    }
+
+    #[test]
+    fn test_size_class_clear() {
+        let mut pool = SizeClassPool::new();
+        pool.release(vec![0.0_f32; 50]);
+        pool.release(vec![0.0_f32; 200]);
+        pool.release(vec![0.0_f32; 5000]);
+        assert!(pool.stats().current_bytes > 0);
+
+        pool.clear();
+        assert_eq!(pool.stats().current_bytes, 0);
+    }
+
+    #[test]
+    fn test_size_class_pool_stats_api() {
+        use crate::graph::Graph;
+        use crate::tensor::Tensor;
+
+        let nodes = vec![
+            make_node(OpKind::Relu, "relu", vec!["x"], vec!["a"]),
+            make_node(OpKind::Sigmoid, "sigmoid", vec!["a"], vec!["output"]),
+        ];
+        let graph = Graph {
+            nodes,
+            input_names: vec!["x".to_string()],
+            output_names: vec!["output".to_string()],
+            ..Default::default()
+        };
+        let weights: HashMap<String, Tensor> = HashMap::new();
+
+        let session = crate::session::Session::builder()
+            .with_optimization_level(crate::session::OptLevel::None)
+            .with_memory_pool(true)
+            .build_from_graph(graph, weights)
+            .expect("build should succeed");
+
+        // pool_stats() should return Some since pool is enabled
+        let stats = session.pool_stats();
+        assert!(
+            stats.is_some(),
+            "pool_stats should return Some when pool is enabled"
+        );
+    }
+
+    #[test]
+    fn test_size_class_pool_stats_none_when_disabled() {
+        use crate::graph::Graph;
+        use crate::tensor::Tensor;
+
+        let nodes = vec![
+            make_node(OpKind::Relu, "relu", vec!["x"], vec!["a"]),
+            make_node(OpKind::Sigmoid, "sigmoid", vec!["a"], vec!["output"]),
+        ];
+        let graph = Graph {
+            nodes,
+            input_names: vec!["x".to_string()],
+            output_names: vec!["output".to_string()],
+            ..Default::default()
+        };
+        let weights: HashMap<String, Tensor> = HashMap::new();
+
+        let session = crate::session::Session::builder()
+            .with_optimization_level(crate::session::OptLevel::None)
+            .with_memory_pool(false)
+            .build_from_graph(graph, weights)
+            .expect("build should succeed");
+
+        // pool_stats() should return None since pool is disabled
+        let stats = session.pool_stats();
+        assert!(
+            stats.is_none(),
+            "pool_stats should return None when pool is disabled"
+        );
+    }
+
+    #[test]
+    fn test_size_class_zero_size_acquire() {
+        let mut pool = SizeClassPool::new();
+        let buf = pool.acquire(0);
+        assert_eq!(buf.len(), 0);
+        pool.release(buf);
+        // Zero-capacity buffers are dropped on release
+        assert_eq!(pool.stats().current_bytes, 0);
+    }
+
+    #[test]
+    fn test_size_class_cross_bucket_reuse() {
+        let mut pool = SizeClassPool::new();
+
+        // Release a large buffer into the Medium bucket
+        let buf = vec![0.0_f32; 10000];
+        pool.release(buf);
+
+        // Acquire a smaller size that falls in Medium class — should reuse
+        let acquired = pool.acquire(5000);
+        assert_eq!(acquired.len(), 5000);
+        assert_eq!(pool.stats().reuse_count, 1);
+    }
+
+    #[test]
+    fn test_size_class_peak_bytes_tracking() {
+        let mut pool = SizeClassPool::new();
+
+        let b1 = pool.acquire(1000);
+        let b2 = pool.acquire(2000);
+        pool.release(b1);
+        pool.release(b2);
+
+        let peak = pool.stats().peak_bytes;
+        assert!(peak > 0, "peak_bytes should be positive after allocations");
+
+        pool.clear();
+        // Peak should remain even after clear
+        assert_eq!(pool.stats().peak_bytes, peak);
     }
 }

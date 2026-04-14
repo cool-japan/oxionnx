@@ -441,11 +441,11 @@ mod tests {
     use super::*;
     use oxionnx_core::graph::{Attributes, Node, OpKind};
 
-    fn make_context<'a>(
+    fn make_context(
         op: OpKind,
-        inputs: Vec<Option<&'a Tensor>>,
+        inputs: Vec<Option<&Tensor>>,
         attrs: Attributes,
-    ) -> (Node, Vec<Option<&'a Tensor>>) {
+    ) -> (Node, Vec<Option<&Tensor>>) {
         let node = Node {
             op,
             name: "test_node".to_string(),

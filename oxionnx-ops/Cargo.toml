@@ -15,6 +15,7 @@ categories = ["science", "mathematics"]
 
 [dependencies]
 oxionnx-core = { workspace = true }
+oxifft = { workspace = true }
 matrixmultiply = { workspace = true }
 
 [dev-dependencies]
