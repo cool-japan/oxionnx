@@ -1,7 +1,7 @@
 //! CUDA context wrapper for oxionnx-cuda.
 //!
 //! [`CudaContext`] holds a CUDA device context together with a [`DnnHandle`]
-//! (which itself contains a [`BlasHandle`], PTX cache, and stream).  A single
+//! (which itself contains a `BlasHandle`, PTX cache, and stream).  A single
 //! `CudaContext` is created once at `Session` build time and shared across all
 //! op dispatches within a session run.
 

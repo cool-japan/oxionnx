@@ -17,9 +17,9 @@ categories = ["science", "mathematics"]
 oxionnx-core = { workspace = true }
 oxifft = { workspace = true }
 matrixmultiply = { workspace = true }
+half = { workspace = true }
 
 [dev-dependencies]
-half = { workspace = true }
 
 [features]
 default = []

@@ -21,8 +21,12 @@ pub enum OnnxError {
     InvalidModel(String),
     /// Catch-all for unexpected internal failures.
     Internal(String),
-    /// Inference was cancelled via a [`CancellationToken`](crate::CancellationToken).
+    /// Inference was cancelled via a `CancellationToken`.
     Cancelled(String),
+    /// A tensor dtype is incompatible with the requested operation or dispatch path.
+    DTypeMismatch(String),
+    /// An arithmetic error occurred during computation (e.g. integer division by zero).
+    Arithmetic(String),
 }
 
 impl fmt::Display for OnnxError {
@@ -37,6 +41,8 @@ impl fmt::Display for OnnxError {
             Self::InvalidModel(s) => write!(f, "Invalid model: {s}"),
             Self::Internal(s) => write!(f, "Internal error: {s}"),
             Self::Cancelled(s) => write!(f, "Cancelled: {s}"),
+            Self::DTypeMismatch(s) => write!(f, "DType mismatch: {s}"),
+            Self::Arithmetic(s) => write!(f, "Arithmetic error: {s}"),
         }
     }
 }

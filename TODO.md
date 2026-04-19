@@ -1,10 +1,10 @@
-# OxiONNX 0.1.1 -- Pure Rust ONNX Inference Engine
+# OxiONNX 0.1.2 -- Pure Rust ONNX Inference Engine
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
 **Author:** COOLJAPAN OU (Team Kitasan)
 
-**Current stats (2026-04-14):** ~47,829 SLoC (Rust code) | 167 OpKind variants | 1,023 tests passing | workspace layout (6 crates)
+**Current stats (2026-04-19):** ~60,734 SLoC (Rust code) | 167 OpKind variants | 1,173 tests passing | workspace layout (7 crates)
 **Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)
 **Zero C/C++ dependencies.**
 
@@ -459,6 +459,7 @@ Summary of key items:
 ## 15. Future Roadmap (Deferred)
 
 ### Phase D — Operator-Native TypedTensor Dispatch
+> **Promoted to v0.1.5 — see Section 16 for tracking.**
 Full multi-dtype dispatch at the operator layer (80+ ops × 13 dtypes). Currently all
 inference runs through f32 internally; `run_typed` performs input→f32 and f32→output
 conversions. Native dispatch would avoid these round-trips for pure-integer or f16 models.
@@ -467,6 +468,7 @@ conversions. Native dispatch would avoid these round-trips for pure-integer or f
 - **Trigger**: user demand for lossless i64 tensors > 2^24 range without precision loss
 
 ### Phase E — DirectML Execution Provider (Windows)
+> **Promoted to v0.1.5 — see Section 16 for tracking.**
 Full implementation of DirectML (Direct Machine Learning, D3D12-based) execution provider
 for Windows GPU acceleration.
 - **Current state**: stub in `execution_providers.rs` (no-op, compiles)
@@ -475,9 +477,48 @@ for Windows GPU acceleration.
 - **Trigger**: Windows-first deployment requirements from downstream projects
 
 ### Phase F — Operator-Level IOBinding Reuse
+> **Promoted to v0.1.5 — see Section 16 for tracking.**
 Extend `IoBinding` to allow individual operators to write directly into pre-allocated output
 buffers (skip the intermediate `HashMap<String, Tensor>` in `run_internal`). Requires
 changing the `Operator::execute` return contract.
+
+---
+
+## 16. v0.1.5 — Phase D, E, F Promotion (In Progress)
+
+### Phase D — Operator-Native TypedTensor Dispatch (pilot)
+- [x] Infrastructure: `TypedOpContext`, `native_dtypes()`, `execute_typed()` hooks on `Operator` trait (all with backward-compat defaults) — `oxionnx-core/src/operator.rs`, `operator_typed.rs`, `operator_slots.rs`
+- [x] Pilot: 40 operators declare `native_dtypes()` + `execute_typed()` (Add, Sub, Mul, Div, Neg, Sqrt, Relu, Sigmoid, Tanh, Gelu, Exp, Log, Abs, Erf, Identity, Cast, Reshape, + 23 more)
+- [x] Typed arithmetic wired: `typed_add`, `typed_sub`, `typed_mul`, `typed_div`, `typed_relu`, `typed_sigmoid`, `typed_tanh`, `typed_gelu`, `typed_exp` from `typed_ops.rs` used in `execute_typed` bodies
+- [x] Session `run_typed()`: still uses f32 fallback for now — per-node typed dispatch deferred to v0.1.6 (requires `run_typed` rewrite to carry TypedTensor intermediates)
+- [x] v0.1.6 follow-up: Rewrite `run_typed` to carry `TypedTensor` intermediates; per-node dispatch via `native_dtypes()` (skip f32 round-trip)
+- [x] v0.1.6 follow-up: Native integer arithmetic in `typed_ops.rs` (Add/Sub/Mul/Div for I8/I16/I32/I64 without f32 intermediate)
+- [x] v0.1.6 follow-up: Native dispatch for Conv, MatMul, Gemm (heavy hand-written kernels — conv.rs, rnn.rs, attention.rs)
+  - [x] **v0.1.8 scoped slice: MatMul-only native typed dispatch** (planned 2026-04-18) — `native_dtypes()` for I8/I32/F16/BF16; `execute_typed` with INT8×INT8→I32 kernel, F16 and BF16 triple-loop kernels (f32 accumulator). No f32 round-trip. Precedent pattern for Gemm/Conv/Attention in v0.1.9+.
+  - [x] **v0.1.9 scoped slice: GemmOp native typed dispatch** (planned 2026-04-18) — `native_dtypes()` for F32/F16/BF16/I8/I32; `execute_typed` with I8×I8→I32 kernel, I32×I32→I32, F16 and BF16 triple-loop kernels. Kernels in `math_typed.rs` (new module also housing v0.1.8 matmul typed kernels). No f32 round-trip.
+  - [x] **v0.1.10 scoped slice: AttentionOp + MultiHeadAttentionOp native typed dispatch (F16/BF16)** (planned 2026-04-18) — `native_dtypes()` for F32/F16/BF16; `execute_typed` with f32-accumulator SDPA and MHA kernels (softmax in f32 for F16 numerical stability). Kernels in `attention/typed.rs` (new module). No f32 round-trip for Q/K/V. Prerequisite splitrs on attention.rs also shipped in v0.1.10.
+  - [x] **v0.1.10+ scoped slice: ConvOp + ConvTransposeOp native typed dispatch (F16/BF16)** — `native_dtypes()` for F32/F16/BF16; `execute_typed` with cast-compute-cast kernels (f32 accumulator). New module `conv_typed.rs`. No f32 round-trip for input/weight.
+  - [x] **v0.1.10+ scoped slice: LSTMOp + GRUOp native typed dispatch (F16/BF16)** — `native_dtypes()` for F32/F16/BF16; `execute_typed` with cast-compute-cast kernels. New module `rnn_typed.rs`. Multi-output (3 outputs for LSTM, 2 for GRU). No f32 round-trip.
+
+### Phase E — DirectML Execution Provider (scaffold)
+- [x] New subcrate `oxionnx-directml` with cross-platform shim (non-Windows: `try_new() -> None`) and Windows `#[cfg(target_os = "windows")]` D3D12 context skeleton
+- [x] Feature flag `directml` wired: root `Cargo.toml`, session field (`Session::dml`), session init, dispatch block in `run_sequential_inner` (CUDA → DirectML → wgpu → CPU priority order)
+- [x] Dispatch coverage: MatMul, Add, Mul, Relu, Sigmoid — all return `Err` (scaffold) → CPU fallback
+- [x] `DirectMLExecutionProvider` preserved as ort-compat no-op (with-feature: real factory path)
+- [ ] v0.1.6 follow-up: Compile and bind the MatMul HLSL compute shader (`MATMUL_HLSL` constant in `kernels/matmul.rs`)
+- [ ] v0.1.6 follow-up: Compile and bind element-wise HLSL shaders (Add, Mul, Relu, Sigmoid)
+- [ ] v0.1.6 follow-up: End-to-end Windows CI job (windows-latest matrix entry in `.github/workflows.disabled/ci.yml`)
+- [ ] v0.1.6 follow-up: Extend dispatch to Conv, Softmax, Reduce
+
+### Phase F — Operator-Level IOBinding Reuse (pilot)
+- [x] `execute_into_slots()` + `supports_output_slots()` hooks on `Operator` trait (backward-compat defaults)
+- [x] Dispatch path wired in `execute_node_with_inplace` (sequential path): if op supports slots AND static output shape known → pre-allocate from pool + write via `execute_into_slots`
+- [x] Pilot: 40 operators implement `execute_into_slots` (same set as Phase D pilot)
+- [x] `IoBinding` helpers: `take_output_buffer` / `put_output_buffer` for future pointer-identity guarantee
+- [x] `SizeClassPool::acquire()` called on Phase F path (pool is now acquire + release, not drain-only)
+- [x] v0.1.6 follow-up: `SessionRunState` with pool-aware insert/release — wraps `HashMap<String, Tensor>` with `SizeClassPool` integration; pointer-identity for IoBinding outputs via `take_output_buffer`/`put_output_buffer`. (Slot-indexed Vec variant deferred to F.11 in Proposed follow-ups.)
+- [x] v0.1.6 follow-up: Phase F pilot for parallel rayon branch (currently uses CPU-allocate path only)
+- [x] v0.1.6 follow-up: Phase F for remaining 107 operators (all non-pilot operators still use default copy path)
 
 ---
 
@@ -485,3 +526,16 @@ changing the `Operator::execute` return contract.
 
 - **Operator roadmap:** [oxionnx-ops/](oxionnx-ops/)
 - **GPU backend roadmap:** [oxionnx-gpu/](oxionnx-gpu/)
+
+---
+
+## Proposed follow-ups (deferred from v0.1.6 run, 2026-04-17)
+
+- **D.3 — Native dispatch for Conv / Attention / RNN** (**COMPLETE**): MatMul (v0.1.8), Gemm (v0.1.9), AttentionOp+MHA (v0.1.10), ConvOp+ConvTransposeOp+LSTMOp+GRUOp (v0.1.10+), Attention SIMD/NEON/AVX2 (v0.1.10+) — all shipped. No remaining items.
+- **E.4 — DirectML real HLSL compilation** (v0.1.7): D3DCompile flow requires Windows hardware. Cannot validate on darwin (dev machine). Waiting for Windows CI or user access.
+- **E.5 — Windows DirectML CI job** (v0.1.7+): All CI disabled by user. Will not re-enable without explicit instruction.
+- **E.6 — DirectML Conv/Softmax/Reduce kernels** (v0.1.7): Depends on E.4 landing first.
+- **E.7 — DirectML Q4/Q8 support** (v0.1.8): Depends on E.4 + E.6.
+- **F.11 — Slot-indexed Vec<Tensor> SessionRunState** (v0.1.8): Replace the HashMap backing with a `Vec<Tensor>` + name→index lookup table. Would save the HashMap hash computation per node (~121 ops per run). Requires a mirror change in `TypedSessionRunState` and care around `bound_outputs` ownership. Defer until a real-world workload shows HashMap cost as material.
+- **F.12 — Zero-copy per-op `execute_into_slots` for non-pilot hot ops** (in progress, 2026-04-18): 22 hot ops shipped hand-coded slot-write bodies in v0.1.6. v0.1.7 added 27 more: shape_ops (Squeeze/Unsqueeze/Flatten/Expand/Split/Tile/DepthToSpace/SpaceToDepth/ReverseSequence), nn_ops (Clip/LeakyRelu/PRelu/HardSigmoid/Celu/Elu/Selu/ThresholdedRelu/LpNorm/MeanVarianceNorm/Hardmax/Shrink), conv_ops (MaxPool/AveragePool/GlobalAveragePool/GlobalMaxPool/Pad/Resize). v0.1.8 added 3 more: Gather, ScatterND, ScatterElements — subtotal 52. v0.1.9 added 2 more: Conv, ConvTranspose — subtotal 54. v0.1.10 added 2 more: LSTM, GRU — **total 56 of 121 ops** with hand-coded slot-write bodies. Remaining (tracked as F.13): AttentionOp, MultiHeadAttentionOp. Distinct from F.10 (which only flips the opt-in bit).
+- **F.13 — F.12 remaining complex ops** (v0.1.11+): AttentionOp, MultiHeadAttentionOp. LSTM/GRU shipped in v0.1.10. Attention ops have complex Q/K/V projection + optional KV cache. Profile-gated — defer until workload shows slot-write cost as material. Distinct from F.10 (opt-in sweep) and F.12 (simpler hot ops).

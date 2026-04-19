@@ -1,0 +1,31 @@
+[package]
+name = "oxionnx-directml"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "DirectML (Windows D3D12) execution provider for OxiONNX — Windows-only GPU dispatch"
+readme = "README.md"
+keywords = ["onnx", "directml", "d3d12", "windows", "gpu"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+oxionnx-core = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+] }
+
+[features]
+default = []

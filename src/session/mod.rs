@@ -56,4 +56,6 @@ pub struct Session {
     pub(crate) gpu: Option<crate::gpu::GpuContext>,
     #[cfg(feature = "cuda")]
     pub(crate) cuda: Option<oxionnx_cuda::CudaContext>,
+    #[cfg(feature = "directml")]
+    pub(crate) dml: Option<oxionnx_directml::DirectMLContext>,
 }

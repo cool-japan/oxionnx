@@ -16,6 +16,8 @@ categories = ["parser-implementations", "encoding"]
 [dependencies]
 oxionnx-core = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }
 memmap2 = { workspace = true, optional = true }
 
 [features]

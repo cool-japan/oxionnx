@@ -72,8 +72,7 @@ wasm-pack.log
 **/src_backup_*/
 
 # Claude/Copilot settings
-**/.claude/settings.local.json
+**/.claude/
 **/CLAUDE.md
 **/CLAUDE.local.md
 **/.hypothesis/
-.claude/worktrees/

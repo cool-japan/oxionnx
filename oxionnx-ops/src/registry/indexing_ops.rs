@@ -17,6 +17,38 @@ impl Operator for GatherOp {
         let axis = ctx.attrs().i("axis", 0);
         Ok(vec![indexing::gather(x, idx, axis)?])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        let data = ctx.input(0)?;
+        let indices = ctx.input(1)?;
+        let axis_raw = ctx.attrs().i("axis", 0);
+        let ndim = data.shape.len();
+        let axis = if axis_raw < 0 {
+            (axis_raw + ndim as i64) as usize
+        } else {
+            axis_raw as usize
+        };
+        // Output shape: data.shape[..axis] ++ indices.shape ++ data.shape[axis+1..]
+        let out_shape: Vec<usize> = data.shape[..axis]
+            .iter()
+            .chain(indices.shape.iter())
+            .chain(data.shape[axis + 1..].iter())
+            .copied()
+            .collect();
+        let out_len: usize = out_shape.iter().product();
+        if slots[0].data.len() != out_len {
+            slots[0].data.resize(out_len, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&out_shape);
+        indexing::gather_into(data, &indices.data, axis, &mut slots[0].data);
+        Ok(())
+    }
 }
 
 // ── GatherElements ──────────────────────────────────────────────────────────
@@ -31,6 +63,9 @@ impl Operator for GatherElementsOp {
         let idx = ctx.input(1)?;
         let axis = ctx.attrs().i("axis", 0);
         Ok(vec![indexing::gather_elements(x, idx, axis)?])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -49,6 +84,9 @@ impl Operator for GatherNDOp {
             batch_dims,
         )?])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── Where ───────────────────────────────────────────────────────────────────
@@ -63,6 +101,9 @@ impl Operator for WhereOp {
         let x = ctx.input(1)?;
         let y = ctx.input(2)?;
         Ok(vec![indexing::where_op(cond, x, y)?])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -82,6 +123,39 @@ impl Operator for ScatterElementsOp {
             data, indices, updates, axis,
         )?])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        let data = ctx.input(0)?;
+        let indices = ctx.input(1)?;
+        let updates = ctx.input(2)?;
+        let axis_raw = ctx.attrs().i("axis", 0);
+        let ndim = data.shape.len();
+        let axis = if axis_raw < 0 {
+            (axis_raw + ndim as i64) as usize
+        } else {
+            axis_raw as usize
+        };
+        if slots[0].data.len() != data.data.len() {
+            slots[0].data.resize(data.data.len(), 0.0_f32);
+        }
+        slots[0].shape.clone_from(&data.shape);
+        slots[0].data.copy_from_slice(&data.data);
+        indexing::scatter_elements_into(
+            &data.shape,
+            &indices.shape,
+            &indices.data,
+            &updates.data,
+            axis,
+            &mut slots[0].data,
+        );
+        Ok(())
+    }
 }
 
 // ── ScatterND ───────────────────────────────────────────────────────────────
@@ -96,6 +170,32 @@ impl Operator for ScatterNDOp {
         let indices = ctx.input(1)?;
         let updates = ctx.input(2)?;
         Ok(vec![indexing::scatter_nd(data, indices, updates)?])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        let data = ctx.input(0)?;
+        let indices = ctx.input(1)?;
+        let updates = ctx.input(2)?;
+        let k = indices.shape.last().copied().unwrap_or(0);
+        if slots[0].data.len() != data.data.len() {
+            slots[0].data.resize(data.data.len(), 0.0_f32);
+        }
+        slots[0].shape.clone_from(&data.shape);
+        slots[0].data.copy_from_slice(&data.data);
+        indexing::scatter_nd_into(
+            &data.shape,
+            k,
+            &indices.data,
+            &updates.data,
+            &mut slots[0].data,
+        );
+        Ok(())
     }
 }
 
@@ -112,6 +212,9 @@ impl Operator for QuantizeLinearOp {
         let zp = ctx.optional_input(2);
         Ok(vec![indexing::quantize_linear(x, scale, zp)?])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── DequantizeLinear ────────────────────────────────────────────────────────
@@ -126,6 +229,9 @@ impl Operator for DequantizeLinearOp {
         let scale = ctx.input(1)?;
         let zp = ctx.optional_input(2);
         Ok(vec![indexing::dequantize_linear(x, scale, zp)?])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -154,6 +260,9 @@ impl Operator for OneHotOp {
             axis,
         )?])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── Compress ────────────────────────────────────────────────────────────────
@@ -178,6 +287,9 @@ impl Operator for CompressOp {
             axis,
         )?])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── Unique ──────────────────────────────────────────────────────────────────
@@ -200,5 +312,8 @@ impl Operator for UniqueOp {
         let sorted = attrs.i("sorted", 1) != 0;
         let (y, idx, inv, counts) = indexing::unique(ctx.input(0)?, axis, sorted)?;
         Ok(vec![y, idx, inv, counts])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }

@@ -1,4 +1,5 @@
 #![cfg(feature = "simd")]
+#![allow(clippy::needless_range_loop, clippy::useless_vec)]
 
 use oxionnx_ops::simd_ops::*;
 

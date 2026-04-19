@@ -473,20 +473,20 @@ mod tests {
         tensor_bytes.extend(encode_varint_field(2, 1));
         // name = "my_weight"
         tensor_bytes.extend(encode_bytes_field(8, b"my_weight"));
-        // data_location = 1
-        tensor_bytes.extend(encode_varint_field(13, 1));
-        // external_data entries
+        // external_data entries (field 13, repeated StringStringEntryProto)
         let mut entry_loc = encode_bytes_field(1, b"location");
         entry_loc.extend(encode_bytes_field(2, b"weights.bin"));
-        tensor_bytes.extend(encode_bytes_field(14, &entry_loc));
+        tensor_bytes.extend(encode_bytes_field(13, &entry_loc));
 
         let mut entry_off = encode_bytes_field(1, b"offset");
         entry_off.extend(encode_bytes_field(2, b"16"));
-        tensor_bytes.extend(encode_bytes_field(14, &entry_off));
+        tensor_bytes.extend(encode_bytes_field(13, &entry_off));
 
         let mut entry_len = encode_bytes_field(1, b"length");
         entry_len.extend(encode_bytes_field(2, b"32")); // 8 * 4 bytes
-        tensor_bytes.extend(encode_bytes_field(14, &entry_len));
+        tensor_bytes.extend(encode_bytes_field(13, &entry_len));
+        // data_location = 1 (field 14, enum)
+        tensor_bytes.extend(encode_varint_field(14, 1));
 
         let model_bytes = build_model_with_initializer(&tensor_bytes);
 
@@ -510,7 +510,7 @@ mod tests {
         tensor_bytes.extend(encode_bytes_field(1, &dims_packed));
         tensor_bytes.extend(encode_varint_field(2, 1));
         tensor_bytes.extend(encode_bytes_field(8, b"ext_weight"));
-        tensor_bytes.extend(encode_varint_field(13, 1));
+        tensor_bytes.extend(encode_varint_field(14, 1));
 
         let model_bytes = build_model_with_initializer(&tensor_bytes);
 

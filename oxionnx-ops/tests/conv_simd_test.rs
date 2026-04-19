@@ -1,4 +1,5 @@
 //! Tests for SIMD-accelerated im2col and weight packing in conv.rs.
+#![allow(clippy::too_many_arguments, clippy::identity_op)]
 
 use oxionnx_core::Tensor;
 use oxionnx_ops::conv;

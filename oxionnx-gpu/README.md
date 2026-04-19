@@ -18,15 +18,19 @@ WebGPU in the browser, all through a single Pure Rust API.
 
 - **`gpu_matmul`** / **`gpu_matmul_tiled`** -- GPU matrix multiplication with optional tiled variant for better cache behavior.
 - **`gpu_conv2d`** -- GPU 2D convolution.
-- **`gpu_relu`**, **`gpu_sigmoid`**, **`gpu_gelu`** -- Element-wise activation functions.
+- **`gpu_relu`**, **`gpu_sigmoid`**, **`gpu_gelu`**, **`gpu_silu`**, **`gpu_leaky_relu`** -- Element-wise activation functions.
+- **`gpu_tanh`**, **`gpu_abs`**, **`gpu_neg`**, **`gpu_exp`**, **`gpu_sqrt`**, **`gpu_log`** -- Unary element-wise math.
+- **`gpu_add`**, **`gpu_mul`** -- Element-wise binary operations.
 - **`gpu_softmax`** -- Softmax along the last axis.
-- **`gpu_reduce_sum`**, **`gpu_reduce_max`** -- Reduction operations.
+- **`gpu_layer_norm`**, **`gpu_batch_norm`** -- Normalization layers.
+- **`gpu_transpose`** -- Tensor axis transposition on GPU.
+- **`gpu_reduce_sum`**, **`gpu_reduce_max`**, **`gpu_reduce_min`**, **`gpu_reduce_mean`** -- Reduction operations.
 
 ## Usage
 
 ```toml
 [dependencies]
-oxionnx-gpu = "0.1.1"
+oxionnx-gpu = "0.1.2"
 ```
 
 ```rust

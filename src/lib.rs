@@ -30,6 +30,11 @@ pub mod cuda {
 }
 #[cfg(feature = "cuda")]
 pub use oxionnx_cuda::CudaContext;
+#[cfg(feature = "directml")]
+pub mod directml {
+    //! DirectML (Windows D3D12 GPU) dispatch for ONNX ops.
+    pub use oxionnx_directml::*;
+}
 pub mod graph {
     pub use oxionnx_core::graph::*;
 }

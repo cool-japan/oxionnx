@@ -97,8 +97,15 @@ impl IoBinding {
         &self.inputs
     }
 
-    /// Access the raw output map mutably (for internal use by Session).
-    pub(crate) fn outputs_mut(&mut self) -> &mut HashMap<String, Tensor> {
-        &mut self.outputs
+    /// Extract a pre-bound output tensor by name, removing it from the binding.
+    /// Returns None if the name is not bound. Used by run_with_binding to inject
+    /// pre-bound buffers as output slots before the run.
+    pub(crate) fn take_output_buffer(&mut self, name: &str) -> Option<Tensor> {
+        self.outputs.remove(name)
+    }
+
+    /// Return an output tensor back into the binding (after the run).
+    pub(crate) fn put_output_buffer(&mut self, name: String, tensor: Tensor) {
+        self.outputs.insert(name, tensor);
     }
 }

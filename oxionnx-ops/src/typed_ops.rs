@@ -1,22 +1,171 @@
 //! Per-dtype dispatch for element-wise operations on TypedTensor.
 //!
-//! All binary operations follow automatic type promotion rules from
-//! `oxionnx_core::dtype::promote`. Computation is performed in f32
-//! (or the promoted type) and the result is cast to the target dtype.
+//! Binary operations use two paths:
+//!  - **Integer path**: when both operands have the same integer dtype, arithmetic
+//!    is performed natively via `i128`/`u128` promotion to avoid f32 precision loss
+//!    (f32 can only represent integers exactly up to 2^24).
+//!  - **Float path**: all other cases (float/float, mixed int+float, mixed dtypes)
+//!    use the existing `to_f32_vec()` path with automatic type promotion.
 
 use oxionnx_core::dtype::{promote, DType, TensorStorage, TypedTensor};
 use oxionnx_core::OnnxError;
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Internal helpers — generic broadcast
 // ---------------------------------------------------------------------------
 
-/// Perform a binary element-wise operation through f32 with automatic promotion.
-fn typed_binary_op(
+/// Broadcast a flat slice from `src_shape` to `out_shape`, returning a new Vec.
+///
+/// This is a dtype-generic equivalent of `crate::math::broadcast_to` for use
+/// in the native integer path.
+fn broadcast_vec<T: Copy>(data: &[T], src_shape: &[usize], out_shape: &[usize]) -> Vec<T> {
+    if src_shape == out_shape {
+        return data.to_vec();
+    }
+
+    let n_out: usize = out_shape.iter().product();
+    let n = out_shape.len();
+    let pad = n - src_shape.len();
+
+    // Pad src_shape on the left with 1s so both shapes have the same rank.
+    let padded: Vec<usize> = (0..pad)
+        .map(|_| 1)
+        .chain(src_shape.iter().copied())
+        .collect();
+
+    // Row-major strides for the padded source shape; broadcast dims get stride 0.
+    let mut src_strides = vec![0usize; n];
+    let mut stride = 1usize;
+    for i in (0..n).rev() {
+        if padded[i] == 1 && out_shape[i] != 1 {
+            src_strides[i] = 0;
+        } else {
+            src_strides[i] = stride;
+        }
+        stride *= padded[i];
+    }
+
+    // Row-major strides for the output shape.
+    let mut out_strides = vec![0usize; n];
+    let mut s = 1usize;
+    for i in (0..n).rev() {
+        out_strides[i] = s;
+        s *= out_shape[i];
+    }
+
+    // Fill output by back-mapping each output index to a source index.
+    let mut result = Vec::with_capacity(n_out);
+    for out_idx in 0..n_out {
+        let mut rem = out_idx;
+        let mut src_idx = 0usize;
+        for i in 0..n {
+            let coord = rem / out_strides[i];
+            rem %= out_strides[i];
+            src_idx += coord * src_strides[i];
+        }
+        result.push(data[src_idx]);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Native integer binary operation
+// ---------------------------------------------------------------------------
+
+/// Execute a binary element-wise operation on two tensors that share the same
+/// integer dtype, using native i128/u128 arithmetic to preserve precision.
+///
+/// `int_op` receives two `i128` values (both signed and unsigned integers are
+/// promoted — unsigned is widened to i128 as well; the result is narrowed back
+/// via `as` truncation which gives two's-complement wrapping at the storage
+/// width for all signed types and natural modular wrapping for unsigned).
+fn typed_binary_op_int<F>(
     a: &TypedTensor,
     b: &TypedTensor,
-    op: impl Fn(f32, f32) -> f32,
-) -> Result<TypedTensor, OnnxError> {
+    int_op: F,
+) -> Result<TypedTensor, OnnxError>
+where
+    F: Fn(i128, i128) -> Result<i128, OnnxError>,
+{
+    let out_shape = oxionnx_core::Tensor::broadcast_shape(&a.shape, &b.shape)
+        .map_err(OnnxError::ShapeMismatch)?;
+
+    // Dispatch on the common dtype and apply the operation elementwise.
+    macro_rules! int_op_typed {
+        ($StorageVariant:ident, $prim:ty, $ResultVariant:ident, $out_ty:ty) => {{
+            let av = match &a.storage {
+                TensorStorage::$StorageVariant(v) => v.as_slice(),
+                _ => {
+                    return Err(OnnxError::DTypeMismatch(format!(
+                        "expected {} storage",
+                        a.dtype()
+                    )))
+                }
+            };
+            let bv = match &b.storage {
+                TensorStorage::$StorageVariant(v) => v.as_slice(),
+                _ => {
+                    return Err(OnnxError::DTypeMismatch(format!(
+                        "expected {} storage",
+                        b.dtype()
+                    )))
+                }
+            };
+            let a_bc = broadcast_vec(av, &a.shape, &out_shape);
+            let b_bc = broadcast_vec(bv, &b.shape, &out_shape);
+            let mut result: Vec<$out_ty> = Vec::with_capacity(a_bc.len());
+            for (x, y) in a_bc.iter().zip(b_bc.iter()) {
+                let r = int_op(*x as i128, *y as i128)?;
+                result.push(r as $out_ty);
+            }
+            Ok(TypedTensor::new(
+                TensorStorage::$ResultVariant(result),
+                out_shape,
+            ))
+        }};
+    }
+
+    match a.dtype() {
+        DType::I8 => int_op_typed!(I8, i8, I8, i8),
+        DType::I16 => int_op_typed!(I16, i16, I16, i16),
+        DType::I32 => int_op_typed!(I32, i32, I32, i32),
+        DType::I64 => int_op_typed!(I64, i64, I64, i64),
+        DType::U8 => int_op_typed!(U8, u8, U8, u8),
+        DType::U16 => int_op_typed!(U16, u16, U16, u16),
+        DType::U32 => int_op_typed!(U32, u32, U32, u32),
+        DType::U64 => int_op_typed!(U64, u64, U64, u64),
+        other => Err(OnnxError::DTypeMismatch(format!(
+            "typed_binary_op_int called with non-integer dtype {other}"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combined binary op (integer-native + float fallback)
+// ---------------------------------------------------------------------------
+
+/// Perform a binary element-wise operation with two dispatch paths:
+///
+/// 1. When both operands share the **same integer dtype** (I8/I16/I32/I64/U8/U16/U32/U64),
+///    `int_op` is applied natively via i128 arithmetic — no f32 conversion.
+/// 2. All other cases (both float, mixed dtypes, Bool) fall through to the
+///    `float_op` path via `to_f32_vec()` with automatic type promotion.
+fn typed_binary_op<F, G>(
+    a: &TypedTensor,
+    b: &TypedTensor,
+    int_op: F,
+    float_op: G,
+) -> Result<TypedTensor, OnnxError>
+where
+    F: Fn(i128, i128) -> Result<i128, OnnxError>,
+    G: Fn(f32, f32) -> f32,
+{
+    // When both tensors have the same integer dtype, use the native path.
+    if a.dtype() == b.dtype() && a.dtype().is_integer() {
+        return typed_binary_op_int(a, b, int_op);
+    }
+
+    // Float path (also covers mixed int+float, different dtypes, Bool).
     let out_shape = oxionnx_core::Tensor::broadcast_shape(&a.shape, &b.shape)
         .map_err(OnnxError::ShapeMismatch)?;
 
@@ -25,7 +174,6 @@ fn typed_binary_op(
     let a_f32 = oxionnx_core::Tensor::new(a.storage.to_f32_vec(), a.shape.clone());
     let b_f32 = oxionnx_core::Tensor::new(b.storage.to_f32_vec(), b.shape.clone());
 
-    // Broadcast both tensors to the output shape
     let a_bc = crate::math::broadcast_to(&a_f32, &out_shape);
     let b_bc = crate::math::broadcast_to(&b_f32, &out_shape);
 
@@ -33,7 +181,7 @@ fn typed_binary_op(
         .data
         .iter()
         .zip(b_bc.data.iter())
-        .map(|(&x, &y)| op(x, y))
+        .map(|(&x, &y)| float_op(x, y))
         .collect();
 
     let result_f32 = TypedTensor::new(TensorStorage::F32(data), out_shape);
@@ -43,6 +191,10 @@ fn typed_binary_op(
         Ok(result_f32)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unary op helper (unchanged)
+// ---------------------------------------------------------------------------
 
 /// Perform a unary element-wise operation through f32, preserving the input dtype.
 fn typed_unary_op(x: &TypedTensor, op: impl Fn(f32) -> f32) -> TypedTensor {
@@ -57,27 +209,69 @@ fn typed_unary_op(x: &TypedTensor, op: impl Fn(f32) -> f32) -> TypedTensor {
 }
 
 // ---------------------------------------------------------------------------
-// Binary ops
+// DType helper — is_integer extends DType without modifying core
+// ---------------------------------------------------------------------------
+
+trait DTypeExt {
+    fn is_integer(&self) -> bool;
+}
+
+impl DTypeExt for DType {
+    fn is_integer(&self) -> bool {
+        matches!(
+            self,
+            DType::I8
+                | DType::I16
+                | DType::I32
+                | DType::I64
+                | DType::U8
+                | DType::U16
+                | DType::U32
+                | DType::U64
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary ops — public API
 // ---------------------------------------------------------------------------
 
 /// Element-wise addition with automatic type promotion.
+/// Integer operands of the same dtype use native arithmetic (no f32 loss).
 pub fn typed_add(a: &TypedTensor, b: &TypedTensor) -> Result<TypedTensor, OnnxError> {
-    typed_binary_op(a, b, |x, y| x + y)
+    typed_binary_op(a, b, |x, y| Ok(x.wrapping_add(y)), |x, y| x + y)
 }
 
 /// Element-wise subtraction with automatic type promotion.
+/// Integer operands of the same dtype use native arithmetic (no f32 loss).
 pub fn typed_sub(a: &TypedTensor, b: &TypedTensor) -> Result<TypedTensor, OnnxError> {
-    typed_binary_op(a, b, |x, y| x - y)
+    typed_binary_op(a, b, |x, y| Ok(x.wrapping_sub(y)), |x, y| x - y)
 }
 
 /// Element-wise multiplication with automatic type promotion.
+/// Integer operands of the same dtype use native arithmetic (no f32 loss).
 pub fn typed_mul(a: &TypedTensor, b: &TypedTensor) -> Result<TypedTensor, OnnxError> {
-    typed_binary_op(a, b, |x, y| x * y)
+    typed_binary_op(a, b, |x, y| Ok(x.wrapping_mul(y)), |x, y| x * y)
 }
 
 /// Element-wise division with automatic type promotion.
+/// Integer operands of the same dtype use native arithmetic (no f32 loss).
+/// Returns `OnnxError::Arithmetic` on integer division by zero.
 pub fn typed_div(a: &TypedTensor, b: &TypedTensor) -> Result<TypedTensor, OnnxError> {
-    typed_binary_op(a, b, |x, y| x / y)
+    typed_binary_op(
+        a,
+        b,
+        |x, y| {
+            if y == 0 {
+                Err(OnnxError::Arithmetic(
+                    "integer division by zero".to_string(),
+                ))
+            } else {
+                Ok(x / y)
+            }
+        },
+        |x, y| x / y,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +370,10 @@ mod tests {
         (a - b).abs() < eps
     }
 
+    // -----------------------------------------------------------------------
+    // Existing tests (unchanged)
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_typed_add_same_dtype() {
         let a = make_f32(vec![1.0, 2.0, 3.0], vec![3]);
@@ -188,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_typed_add_promotion() {
-        // I32 + F32 should promote to F32
+        // I32 + F32 should promote to F32 (falls through to float path)
         let a = make_i32(vec![1, 2, 3], vec![3]);
         let b = make_f32(vec![0.5, 1.5, 2.5], vec![3]);
         let c = typed_add(&a, &b).expect("add failed");
@@ -311,5 +509,147 @@ mod tests {
         assert!(approx_eq(vals[2], 2.0, 1e-5));
         assert!(approx_eq(vals[3], 3.0, 1e-5));
         assert!(approx_eq(vals[4], 4.0, 1e-5));
+    }
+
+    // -----------------------------------------------------------------------
+    // New tests — native integer arithmetic
+    // -----------------------------------------------------------------------
+
+    /// Values above 2^24 cannot be represented exactly in f32; the native I64
+    /// path must preserve them.
+    #[test]
+    fn typed_add_i64_preserves_2pow40() {
+        let x: i64 = 1i64 << 40; // 1_099_511_627_776
+        let a = TypedTensor::new(TensorStorage::I64(vec![x]), vec![1]);
+        let b = TypedTensor::new(TensorStorage::I64(vec![1i64]), vec![1]);
+        let c = typed_add(&a, &b).expect("add failed");
+        assert_eq!(c.dtype(), DType::I64);
+        match &c.storage {
+            TensorStorage::I64(v) => assert_eq!(v[0], x + 1),
+            other => panic!("expected I64 storage, got {:?}", other.dtype()),
+        }
+    }
+
+    /// i32::MAX * 2 overflows; the result must wrap in two's-complement.
+    #[test]
+    fn typed_mul_i32_wraps_on_overflow() {
+        let a = TypedTensor::new(TensorStorage::I32(vec![i32::MAX]), vec![1]);
+        let b = TypedTensor::new(TensorStorage::I32(vec![2i32]), vec![1]);
+        let c = typed_mul(&a, &b).expect("mul failed");
+        assert_eq!(c.dtype(), DType::I32);
+        match &c.storage {
+            TensorStorage::I32(v) => assert_eq!(v[0], i32::MAX.wrapping_mul(2)),
+            other => panic!("expected I32 storage, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Integer division by zero must return an Err.
+    #[test]
+    fn typed_div_i64_by_zero_returns_err() {
+        let a = TypedTensor::new(TensorStorage::I64(vec![10i64]), vec![1]);
+        let b = TypedTensor::new(TensorStorage::I64(vec![0i64]), vec![1]);
+        let result = typed_div(&a, &b);
+        assert!(result.is_err(), "expected Err for div-by-zero, got Ok");
+    }
+
+    /// i8 wraps at 127 → -128.
+    #[test]
+    fn typed_add_i8_wraps_at_127() {
+        let a = TypedTensor::new(TensorStorage::I8(vec![127i8]), vec![1]);
+        let b = TypedTensor::new(TensorStorage::I8(vec![1i8]), vec![1]);
+        let c = typed_add(&a, &b).expect("add failed");
+        assert_eq!(c.dtype(), DType::I8);
+        match &c.storage {
+            TensorStorage::I8(v) => assert_eq!(v[0], -128i8),
+            other => panic!("expected I8 storage, got {:?}", other.dtype()),
+        }
+    }
+
+    /// f32 addition must still work via the float path.
+    #[test]
+    fn typed_add_f32_exact_roundtrip() {
+        let a = TypedTensor::new(TensorStorage::F32(vec![1.0f32, 2.0]), vec![2]);
+        let b = TypedTensor::new(TensorStorage::F32(vec![3.0f32, 4.0]), vec![2]);
+        let c = typed_add(&a, &b).expect("add failed");
+        assert_eq!(c.dtype(), DType::F32);
+        match &c.storage {
+            TensorStorage::F32(v) => {
+                assert!((v[0] - 4.0f32).abs() < 1e-6);
+                assert!((v[1] - 6.0f32).abs() < 1e-6);
+            }
+            other => panic!("expected F32 storage, got {:?}", other.dtype()),
+        }
+    }
+
+    /// I32 integer arithmetic stays in I32 (no promotion to float).
+    #[test]
+    fn typed_add_i32_same_dtype_stays_integer() {
+        let a = TypedTensor::new(TensorStorage::I32(vec![100i32, 200]), vec![2]);
+        let b = TypedTensor::new(TensorStorage::I32(vec![1i32, 2]), vec![2]);
+        let c = typed_add(&a, &b).expect("add failed");
+        assert_eq!(c.dtype(), DType::I32, "result must stay I32");
+        match &c.storage {
+            TensorStorage::I32(v) => {
+                assert_eq!(v[0], 101);
+                assert_eq!(v[1], 202);
+            }
+            other => panic!("expected I32 storage, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Broadcast with integer tensors: [3,1] + [1,4] should produce [3,4] I64.
+    #[test]
+    fn typed_add_i64_broadcast() {
+        let a = TypedTensor::new(TensorStorage::I64(vec![1i64, 2, 3]), vec![3, 1]);
+        let b = TypedTensor::new(TensorStorage::I64(vec![10i64, 20, 30, 40]), vec![1, 4]);
+        let c = typed_add(&a, &b).expect("broadcast add failed");
+        assert_eq!(c.shape, vec![3, 4]);
+        assert_eq!(c.dtype(), DType::I64);
+        match &c.storage {
+            TensorStorage::I64(v) => {
+                // Row 0 (a=1): 11, 21, 31, 41
+                assert_eq!(v[0], 11);
+                assert_eq!(v[1], 21);
+                assert_eq!(v[2], 31);
+                assert_eq!(v[3], 41);
+                // Row 1 (a=2): 12, 22, 32, 42
+                assert_eq!(v[4], 12);
+                assert_eq!(v[5], 22);
+                assert_eq!(v[6], 32);
+                assert_eq!(v[7], 42);
+                // Row 2 (a=3): 13, 23, 33, 43
+                assert_eq!(v[8], 13);
+                assert_eq!(v[9], 23);
+                assert_eq!(v[10], 33);
+                assert_eq!(v[11], 43);
+            }
+            other => panic!("expected I64 storage, got {:?}", other.dtype()),
+        }
+    }
+
+    /// U8 wrapping: 255u8 + 1 = 0.
+    #[test]
+    fn typed_add_u8_wraps() {
+        let a = TypedTensor::new(TensorStorage::U8(vec![255u8]), vec![1]);
+        let b = TypedTensor::new(TensorStorage::U8(vec![1u8]), vec![1]);
+        let c = typed_add(&a, &b).expect("add failed");
+        assert_eq!(c.dtype(), DType::U8);
+        match &c.storage {
+            TensorStorage::U8(v) => assert_eq!(v[0], 0u8),
+            other => panic!("expected U8 storage, got {:?}", other.dtype()),
+        }
+    }
+
+    /// I64 subtraction: precision must be maintained above 2^24.
+    #[test]
+    fn typed_sub_i64_precision() {
+        let big: i64 = (1i64 << 40) + 999;
+        let a = TypedTensor::new(TensorStorage::I64(vec![big]), vec![1]);
+        let b = TypedTensor::new(TensorStorage::I64(vec![999i64]), vec![1]);
+        let c = typed_sub(&a, &b).expect("sub failed");
+        match &c.storage {
+            TensorStorage::I64(v) => assert_eq!(v[0], 1i64 << 40),
+            other => panic!("expected I64 storage, got {:?}", other.dtype()),
+        }
     }
 }

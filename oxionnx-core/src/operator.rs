@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::dtype::{DType, TypedTensor};
 use crate::error::OnnxError;
 use crate::graph::{Attributes, Node};
 use crate::tensor::Tensor;
@@ -44,6 +45,41 @@ impl<'a> OpContext<'a> {
     }
 }
 
+/// Context passed to operators executing via the native typed dispatch path.
+pub struct TypedOpContext<'a> {
+    /// The node being executed.
+    pub node: &'a Node,
+    /// Resolved typed input tensors in order matching node.inputs.
+    /// Optional/missing inputs are None.
+    pub inputs: Vec<Option<&'a TypedTensor>>,
+    /// Outer scope typed tensors for subgraph operators (If, Loop, Scan).
+    pub outer_scope: Option<&'a HashMap<String, TypedTensor>>,
+    /// Operator registry for subgraph execution (If, Loop, Scan).
+    pub registry: Option<&'a OperatorRegistry>,
+}
+
+impl<'a> TypedOpContext<'a> {
+    /// Get a typed input by positional index.
+    pub fn input(&self, idx: usize) -> Option<&'a TypedTensor> {
+        self.inputs.get(idx).and_then(|v| *v)
+    }
+
+    /// Get an optional typed input by positional index.
+    pub fn optional_input(&self, idx: usize) -> Option<&'a TypedTensor> {
+        self.input(idx)
+    }
+
+    /// Number of input slots (including None entries).
+    pub fn num_inputs(&self) -> usize {
+        self.inputs.len()
+    }
+
+    /// Shorthand for &self.node.attrs
+    pub fn attrs(&self) -> &Attributes {
+        &self.node.attrs
+    }
+}
+
 /// Trait for ONNX operator implementations.
 /// Operators are stateless -- all runtime state comes through OpContext.
 pub trait Operator: Send + Sync {
@@ -71,6 +107,79 @@ pub trait Operator: Send + Sync {
         ctx: &OpContext<'_>,
     ) -> Result<Vec<Tensor>, OnnxError> {
         self.execute(ctx)
+    }
+
+    // ── Phase D: native typed dispatch ─────────────────────────────────────────
+
+    /// Dtypes this operator can execute without an f32 round-trip.
+    /// An empty slice (the default) means "f32 only".
+    fn native_dtypes(&self) -> &'static [DType] {
+        &[]
+    }
+
+    /// Execute on typed inputs and return typed outputs.
+    /// Default: converts inputs to f32, calls `execute`, returns as F32 TypedTensors.
+    fn execute_typed(&self, ctx: &TypedOpContext<'_>) -> Result<Vec<TypedTensor>, OnnxError> {
+        use crate::dtype::TensorStorage;
+        // Convert each typed input to an f32 Tensor.
+        let owned: Vec<Option<Tensor>> = ctx
+            .inputs
+            .iter()
+            .map(|maybe| {
+                maybe.map(|tt| {
+                    let data = tt.storage.to_f32_vec();
+                    Tensor::new(data, tt.shape.clone())
+                })
+            })
+            .collect();
+        let refs: Vec<Option<&Tensor>> = owned.iter().map(|opt| opt.as_ref()).collect();
+        // Build an f32 OpContext from the typed context's metadata.
+        let f32_ctx = OpContext {
+            node: ctx.node,
+            inputs: refs,
+            outer_scope: None,
+            registry: ctx.registry,
+        };
+        // Execute on f32.
+        let f32_results = self.execute(&f32_ctx)?;
+        // Wrap each f32 Tensor as an F32 TypedTensor.
+        Ok(f32_results
+            .into_iter()
+            .map(|t| TypedTensor::new(TensorStorage::F32(t.data), t.shape))
+            .collect())
+    }
+
+    // ── Phase F: output-slot writing ───────────────────────────────────────────
+
+    /// Whether this operator can write directly into pre-allocated output slots.
+    fn supports_output_slots(&self) -> bool {
+        false
+    }
+
+    /// Write outputs into caller-provided slots in place.
+    /// Default: calls `execute`, copies results into slots (shape-mismatch falls back to replace).
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        let results = self.execute(ctx)?;
+        if results.len() != slots.len() {
+            return Err(OnnxError::Internal(format!(
+                "operator '{}' produced {} outputs but {} slots were provided",
+                self.op_type(),
+                results.len(),
+                slots.len()
+            )));
+        }
+        for (slot, result) in slots.iter_mut().zip(results) {
+            if slot.shape == result.shape && slot.data.len() == result.data.len() {
+                slot.data.copy_from_slice(&result.data);
+            } else {
+                *slot = result;
+            }
+        }
+        Ok(())
     }
 }
 

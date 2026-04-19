@@ -1,9 +1,9 @@
 [workspace]
-members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu", "oxionnx-cuda"]
+members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu", "oxionnx-cuda", "oxionnx-directml"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
 license = "Apache-2.0"
@@ -13,20 +13,21 @@ homepage = "https://github.com/cool-japan/oxionnx"
 rust-version = "1.75"
 
 [workspace.dependencies]
-oxionnx-core = { path = "oxionnx-core", version = "0.1.1" }
+oxionnx-core = { path = "oxionnx-core", version = "0.1.2" }
 ndarray = { version = "0.17" }
-oxionnx-ops = { path = "oxionnx-ops", version = "0.1.1" }
-oxionnx-proto = { path = "oxionnx-proto", version = "0.1.1" }
-oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.1" }
-oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.1" }
+oxionnx-ops = { path = "oxionnx-ops", version = "0.1.2" }
+oxionnx-proto = { path = "oxionnx-proto", version = "0.1.2" }
+oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.2" }
+oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.2" }
+oxionnx-directml = { path = "oxionnx-directml", version = "0.1.2" }
 # OxiCUDA stack
 oxifft = "0.2.0"
-oxicuda-driver = { version = "0.1.2" }
-oxicuda-memory = { version = "0.1.2" }
-oxicuda-blas = { version = "0.1.2" }
-oxicuda-dnn = { version = "0.1.2" }
-oxicuda-ptx = { version = "0.1.2" }
-oxicuda-launch = { version = "0.1.2" }
+oxicuda-driver = { version = "0.1.4" }
+oxicuda-memory = { version = "0.1.4" }
+oxicuda-blas = { version = "0.1.4" }
+oxicuda-dnn = { version = "0.1.4" }
+oxicuda-ptx = { version = "0.1.4" }
+oxicuda-launch = { version = "0.1.4" }
 thiserror = "2"
 half = "2.7"
 matrixmultiply = "0.3"
@@ -64,6 +65,7 @@ oxionnx-ops = { workspace = true }
 oxionnx-proto = { workspace = true }
 oxionnx-gpu = { workspace = true, optional = true }
 oxionnx-cuda = { workspace = true, optional = true }
+oxionnx-directml = { workspace = true, optional = true }
 half = { workspace = true }
 matrixmultiply = { workspace = true }
 bytemuck = { workspace = true }
@@ -83,6 +85,7 @@ rayon = { workspace = true }
 default = []
 gpu = ["dep:wgpu", "dep:pollster", "oxionnx-gpu"]
 cuda = ["dep:oxionnx-cuda"]
+directml = ["dep:oxionnx-directml"]
 simd = ["oxionnx-ops/simd"]
 encryption = ["dep:aes-gcm"]
 mmap = ["dep:memmap2", "oxionnx-proto/mmap"]

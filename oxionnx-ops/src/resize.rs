@@ -190,7 +190,7 @@ pub fn resize(
     Tensor::new(out, out_shape)
 }
 
-fn transform_coord(
+pub(crate) fn transform_coord(
     dst: usize,
     scale: f32,
     input_size: usize,
@@ -218,7 +218,7 @@ fn transform_coord(
     }
 }
 
-fn nearest_index(src: f32, dim_size: usize) -> usize {
+pub(crate) fn nearest_index(src: f32, dim_size: usize) -> usize {
     // ONNX default nearest mode: round to nearest, prefer floor for .5
     // But for asymmetric coordinates, floor is more standard
     let idx = src.floor().max(0.0) as usize;

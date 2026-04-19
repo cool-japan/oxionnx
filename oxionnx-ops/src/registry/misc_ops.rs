@@ -17,6 +17,9 @@ macro_rules! comparison_binary_op {
             fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
                 Ok(vec![$func(ctx.input(0)?, ctx.input(1)?)?])
             }
+            fn supports_output_slots(&self) -> bool {
+                true
+            }
         }
     };
 }
@@ -44,6 +47,9 @@ impl Operator for NotOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         Ok(vec![comparison::not_op(ctx.input(0)?)])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── IsInf ───────────────────────────────────────────────────────────────────
@@ -63,6 +69,9 @@ impl Operator for IsInfOp {
             detect_pos,
         )])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── IsNaN ───────────────────────────────────────────────────────────────────
@@ -75,6 +84,9 @@ impl Operator for IsNaNOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         Ok(vec![comparison::is_nan(ctx.input(0)?)])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── NonZero ─────────────────────────────────────────────────────────────────
@@ -86,6 +98,9 @@ impl Operator for NonZeroOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         Ok(vec![comparison::non_zero(ctx.input(0)?)])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -107,6 +122,9 @@ impl Operator for ConstantOfShapeOp {
             .unwrap_or(0.0);
         Ok(vec![comparison::constant_of_shape(&target_shape, value)])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── EyeLike ─────────────────────────────────────────────────────────────────
@@ -120,6 +138,9 @@ impl Operator for EyeLikeOp {
         let x = ctx.input(0)?;
         let k = ctx.attrs().i("k", 0);
         Ok(vec![comparison::eye_like(&x.shape, k)?])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -136,6 +157,9 @@ impl Operator for TriluOp {
         let k = ctx.optional_input(1).map(|t| t.data[0] as i64).unwrap_or(0);
         Ok(vec![comparison::trilu(x, upper, k)?])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── Identity ────────────────────────────────────────────────────────────────
@@ -147,6 +171,61 @@ impl Operator for IdentityOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         Ok(vec![ctx.input(0)?.clone()])
+    }
+    fn supports_inplace(&self) -> bool {
+        true
+    }
+    fn execute_inplace(
+        &self,
+        input: Tensor,
+        _ctx: &OpContext<'_>,
+    ) -> Result<Vec<Tensor>, OnnxError> {
+        Ok(vec![input])
+    }
+    fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
+        &[
+            oxionnx_core::DType::F32,
+            oxionnx_core::DType::F16,
+            oxionnx_core::DType::BF16,
+            oxionnx_core::DType::F64,
+            oxionnx_core::DType::I8,
+            oxionnx_core::DType::I16,
+            oxionnx_core::DType::I32,
+            oxionnx_core::DType::I64,
+            oxionnx_core::DType::U8,
+            oxionnx_core::DType::U16,
+            oxionnx_core::DType::U32,
+            oxionnx_core::DType::U64,
+            oxionnx_core::DType::Bool,
+        ]
+    }
+    fn execute_typed(
+        &self,
+        ctx: &oxionnx_core::TypedOpContext<'_>,
+    ) -> Result<Vec<oxionnx_core::TypedTensor>, oxionnx_core::OnnxError> {
+        use oxionnx_core::OnnxError;
+        let input = ctx
+            .input(0)
+            .ok_or_else(|| OnnxError::TensorNotFound("Identity: missing input[0]".into()))?;
+        Ok(vec![input.clone()])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        use oxionnx_core::OnnxError;
+        if slots.is_empty() {
+            return Err(OnnxError::Internal("Identity: no output slots".into()));
+        }
+        let input = ctx.input(0)?;
+        slots[0].data.clear();
+        slots[0].data.extend_from_slice(&input.data);
+        slots[0].shape = input.shape.clone();
+        Ok(())
     }
 }
 
@@ -171,6 +250,60 @@ impl Operator for CastOp {
         };
         Ok(vec![Tensor::new(data, x.shape.clone())])
     }
+    fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
+        &[
+            oxionnx_core::DType::F32,
+            oxionnx_core::DType::F16,
+            oxionnx_core::DType::BF16,
+            oxionnx_core::DType::F64,
+            oxionnx_core::DType::I8,
+            oxionnx_core::DType::I16,
+            oxionnx_core::DType::I32,
+            oxionnx_core::DType::I64,
+            oxionnx_core::DType::U8,
+            oxionnx_core::DType::U16,
+            oxionnx_core::DType::U32,
+            oxionnx_core::DType::U64,
+            oxionnx_core::DType::Bool,
+        ]
+    }
+    fn execute_typed(
+        &self,
+        ctx: &oxionnx_core::TypedOpContext<'_>,
+    ) -> Result<Vec<oxionnx_core::TypedTensor>, oxionnx_core::OnnxError> {
+        use oxionnx_core::OnnxError;
+        let to_int = ctx.attrs().i("to", 1);
+        let target_dtype =
+            oxionnx_core::DType::from_onnx(to_int as i32).unwrap_or(oxionnx_core::DType::F32);
+        let input = ctx
+            .input(0)
+            .ok_or_else(|| OnnxError::TensorNotFound("Cast: missing input[0]".into()))?;
+        Ok(vec![input.cast(target_dtype)])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let results = self.execute(ctx)?;
+        let result = results
+            .into_iter()
+            .next()
+            .ok_or_else(|| OnnxError::Internal("Cast: no output".into()))?;
+        let out = &mut slots[0];
+        if out.shape == result.shape && out.data.len() == result.data.len() {
+            out.data.copy_from_slice(&result.data);
+        } else {
+            *out = result;
+        }
+        Ok(())
+    }
 }
 
 // ── Shape ───────────────────────────────────────────────────────────────────
@@ -185,6 +318,9 @@ impl Operator for ShapeOp {
         let shape_vals: Vec<f32> = x.shape.iter().map(|&d| d as f32).collect();
         let n = shape_vals.len();
         Ok(vec![Tensor::new(shape_vals, vec![n])])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -207,6 +343,9 @@ impl Operator for ConstantOp {
             Ok(vec![Tensor::new(vec![0.0], vec![1])])
         }
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── Einsum ──────────────────────────────────────────────────────────────────
@@ -221,6 +360,9 @@ impl Operator for EinsumOp {
         let tensors: Vec<&Tensor> = ctx.inputs.iter().filter_map(|opt| *opt).collect();
         Ok(vec![crate::einsum::einsum(equation, &tensors)?])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── Bitwise ──────────────────────────────────────────────────────────────
@@ -234,6 +376,9 @@ macro_rules! bitwise_binary_op {
             }
             fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
                 Ok(vec![$func(ctx.input(0)?, ctx.input(1)?)?])
+            }
+            fn supports_output_slots(&self) -> bool {
+                true
             }
         }
     };
@@ -251,6 +396,9 @@ impl Operator for BitwiseNotOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         Ok(vec![crate::bitwise::bitwise_not(ctx.input(0)?)])
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 // ── Size ─────────────────────────────────────────────────────────────────
@@ -264,6 +412,9 @@ impl Operator for SizeOp {
         let x = ctx.input(0)?;
         let n = x.numel();
         Ok(vec![Tensor::new(vec![n as f32], vec![1])])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -295,5 +446,8 @@ impl Operator for NonMaxSuppressionOp {
             score_thresh,
             center_point_box,
         )?])
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }

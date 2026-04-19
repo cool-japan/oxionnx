@@ -11,16 +11,17 @@ and has minimal dependencies.
 - **`Tensor`** -- N-dimensional tensor with f32 storage, shape, strides, and layout support (NCHW/NHWC/RowMajor).
 - **`DType`** / **`TypedTensor`** -- Multi-dtype tensor support covering F32, F16, BF16, F64, I8/I16/I32/I64, U8/U16/U32/U64, and Bool.
 - **`Graph`** -- Represents an ONNX computation graph as a list of `Node`s with input/output names.
-- **`OpKind`** -- Enum of all supported ONNX operators (147).
+- **`OpKind`** -- Enum of all supported ONNX operators (167).
 - **`Operator`** trait -- Stateless interface for operator implementations; receives an `OpContext` with resolved inputs.
 - **`OperatorRegistry`** -- Maps ONNX op_type strings to `Operator` trait objects.
+- **`TypedOpContext`** -- Context struct for typed operator dispatch (Phase D); parallels `OpContext` but carries `TypedTensor` inputs.
 - **`OnnxError`** -- Unified error type for the engine.
 
 ## Usage
 
 ```toml
 [dependencies]
-oxionnx-core = "0.1.1"
+oxionnx-core = "0.1.2"
 ```
 
 ```rust
@@ -42,6 +43,7 @@ assert_eq!(nhwc.shape, vec![1, 2, 4, 3]); // [N,H,W,C]
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std`   | Yes     | Enables standard library support. Disable for `no_std` environments. |
+| `ndarray` | No    | ndarray interop for Tensor conversion (from_ndarray, to_ndarray, as_ndarray_view) |
 
 ## Part of [oxionnx](https://github.com/cool-japan/oxionnx)
 

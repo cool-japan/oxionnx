@@ -145,9 +145,9 @@ pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
                 t.double_data.push(f64::from_le_bytes(b));
             }
             (9, WireValue::Bytes(b)) => t.raw_data = b.to_vec(),
-            (13, WireValue::Varint(v)) => t.data_location = v as i32,
-            (14, WireValue::Bytes(b)) => {
-                // StringStringEntryProto: field 1 = key, field 2 = value
+            (13, WireValue::Bytes(b)) => {
+                // ONNX spec: field 13 = repeated StringStringEntryProto external_data.
+                // StringStringEntryProto: field 1 = key, field 2 = value.
                 let mut key = String::new();
                 let mut val = String::new();
                 let mut p = 0;
@@ -162,6 +162,7 @@ pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
                 }
                 t.external_data.push((key, val));
             }
+            (14, WireValue::Varint(v)) => t.data_location = v as i32,
             _ => {} // ignore unknown fields
         }
     }
@@ -673,12 +674,12 @@ mod tests {
         tensor_bytes.extend(encode_varint_field(2, 1));
         // name = "weight"
         tensor_bytes.extend(encode_bytes_field(8, b"weight"));
-        // data_location = 1
-        tensor_bytes.extend(encode_varint_field(13, 1));
-        // external_data entries (field 14)
-        tensor_bytes.extend(encode_bytes_field(14, &entry1));
-        tensor_bytes.extend(encode_bytes_field(14, &entry2));
-        tensor_bytes.extend(encode_bytes_field(14, &entry3));
+        // external_data entries (field 13, repeated StringStringEntryProto)
+        tensor_bytes.extend(encode_bytes_field(13, &entry1));
+        tensor_bytes.extend(encode_bytes_field(13, &entry2));
+        tensor_bytes.extend(encode_bytes_field(13, &entry3));
+        // data_location = 1 (field 14, enum)
+        tensor_bytes.extend(encode_varint_field(14, 1));
 
         let tp = parse_tensor_proto(&tensor_bytes).expect("should parse tensor proto");
         assert_eq!(tp.name, "weight");

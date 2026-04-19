@@ -7,15 +7,15 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 OxiONNX is a high-performance ONNX inference engine written in pure Rust.
-It supports 147 ONNX operators, GPU acceleration via wgpu, SIMD optimization,
+It supports 165 ONNX operators, GPU acceleration via wgpu, SIMD optimization,
 and runs on any platform including WebAssembly.
 
-**47,829 lines of Rust | 1,023 tests | 0 clippy warnings**
+**60,734 lines of Rust | 1,173 tests | 0 clippy warnings**
 
 ## Features
 
 - **Pure Rust** -- Zero C/C++/Fortran dependencies. Safe, portable, auditable.
-- **147 ONNX operators** -- Math, NN, Conv, Shape, Indexing, Comparison, RNN, Attention, ML
+- **165 ONNX operators** -- Math, NN, Conv, Shape, Indexing, Comparison, RNN, Attention, ML
 - **GPU acceleration** -- wgpu compute shaders for MatMul, Softmax, ReLU, etc.
 - **SIMD optimization** -- NEON (aarch64) and AVX2 (x86_64) for element-wise ops
 - **Multi-dtype** -- f32, f16, bf16, i8, i32, i64 with automatic type promotion
@@ -30,6 +30,23 @@ and runs on any platform including WebAssembly.
 - **WebAssembly** -- Run in the browser via wasm-bindgen
 - **no_std** -- Core types work without std (alloc only)
 - **Session caching** -- Save/load pre-optimized graphs to skip re-optimization
+- **Native dtype dispatch** -- `run_typed()` path executes 40+ operators natively (no f32 round-trip) via `TypedOpContext`; MatMul natively handles F32/F16/BF16/I8→I32/I32 dtypes
+- **DirectML backend** -- Windows D3D12 execution provider (`directml` feature) with CPU fallback on other platforms
+- **Zero-copy output reuse** -- All 121 operators support pre-allocated output slot reuse via `execute_into_slots`; 52 operators have hand-coded zero-copy kernels (Gather, ScatterND, ScatterElements, shape/pool/elementwise ops) — no memcpy, pointer-identity across inference runs with `IoBinding`
+
+## Status
+
+| Crate | Status | Tests |
+|-------|--------|-------|
+| `oxionnx` (root) | Alpha | 521 passing |
+| `oxionnx-core` | Stable | 36 passing |
+| `oxionnx-ops` | Alpha | 554 passing |
+| `oxionnx-proto` | Stable | 37 passing |
+| `oxionnx-gpu` | Alpha | 17 passing |
+| `oxionnx-cuda` | Partial | 4 passing (GEMM/elementwise/softmax via OxiCUDA; Conv stubbed) |
+| `oxionnx-directml` | Planned | 4 passing (Windows scaffold; HLSL shaders defined but not yet bound) |
+
+**Total: 1,173 tests passing, 0 clippy warnings, 60,734 SLoC**
 
 ## Quick Start
 
@@ -64,20 +81,20 @@ let session = Session::builder()
 
 ## Supported Operators
 
-OxiONNX implements 147 operators across the full ONNX specification:
+OxiONNX implements 165 ONNX operators (plus 21 aliases including the `ai.onnx.ml.*` domain)
 
 | Category | Count | Examples |
 |----------|-------|---------|
-| Math | 38 | MatMul, Gemm, Add, Mul, Pow, Sqrt, Reduce*, Trig |
-| Neural Network | 35 | Relu, Sigmoid, Softmax, LayerNorm, BatchNorm, GELU, SiLU |
-| Convolution | 8 | Conv, ConvTranspose, MaxPool, AveragePool, GlobalAvgPool |
-| Shape | 14 | Reshape, Transpose, Concat, Slice, Split, Flatten |
-| Indexing | 12 | Gather, Scatter, Where, OneHot, Compress, Unique |
-| Comparison | 13 | Equal, Greater, Less, And, Or, Not, IsInf, IsNaN |
-| RNN/Attention | 8 | LSTM, GRU, Attention, MultiHeadAttention, RotaryEmbedding |
-| ONNX-ML | 12 | LinearClassifier, TreeEnsemble, SVM, Normalizer, TfIdf |
+| Math | 46 | MatMul, Gemm, Add, Mul, Pow, Sqrt, Reduce* (incl. L1/L2/LogSum/LogSumExp/SumSquare), Trig, ArgMax/Min, CumSum, TopK, BitShift, VariadicMin/Max/Mean/Sum |
+| Neural Network | 33 | Relu, Sigmoid, Softmax, LayerNorm, BatchNorm, GELU, SiLU, Mish, GroupNorm, InstanceNorm, RmsNorm, Hardmax, Shrink |
+| Convolution / Pool | 8 | Conv, ConvTranspose, MaxPool, AveragePool, GlobalAvgPool, GlobalMaxPool, Pad, Resize |
+| Shape | 14 | Reshape, Transpose, Concat, Slice, Split, Flatten, Tile, DepthToSpace, SpaceToDepth, ReverseSequence, Size, Expand, Squeeze, Unsqueeze |
+| Indexing / Quant | 11 | Gather, GatherElements, GatherND, Scatter, ScatterND, Where, OneHot, Compress, Unique, QuantizeLinear, DequantizeLinear |
+| Comparison / Logic | 25 | Equal, Greater, Less, And, Or, Not, Xor, Bitwise* (And/Or/Xor/Not), IsInf, IsNaN, NonZero, Cast, Constant, Einsum, ConstantOfShape, EyeLike, Trilu, Identity, Shape, NonMaxSuppression |
+| RNN / Attention | 7 | LSTM, GRU, Attention, MultiHeadAttention, RotaryEmbedding, GridSample, RoiAlign |
+| DSP | 7 | DFT, STFT, HannWindow, HammingWindow, BlackmanWindow, MelWeightMatrix, Bernoulli |
 | Control Flow | 3 | If, Loop, Scan |
-| Quantization | 4 | QuantizeLinear, DequantizeLinear, QLinearMatMul, QLinearConv |
+| ONNX-ML | 11 | LinearClassifier, LinearRegressor, TreeEnsembleClassifier/Regressor, SVMClassifier/Regressor, Normalizer, Scaler, LabelEncoder, TfIdfVectorizer, StringNormalizer |
 
 ## Feature Flags
 
@@ -90,16 +107,18 @@ OxiONNX implements 147 operators across the full ONNX specification:
 | `mmap` | Memory-mapped weight loading |
 | `wasm` | WebAssembly browser bindings |
 | `ndarray` | ndarray interop for Tensor conversion |
+| `directml` | DirectML GPU acceleration (Windows, via D3D12) |
 
 ## Architecture
 
 ```
 oxionnx (root)           -- Session, optimizer, execution engine
   oxionnx-core           -- Tensor, DType, Graph, Operator trait, OnnxError
-  oxionnx-ops            -- 147 operator implementations
+  oxionnx-ops            -- 159 operator implementations
   oxionnx-proto          -- Pure Rust ONNX protobuf parser
   oxionnx-gpu            -- wgpu compute backend (optional)
   oxionnx-cuda           -- CUDA dispatch layer via OxiCUDA (optional)
+  oxionnx-directml       -- DirectML execution provider for Windows D3D12 (optional)
 ```
 
 ## Performance

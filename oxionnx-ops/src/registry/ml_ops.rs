@@ -10,6 +10,9 @@ impl Operator for LinearClassifierOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml::linear_classifier(ctx)
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 pub struct LinearRegressorOp;
@@ -19,6 +22,9 @@ impl Operator for LinearRegressorOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml::linear_regressor(ctx)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -30,6 +36,9 @@ impl Operator for NormalizerOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml::normalizer(ctx)
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 pub struct ScalerOp;
@@ -39,6 +48,9 @@ impl Operator for ScalerOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml::scaler(ctx)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -50,6 +62,9 @@ impl Operator for LabelEncoderOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml::label_encoder(ctx)
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 pub struct TreeEnsembleClassifierOp;
@@ -59,6 +74,9 @@ impl Operator for TreeEnsembleClassifierOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml_tree::tree_ensemble_classifier(ctx)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -70,6 +88,9 @@ impl Operator for TreeEnsembleRegressorOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml_tree::tree_ensemble_regressor(ctx)
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 pub struct SVMClassifierOp;
@@ -79,6 +100,9 @@ impl Operator for SVMClassifierOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml_svm::svm_classifier(ctx)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }
 
@@ -90,6 +114,9 @@ impl Operator for SVMRegressorOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml_svm::svm_regressor(ctx)
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 pub struct TfIdfVectorizerOp;
@@ -100,6 +127,9 @@ impl Operator for TfIdfVectorizerOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml::tfidf_vectorizer(ctx)
     }
+    fn supports_output_slots(&self) -> bool {
+        true
+    }
 }
 
 pub struct StringNormalizerOp;
@@ -109,5 +139,8 @@ impl Operator for StringNormalizerOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         crate::ml::string_normalizer(ctx)
+    }
+    fn supports_output_slots(&self) -> bool {
+        true
     }
 }

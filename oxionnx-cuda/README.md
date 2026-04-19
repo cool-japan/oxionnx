@@ -29,12 +29,12 @@ configuration required.
 
 | Category         | Operators                                                         |
 |------------------|-------------------------------------------------------------------|
-| Linear algebra   | MatMul, Gemm (batched, transposed)                                |
-| Convolution      | Conv (2-D, grouped, dilated)                                      |
-| Unary activation | Relu, Sigmoid, Gelu, Tanh, Exp, Sqrt, Abs, Neg, Log, Ceil, Floor, HardSigmoid, HardSwish, SiLU, Softplus, LeakyRelu |
-| Binary           | Add, Sub, Mul, Div (matching shapes)                              |
-| Reduction        | ReduceSum, ReduceMax (single axis)                                |
-| Normalization    | Softmax                                                           |
+| Linear algebra   | MatMul, Gemm (batched, transposed) — via `oxicuda_blas::gemm`     |
+| Convolution      | Conv — stubbed (returns `Ok(None)`, falls back to CPU; GEMM engine pending) |
+| Unary activation | Relu, Sigmoid, Gelu, Tanh, Exp, Sqrt, Abs, Neg, Log, Ceil, Floor, HardSigmoid, HardSwish, SiLU, Softplus, LeakyRelu (15 ops via PTX) |
+| Binary           | Add, Sub, Mul, Div (same-shape only)                              |
+| Reduction        | ReduceSum, ReduceMax (single axis only)                           |
+| Normalization    | Softmax (last-axis, row_size <= 1024)                             |
 
 Unsupported or unrecognised operators return `Ok(None)` so the caller falls
 back automatically.

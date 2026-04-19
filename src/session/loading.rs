@@ -195,6 +195,9 @@ impl Session {
         #[cfg(feature = "cuda")]
         let cuda = oxionnx_cuda::CudaContext::try_new();
 
+        #[cfg(feature = "directml")]
+        let dml = oxionnx_directml::DirectMLContext::try_new();
+
         #[cfg(feature = "gpu")]
         let gpu = crate::gpu::GpuContext::try_new();
 
@@ -229,6 +232,8 @@ impl Session {
             thread_pool,
             #[cfg(feature = "cuda")]
             cuda,
+            #[cfg(feature = "directml")]
+            dml,
             #[cfg(feature = "gpu")]
             gpu,
         })
