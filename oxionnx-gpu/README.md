@@ -30,7 +30,7 @@ WebGPU in the browser, all through a single Pure Rust API.
 
 ```toml
 [dependencies]
-oxionnx-gpu = "0.1.2"
+oxionnx-gpu = "0.1.3"
 ```
 
 ```rust

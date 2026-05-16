@@ -4,6 +4,18 @@ All notable changes to OxiONNX will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.3] - 2026-05-16
+
+### Added
+
+- feat: `ProviderKind::DirectMl` variant (behind `directml` feature) — `ProviderKind` enum now covers CPU, GPU (wgpu), CUDA, and DirectML
+- feat: `SessionBuilder::with_provider_kinds()` — non-trivial ordered execution provider list that routes dispatch at runtime; CPU is always the implicit terminal fallback
+- feat: `SessionBuilder::provider_kinds()` accessor — returns the configured provider list for introspection
+- feat: `Session::provider_kinds()` accessor — returns the provider list stored in the session
+- feat: provider-list dispatch loop in `run_sequential_inner` — when `providers` is non-empty, each node is attempted through the list in order; falls back to legacy heuristic path when list is empty (backward compatible)
+- feat: `try_provider_list_dispatch` helper — encapsulates CUDA / DirectML / GPU / CPU provider dispatch for the provider-list path; all providers return `None`-graceful results with CPU fallback guaranteed
+- `ProviderKind` re-exported from `oxionnx` crate root
+
 ## [0.1.2] - 2026-04-19
 
 ### Added
@@ -79,6 +91,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fuzz testing for protobuf parser
 - 595 tests, 0 clippy warnings
 
+[0.1.3]: https://github.com/cool-japan/oxionnx/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cool-japan/oxionnx/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxionnx/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxionnx/releases/tag/v0.1.0

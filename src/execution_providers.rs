@@ -124,11 +124,17 @@ pub enum OpPlacement {
 /// Which provider to use for an operator invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
+    /// Pure-Rust CPU execution (always available as fallback).
     Cpu,
+    /// wgpu / WebGPU compute backend (requires `gpu` feature).
     #[cfg(feature = "gpu")]
     Gpu,
+    /// NVIDIA CUDA backend (requires `cuda` feature).
     #[cfg(feature = "cuda")]
     Cuda,
+    /// Microsoft DirectML backend (requires `directml` feature; no-op off Windows).
+    #[cfg(feature = "directml")]
+    DirectMl,
 }
 
 /// Decide placement for a specific operator invocation.

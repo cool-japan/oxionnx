@@ -1,4 +1,4 @@
-use crate::execution_providers::OpPlacement;
+use crate::execution_providers::{OpPlacement, ProviderKind};
 use crate::graph::Graph;
 use crate::tensor::Tensor;
 use crate::OnnxError;
@@ -19,6 +19,16 @@ pub struct SessionBuilder {
     pub(crate) mixed_precision: bool,
     pub(crate) num_threads: Option<usize>,
     pub(crate) op_placement: OpPlacement,
+    /// Ordered list of execution provider backends to attempt, in priority order.
+    ///
+    /// When non-empty, the dispatch loop tries each provider in turn and uses the
+    /// first that returns `Some(result)`. CPU is always the implicit terminal
+    /// fallback — it is tried even if absent from this list.
+    ///
+    /// When empty (the default), the session falls back to the legacy
+    /// heuristic / compile-time feature-flag dispatch, preserving backward
+    /// compatibility with callers that never call `with_execution_providers`.
+    pub(crate) providers: Vec<ProviderKind>,
 }
 
 impl SessionBuilder {
@@ -34,6 +44,7 @@ impl SessionBuilder {
             mixed_precision: false,
             num_threads: None,
             op_placement: OpPlacement::default(),
+            providers: Vec::new(),
         }
     }
 
@@ -106,6 +117,7 @@ impl SessionBuilder {
             self.mixed_precision,
             self.num_threads,
             self.op_placement,
+            self.providers,
         )
     }
 
@@ -132,6 +144,7 @@ impl SessionBuilder {
             self.mixed_precision,
             self.num_threads,
             self.op_placement,
+            self.providers,
         )
     }
 
@@ -153,6 +166,7 @@ impl SessionBuilder {
             self.mixed_precision,
             self.num_threads,
             self.op_placement,
+            self.providers,
         )
     }
 
@@ -177,6 +191,7 @@ impl SessionBuilder {
             self.mixed_precision,
             self.num_threads,
             self.op_placement,
+            self.providers,
         )
     }
 
@@ -208,6 +223,7 @@ impl SessionBuilder {
             self.mixed_precision,
             self.num_threads,
             self.op_placement,
+            self.providers,
         )
     }
 
@@ -230,6 +246,7 @@ impl SessionBuilder {
             self.mixed_precision,
             self.num_threads,
             self.op_placement,
+            self.providers,
         )
     }
 
@@ -268,17 +285,69 @@ impl SessionBuilder {
         self
     }
 
-    /// `ort`-compatible no-op for execution provider selection.
+    /// Set the ordered list of execution provider backends to try, in priority order.
     ///
-    /// oxionnx's runtime backend is determined at compile time via feature flags
-    /// (`gpu`, `cuda`).  This method accepts any iterator of
-    /// [`crate::ExecutionProviderDispatch`] values so that ort-style provider-registration
-    /// code compiles without modification.
+    /// Each `ProviderKind` in the iterator is attempted for every ONNX graph node
+    /// during inference; the first provider that returns `Some(result)` wins.
+    /// CPU is always the implicit terminal fallback — it is tried even if
+    /// absent from this list, guaranteeing that no provider selection can
+    /// silently break CPU-only inference.
+    ///
+    /// Passing an empty iterator restores the legacy heuristic / compile-time
+    /// feature-flag dispatch (backward-compatible default).
+    ///
+    /// ## `ort` compatibility
+    ///
+    /// The `ort` 2.x API accepts [`crate::execution_providers::ExecutionProviderDispatch`]
+    /// tokens.  To support callers migrating from `ort`, this method also accepts
+    /// those tokens — they are silently discarded so that existing call sites
+    /// compile without change.  Use [`SessionBuilder::with_provider_kinds`] to
+    /// pass typed [`ProviderKind`] values that actually affect dispatch.
     pub fn with_execution_providers<I>(self, _providers: I) -> Self
     where
         I: IntoIterator<Item = crate::execution_providers::ExecutionProviderDispatch>,
     {
+        // `ExecutionProviderDispatch` is an opaque ort-compat token; discarding
+        // it preserves backward compatibility (callers migrating from ort).
         self
+    }
+
+    /// Set the ordered list of [`ProviderKind`] backends to attempt, in priority order.
+    ///
+    /// Unlike [`SessionBuilder::with_execution_providers`], which accepts the
+    /// `ort`-compatible opaque token, this method accepts typed [`ProviderKind`]
+    /// values that **actually route dispatch** at runtime.
+    ///
+    /// # CPU fallback guarantee
+    ///
+    /// CPU is always tried last even if not present in `providers`.
+    /// An empty list is equivalent to CPU-only execution.
+    ///
+    /// # Feature gating
+    ///
+    /// Provider variants are only present when the corresponding Cargo feature
+    /// is enabled:
+    /// - [`ProviderKind::Gpu`] requires feature `gpu`
+    /// - [`ProviderKind::Cuda`] requires feature `cuda`
+    /// - [`ProviderKind::DirectMl`] requires feature `directml`
+    ///
+    /// Passing a provider whose feature is not enabled is a compile error.
+    pub fn with_provider_kinds(
+        mut self,
+        providers: impl IntoIterator<Item = ProviderKind>,
+    ) -> Self {
+        self.providers = providers.into_iter().collect();
+        self
+    }
+
+    /// Return the currently configured provider kind list.
+    ///
+    /// Useful for introspection in tests and diagnostic tooling.
+    /// Returns an empty slice when no explicit list has been set (legacy
+    /// heuristic dispatch will be used in that case).
+    #[must_use]
+    pub fn provider_kinds(&self) -> &[ProviderKind] {
+        &self.providers
     }
 }
 

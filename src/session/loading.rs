@@ -1,4 +1,4 @@
-use crate::execution_providers::OpPlacement;
+use crate::execution_providers::{OpPlacement, ProviderKind};
 use crate::graph::Graph;
 use crate::tensor::Tensor;
 use crate::OnnxError;
@@ -34,6 +34,7 @@ impl Session {
             false,
             None,
             OpPlacement::default(),
+            Vec::new(),
         )
     }
 
@@ -68,6 +69,7 @@ impl Session {
             false,
             None,
             OpPlacement::default(),
+            Vec::new(),
         )
     }
 
@@ -91,6 +93,7 @@ impl Session {
             false,
             None,
             OpPlacement::default(),
+            Vec::new(),
         )
     }
 
@@ -118,6 +121,7 @@ impl Session {
             false,
             None,
             OpPlacement::default(),
+            Vec::new(),
         )
     }
 
@@ -135,6 +139,7 @@ impl Session {
         mixed_precision: bool,
         num_threads: Option<usize>,
         op_placement: OpPlacement,
+        providers: Vec<ProviderKind>,
     ) -> Result<Self, OnnxError> {
         use crate::memory::SizeClassPool;
         use std::sync::Mutex;
@@ -226,6 +231,7 @@ impl Session {
             parallel,
             mixed_precision,
             op_placement,
+            providers,
             dynamic_dims: Mutex::new(HashMap::new()),
             resolved_shapes: Mutex::new(HashMap::new()),
             #[cfg(not(target_arch = "wasm32"))]

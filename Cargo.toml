@@ -1,9 +1,9 @@
 [workspace]
-members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu", "oxionnx-cuda", "oxionnx-directml"]
+members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu", "oxionnx-cuda", "oxionnx-directml", "oxionnx-coreml"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
 license = "Apache-2.0"
@@ -13,21 +13,22 @@ homepage = "https://github.com/cool-japan/oxionnx"
 rust-version = "1.75"
 
 [workspace.dependencies]
-oxionnx-core = { path = "oxionnx-core", version = "0.1.2" }
+oxionnx-core = { path = "oxionnx-core", version = "0.1.3" }
 ndarray = { version = "0.17" }
-oxionnx-ops = { path = "oxionnx-ops", version = "0.1.2" }
-oxionnx-proto = { path = "oxionnx-proto", version = "0.1.2" }
-oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.2" }
-oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.2" }
-oxionnx-directml = { path = "oxionnx-directml", version = "0.1.2" }
+oxionnx-ops = { path = "oxionnx-ops", version = "0.1.3" }
+oxionnx-proto = { path = "oxionnx-proto", version = "0.1.3" }
+oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.3" }
+oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.3" }
+oxionnx-directml = { path = "oxionnx-directml", version = "0.1.3" }
+oxionnx-coreml = { path = "oxionnx-coreml", version = "0.1.3" }
 # OxiCUDA stack
-oxifft = "0.2.0"
-oxicuda-driver = { version = "0.1.4" }
-oxicuda-memory = { version = "0.1.4" }
-oxicuda-blas = { version = "0.1.4" }
-oxicuda-dnn = { version = "0.1.4" }
-oxicuda-ptx = { version = "0.1.4" }
-oxicuda-launch = { version = "0.1.4" }
+oxifft = "0.3"
+oxicuda-driver = { version = "0.1.7" }
+oxicuda-memory = { version = "0.1.7" }
+oxicuda-blas = { version = "0.1.7" }
+oxicuda-dnn = { version = "0.1.7" }
+oxicuda-ptx = { version = "0.1.7" }
+oxicuda-launch = { version = "0.1.7" }
 thiserror = "2"
 half = "2.7"
 matrixmultiply = "0.3"
@@ -66,6 +67,7 @@ oxionnx-proto = { workspace = true }
 oxionnx-gpu = { workspace = true, optional = true }
 oxionnx-cuda = { workspace = true, optional = true }
 oxionnx-directml = { workspace = true, optional = true }
+oxionnx-coreml = { workspace = true, optional = true }
 half = { workspace = true }
 matrixmultiply = { workspace = true }
 bytemuck = { workspace = true }
@@ -86,6 +88,7 @@ default = []
 gpu = ["dep:wgpu", "dep:pollster", "oxionnx-gpu"]
 cuda = ["dep:oxionnx-cuda"]
 directml = ["dep:oxionnx-directml"]
+coreml = ["dep:oxionnx-coreml"]
 simd = ["oxionnx-ops/simd"]
 encryption = ["dep:aes-gcm"]
 mmap = ["dep:memmap2", "oxionnx-proto/mmap"]
@@ -97,6 +100,24 @@ criterion = { workspace = true }
 half = { workspace = true }
 proptest = { workspace = true }
 ndarray = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-ml = "0.3.2"
+block2 = "0.6"
+
+[[example]]
+name = "coreml_arcface_smoke"
+path = "examples/coreml_arcface_smoke.rs"
+
+[[example]]
+name = "coreml_scrfd_smoke"
+path = "examples/coreml_scrfd_smoke.rs"
+
+[[example]]
+name = "coreml_inswapper_smoke"
+path = "examples/coreml_inswapper_smoke.rs"
 
 [[bench]]
 name = "operators"

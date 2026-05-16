@@ -69,11 +69,7 @@ pub(super) fn broadcast_flat_index(
     let mut remaining = flat_idx;
     for d in 0..ndim {
         let out_stride = out_strides[d];
-        let coord = if out_stride > 0 {
-            remaining / out_stride
-        } else {
-            0
-        };
+        let coord = remaining.checked_div(out_stride).unwrap_or(0);
         remaining = if out_stride > 0 {
             remaining % out_stride
         } else {

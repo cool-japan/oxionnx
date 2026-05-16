@@ -159,3 +159,95 @@ fn test_builder_op_placement_api() {
     let y = out.get("output").expect("output");
     assert_eq!(y.data, vec![0.0, 2.0, 0.0]);
 }
+
+/// Verify that `with_provider_kinds([ProviderKind::Cpu])` stores one provider.
+///
+/// This test does NOT require GPU hardware — it only verifies the API stores
+/// the provider list correctly and that a CPU-only session executes correctly.
+#[test]
+fn test_with_provider_kinds_cpu_stores_and_runs() {
+    use crate::execution_providers::ProviderKind;
+    let builder = SessionBuilder::new().with_provider_kinds([ProviderKind::Cpu]);
+    assert_eq!(builder.providers.len(), 1, "providers must have 1 element");
+    assert_eq!(
+        builder.providers[0],
+        ProviderKind::Cpu,
+        "first provider must be Cpu"
+    );
+
+    // Build and run a simple session to verify CPU fallback works correctly
+    // when the provider list is [Cpu].
+    let graph = Graph {
+        nodes: vec![Node {
+            name: "relu_ep".to_string(),
+            op: OpKind::Relu,
+            inputs: vec!["x".to_string()],
+            outputs: vec!["y".to_string()],
+            attrs: Attributes::default(),
+        }],
+        input_names: vec!["x".to_string()],
+        output_names: vec!["y".to_string()],
+        ..Default::default()
+    };
+    let session = SessionBuilder::new()
+        .with_optimization_level(OptLevel::None)
+        .with_provider_kinds([ProviderKind::Cpu])
+        .build_from_graph(graph, HashMap::new())
+        .expect("build with CPU provider kind");
+
+    let input = Tensor::new(vec![-2.0f32, 1.0, -3.0, 4.0], vec![4]);
+    let out = session.run_one("x", input).expect("run with provider-list");
+    let y = out.get("y").expect("output y");
+    assert_eq!(y.data, vec![0.0, 1.0, 0.0, 4.0]);
+    assert_eq!(y.shape, vec![4]);
+}
+
+/// Verify that an empty provider list (default) preserves legacy behavior.
+///
+/// Calling `build_from_graph` without `with_provider_kinds` must still work
+/// correctly — the providers list is empty and the legacy dispatch path is used.
+#[test]
+fn test_empty_provider_list_uses_legacy_dispatch() {
+    let graph = Graph {
+        nodes: vec![Node {
+            name: "relu_legacy".to_string(),
+            op: OpKind::Relu,
+            inputs: vec!["x".to_string()],
+            outputs: vec!["y".to_string()],
+            attrs: Attributes::default(),
+        }],
+        input_names: vec!["x".to_string()],
+        output_names: vec!["y".to_string()],
+        ..Default::default()
+    };
+    let session = SessionBuilder::new()
+        .with_optimization_level(OptLevel::None)
+        // No with_provider_kinds call — providers is empty Vec
+        .build_from_graph(graph, HashMap::new())
+        .expect("build with empty provider list (legacy)");
+
+    // providers must be empty
+    assert!(
+        session.providers.is_empty(),
+        "default build must have empty providers list"
+    );
+
+    let input = Tensor::new(vec![-5.0f32, 0.0, 3.0], vec![3]);
+    let out = session
+        .run_one("x", input)
+        .expect("run with empty providers");
+    let y = out.get("y").expect("output y");
+    assert_eq!(y.data, vec![0.0, 0.0, 3.0]);
+}
+
+/// Verify `with_provider_kinds` with multiple providers stores them in order.
+#[test]
+fn test_with_provider_kinds_multiple_providers_order() {
+    use crate::execution_providers::ProviderKind;
+    // Only Cpu is guaranteed to be available without feature flags, but we
+    // can verify the storage order by using Cpu twice (or once and checking).
+    let builder = SessionBuilder::new().with_provider_kinds([ProviderKind::Cpu, ProviderKind::Cpu]);
+    assert_eq!(builder.providers.len(), 2);
+    assert_eq!(builder.providers[0], ProviderKind::Cpu);
+    assert_eq!(builder.providers[1], ProviderKind::Cpu);
+}

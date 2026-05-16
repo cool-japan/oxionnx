@@ -1,3 +1,4 @@
+use crate::execution_providers::ProviderKind;
 use crate::graph::OpKind;
 use crate::memory::SizeClassPool;
 use crate::OnnxError;
@@ -30,6 +31,25 @@ impl Session {
                 continue;
             }
 
+            // ── Provider-list dispatch path ────────────────────────────────────
+            // When the session was built with `with_provider_kinds()`, iterate
+            // the ordered provider list.  The first provider that returns
+            // `Some(results)` wins; CPU is always the implicit terminal fallback
+            // (handled by the normal dispatch path below).
+            if !self.providers.is_empty() {
+                if let Some(dispatched) =
+                    self.try_provider_list_dispatch(node, state, ref_counts, output_set)?
+                {
+                    if dispatched {
+                        continue;
+                    }
+                    // dispatched == false means all explicit providers returned None;
+                    // fall through to the CPU dispatch path below.
+                }
+            }
+            // ── Legacy heuristic dispatch path ────────────────────────────────
+            // Used when `self.providers` is empty (backward-compatible default).
+
             // Determine operator placement based on the configured strategy.
             // output_bytes and placement are used by the GPU dispatch block below.
             // CUDA and DirectML dispatch check op_placement directly (no size threshold).
@@ -47,9 +67,13 @@ impl Session {
             #[cfg(not(any(feature = "gpu", feature = "cuda", feature = "directml")))]
             let _ = &self.op_placement;
 
-            // CUDA dispatch (only when placement allows)
+            // Skip legacy GPU/CUDA/DirectML dispatch when provider-list was supplied —
+            // the provider-list path already handled it (or fell through to CPU).
+            let skip_legacy_accel = !self.providers.is_empty();
+
+            // CUDA dispatch (only when placement allows and no provider-list)
             #[cfg(feature = "cuda")]
-            {
+            if !skip_legacy_accel {
                 let try_cuda = self.cuda.is_some()
                     && !matches!(
                         self.op_placement,
@@ -108,7 +132,7 @@ impl Session {
 
             // DirectML dispatch — Windows D3D12 GPU, higher priority than wgpu on Windows
             #[cfg(feature = "directml")]
-            {
+            if !skip_legacy_accel {
                 let try_dml = self.dml.is_some()
                     && !matches!(
                         self.op_placement,
@@ -165,11 +189,10 @@ impl Session {
                 }
             }
 
-            // GPU dispatch (only when placement routes to GPU)
+            // GPU dispatch (only when placement routes to GPU and no provider-list)
             #[cfg(feature = "gpu")]
-            {
+            if !skip_legacy_accel {
                 use super::super::gpu_dispatch::{try_gpu_dispatch, GpuExecutionProvider};
-                use crate::execution_providers::ProviderKind;
                 let try_gpu = matches!(placement, ProviderKind::Gpu);
                 if try_gpu {
                     if let Some(gpu_ctx) = &self.gpu {
@@ -197,6 +220,9 @@ impl Session {
                     }
                 }
             }
+
+            // Suppress unused variable warning when no accel features are enabled.
+            let _ = skip_legacy_accel;
 
             let op_name = node.op.as_str();
 
@@ -287,5 +313,164 @@ impl Session {
             self.decrement_refs_state(node, state, ref_counts, output_set);
         }
         Ok(())
+    }
+
+    /// Attempt to dispatch `node` through the ordered provider list stored in
+    /// `self.providers`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(true))` — a provider handled the op; caller should `continue`.
+    /// - `Ok(Some(false))` — all providers returned `None`; caller falls through to CPU.
+    /// - `Ok(None)` — providers list is empty (should not be called in that case).
+    /// - `Err(_)` — an unrecoverable error from a provider.
+    ///
+    /// CPU is the implicit terminal fallback and is never invoked here; the
+    /// caller handles the CPU path after this method returns `Some(false)`.
+    #[allow(unused_variables)]
+    #[allow(clippy::never_loop)] // The loop CAN iterate when GPU/CUDA/DirectML features are enabled;
+                                 // without those features, only ProviderKind::Cpu exists and the first
+                                 // iteration always returns — this is correct conditional-compilation behaviour.
+    fn try_provider_list_dispatch(
+        &self,
+        node: &crate::graph::Node,
+        state: &mut SessionRunState,
+        ref_counts: &mut HashMap<String, usize>,
+        output_set: &std::collections::HashSet<&str>,
+    ) -> Result<Option<bool>, OnnxError> {
+        for provider in &self.providers {
+            match provider {
+                // CPU is an explicit terminal fallback — signal caller to use CPU path.
+                ProviderKind::Cpu => return Ok(Some(false)),
+
+                // CUDA provider
+                #[cfg(feature = "cuda")]
+                ProviderKind::Cuda => {
+                    if let Some(cuda_ctx) = &self.cuda {
+                        let start = std::time::Instant::now();
+                        match oxionnx_cuda::try_cuda_dispatch(
+                            node,
+                            &self.weights,
+                            state.as_map(),
+                            cuda_ctx,
+                        ) {
+                            Ok(Some(results)) => {
+                                let elapsed = start.elapsed();
+                                if let Some(ref profiling) = self.profiling_data {
+                                    if let Ok(mut data) = profiling.lock() {
+                                        data.push(NodeProfile {
+                                            node_name: node.name.clone(),
+                                            op_type: node.op.as_str().to_string(),
+                                            duration: elapsed,
+                                            output_shapes: results
+                                                .iter()
+                                                .map(|t| t.shape.clone())
+                                                .collect(),
+                                        });
+                                    }
+                                }
+                                let pool = self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>);
+                                for (name, tensor) in node.outputs.iter().zip(results) {
+                                    if !name.is_empty() {
+                                        state.insert(name.clone(), tensor, pool);
+                                    }
+                                }
+                                self.decrement_refs_state(node, state, ref_counts, output_set);
+                                return Ok(Some(true));
+                            }
+                            Ok(None) => {
+                                // Op not supported on CUDA — try next provider
+                            }
+                            Err(_e) => {
+                                // CUDA error — fall through to next provider
+                                #[cfg(debug_assertions)]
+                                tracing::debug!(
+                                    op = %node.op.as_str(),
+                                    node = %node.name,
+                                    err = %_e,
+                                    "CUDA dispatch error in provider-list path, trying next provider",
+                                );
+                            }
+                        }
+                    }
+                    // No CUDA context available — try next provider
+                }
+
+                // DirectML provider
+                #[cfg(feature = "directml")]
+                ProviderKind::DirectMl => {
+                    if let Some(dml_ctx) = &self.dml {
+                        let start = std::time::Instant::now();
+                        match oxionnx_directml::try_directml_dispatch(
+                            node,
+                            &self.weights,
+                            state.as_map(),
+                            dml_ctx,
+                        ) {
+                            Ok(Some(results)) => {
+                                let elapsed = start.elapsed();
+                                if let Some(ref profiling) = self.profiling_data {
+                                    if let Ok(mut data) = profiling.lock() {
+                                        data.push(NodeProfile {
+                                            node_name: node.name.clone(),
+                                            op_type: node.op.as_str().to_string(),
+                                            duration: elapsed,
+                                            output_shapes: results
+                                                .iter()
+                                                .map(|t| t.shape.clone())
+                                                .collect(),
+                                        });
+                                    }
+                                }
+                                let pool = self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>);
+                                for (name, tensor) in node.outputs.iter().zip(results) {
+                                    if !name.is_empty() {
+                                        state.insert(name.clone(), tensor, pool);
+                                    }
+                                }
+                                self.decrement_refs_state(node, state, ref_counts, output_set);
+                                return Ok(Some(true));
+                            }
+                            Ok(None) => {
+                                // Op not supported by DirectML — try next provider
+                            }
+                            Err(_e) => {
+                                #[cfg(debug_assertions)]
+                                tracing::debug!(
+                                    op = %node.op.as_str(),
+                                    node = %node.name,
+                                    err = %_e,
+                                    "DirectML dispatch error in provider-list path, trying next provider",
+                                );
+                            }
+                        }
+                    }
+                    // No DirectML context available — try next provider
+                }
+
+                // WebGPU / wgpu provider
+                #[cfg(feature = "gpu")]
+                ProviderKind::Gpu => {
+                    use super::super::gpu_dispatch::try_gpu_dispatch;
+                    if let Some(gpu_ctx) = &self.gpu {
+                        if let Some(results) =
+                            try_gpu_dispatch(node, &self.weights, state.as_map(), gpu_ctx)?
+                        {
+                            let pool = self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>);
+                            for (name, tensor) in node.outputs.iter().zip(results) {
+                                if !name.is_empty() {
+                                    state.insert(name.clone(), tensor, pool);
+                                }
+                            }
+                            self.decrement_refs_state(node, state, ref_counts, output_set);
+                            return Ok(Some(true));
+                        }
+                        // GPU returned None — try next provider
+                    }
+                    // No GPU context — try next provider
+                }
+            }
+        }
+        // All explicit providers returned None — signal caller to use CPU path.
+        Ok(Some(false))
     }
 }

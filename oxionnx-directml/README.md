@@ -24,7 +24,7 @@ oxionnx (root)
 
 ```toml
 [dependencies]
-oxionnx = { version = "0.1.2", features = ["directml"] }
+oxionnx = { version = "0.1.3", features = ["directml"] }
 ```
 
 ## Usage
@@ -39,7 +39,7 @@ let session = Session::builder()
     .load("model.onnx".as_ref())?;
 ```
 
-## Supported Operators (v0.1.2)
+## Supported Operators (v0.1.3)
 
 | Operator | Status |
 |----------|--------|

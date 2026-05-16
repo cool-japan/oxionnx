@@ -1,4 +1,4 @@
-use crate::execution_providers::OpPlacement;
+use crate::execution_providers::{OpPlacement, ProviderKind};
 use crate::memory::SizeClassPool;
 use crate::tensor::Tensor;
 use oxionnx_core::OperatorRegistry;
@@ -44,6 +44,14 @@ pub struct Session {
     pub(crate) mixed_precision: bool,
     /// Operator placement strategy for CPU/GPU routing.
     pub(crate) op_placement: OpPlacement,
+    /// Ordered list of execution provider backends to attempt, in priority order.
+    ///
+    /// When non-empty, the dispatch loop in `run_sequential_inner` iterates this
+    /// list for every node and uses the first provider that returns a result.
+    /// CPU is always the implicit terminal fallback.
+    ///
+    /// When empty, the legacy feature-flag heuristic dispatch is used.
+    pub(crate) providers: Vec<ProviderKind>,
     /// Current dynamic dimension bindings, updated on each `run()` call.
     /// Maps symbolic dimension names (e.g. "batch_size") to concrete values.
     pub(crate) dynamic_dims: Mutex<HashMap<String, usize>>,

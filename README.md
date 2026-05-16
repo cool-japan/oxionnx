@@ -2,7 +2,6 @@
 
 **Pure Rust ONNX Inference Engine -- Zero C/C++ Dependencies**
 
-[![CI](https://github.com/cool-japan/oxionnx/actions/workflows/ci.yml/badge.svg)](https://github.com/cool-japan/oxionnx/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/oxionnx.svg)](https://crates.io/crates/oxionnx)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -10,7 +9,7 @@ OxiONNX is a high-performance ONNX inference engine written in pure Rust.
 It supports 165 ONNX operators, GPU acceleration via wgpu, SIMD optimization,
 and runs on any platform including WebAssembly.
 
-**60,734 lines of Rust | 1,173 tests | 0 clippy warnings**
+**63,460 lines of Rust | 1,179 tests | 0 clippy warnings**
 
 ## Features
 
@@ -38,15 +37,16 @@ and runs on any platform including WebAssembly.
 
 | Crate | Status | Tests |
 |-------|--------|-------|
-| `oxionnx` (root) | Alpha | 521 passing |
+| `oxionnx` (root) | Alpha | 525 passing |
 | `oxionnx-core` | Stable | 36 passing |
 | `oxionnx-ops` | Alpha | 554 passing |
 | `oxionnx-proto` | Stable | 37 passing |
 | `oxionnx-gpu` | Alpha | 17 passing |
 | `oxionnx-cuda` | Partial | 4 passing (GEMM/elementwise/softmax via OxiCUDA; Conv stubbed) |
 | `oxionnx-directml` | Planned | 4 passing (Windows scaffold; HLSL shaders defined but not yet bound) |
+| `oxionnx-coreml` | Partial | 2 passing (CoreML session bridge; macOS only) |
 
-**Total: 1,173 tests passing, 0 clippy warnings, 60,734 SLoC**
+**Total: 1,179 tests passing, 0 clippy warnings, 63,460 SLoC**
 
 ## Quick Start
 
@@ -114,11 +114,12 @@ OxiONNX implements 165 ONNX operators (plus 21 aliases including the `ai.onnx.ml
 ```
 oxionnx (root)           -- Session, optimizer, execution engine
   oxionnx-core           -- Tensor, DType, Graph, Operator trait, OnnxError
-  oxionnx-ops            -- 159 operator implementations
+  oxionnx-ops            -- 165 operator implementations
   oxionnx-proto          -- Pure Rust ONNX protobuf parser
   oxionnx-gpu            -- wgpu compute backend (optional)
   oxionnx-cuda           -- CUDA dispatch layer via OxiCUDA (optional)
   oxionnx-directml       -- DirectML execution provider for Windows D3D12 (optional)
+  oxionnx-coreml         -- CoreML execution provider for macOS/iOS (optional)
 ```
 
 ## Performance

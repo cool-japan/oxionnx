@@ -1,0 +1,28 @@
+[package]
+name = "oxionnx-coreml"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Apple CoreML execution provider for OxiONNX — load and run pre-converted .mlpackage models on ANE / GPU / CPU"
+keywords = ["onnx", "coreml", "ane", "apple-silicon", "inference"]
+categories = ["science", "hardware-support"]
+readme = "README.md"
+
+[dependencies]
+oxionnx-core = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-ml = "0.3.2"
+block2 = "0.6"
+half = { workspace = true }
+
+[features]
+default = []

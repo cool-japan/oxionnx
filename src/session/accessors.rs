@@ -1,3 +1,4 @@
+use crate::execution_providers::ProviderKind;
 use crate::memory::PoolStats;
 use crate::tensor::Tensor;
 use oxionnx_core::Operator;
@@ -95,6 +96,15 @@ impl Session {
         self.pool
             .as_ref()
             .and_then(|m| m.lock().ok().map(|p| p.stats().clone()))
+    }
+
+    /// Return the ordered execution provider list configured for this session.
+    ///
+    /// Returns an empty slice when no explicit list was set (legacy heuristic
+    /// / compile-time feature-flag dispatch is used in that case).
+    #[must_use]
+    pub fn provider_kinds(&self) -> &[ProviderKind] {
+        &self.providers
     }
 
     /// Export the computation graph as a DOT (Graphviz) string.

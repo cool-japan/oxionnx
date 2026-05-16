@@ -1,10 +1,10 @@
-# OxiONNX 0.1.2 -- Pure Rust ONNX Inference Engine
+# OxiONNX 0.1.3 -- Pure Rust ONNX Inference Engine
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
 **Author:** COOLJAPAN OU (Team Kitasan)
 
-**Current stats (2026-04-19):** ~60,734 SLoC (Rust code) | 167 OpKind variants | 1,173 tests passing | workspace layout (7 crates)
+**Current stats (2026-05-16):** ~63,460 SLoC (Rust code) | 167 OpKind variants | 1,179 tests passing | workspace layout (8 crates)
 **Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)
 **Zero C/C++ dependencies.**
 
@@ -309,7 +309,7 @@ Summary of key items:
 
 ---
 
-## 12. Performance & Correctness Enhancements (v0.1.2)
+## 12. Performance & Correctness Enhancements (v0.1.3)
 
 ### RNN Operator Completeness
 - [x] Fix `sequence_lens` parameter -- variable-length sequences now correctly masked per batch element

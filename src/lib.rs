@@ -35,6 +35,27 @@ pub mod directml {
     //! DirectML (Windows D3D12 GPU) dispatch for ONNX ops.
     pub use oxionnx_directml::*;
 }
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+pub mod coreml {
+    //! Apple CoreML whole-model dispatch for pre-converted `.mlpackage` bundles.
+    //!
+    //! Re-exports the public surface of [`oxionnx_coreml`].  The
+    //! [`MlPackageSession`] alias lifts the inner `MlPackageModel` type to
+    //! the user-facing `*Session` naming convention used elsewhere in this
+    //! crate (see [`crate::Session`]).
+    pub use oxionnx_coreml::{ComputePlanSummary, CoreMLError, MlComputeUnits, MlPackageModel};
+
+    /// Sibling of [`crate::Session`] for CoreML-backed `.mlpackage` models.
+    ///
+    /// `MlPackageSession` exposes the same I/O contract as
+    /// [`crate::Session`] (input/output names + a `predict`-style call) so
+    /// callers can swap between the two backends with minimal churn.  It
+    /// is implemented as a type alias over
+    /// [`oxionnx_coreml::MlPackageModel`].
+    pub type MlPackageSession = MlPackageModel;
+}
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+pub use coreml::{ComputePlanSummary, CoreMLError, MlComputeUnits, MlPackageSession};
 pub mod graph {
     pub use oxionnx_core::graph::*;
 }
@@ -82,7 +103,7 @@ pub use benchmark_select::{
 pub use compat::{GraphOptimizationLevel, SessionOutputs};
 pub use execution_providers::{
     CPUExecutionProvider, CUDAExecutionProvider, CoreMLExecutionProvider,
-    DirectMLExecutionProvider, ExecutionProviderDispatch, OpenVINOExecutionProvider,
+    DirectMLExecutionProvider, ExecutionProviderDispatch, OpenVINOExecutionProvider, ProviderKind,
     TensorRTExecutionProvider,
 };
 pub use io_binding::IoBinding;

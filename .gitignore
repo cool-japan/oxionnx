@@ -76,3 +76,5 @@ wasm-pack.log
 **/CLAUDE.md
 **/CLAUDE.local.md
 **/.hypothesis/
+
+target

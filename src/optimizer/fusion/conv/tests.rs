@@ -262,7 +262,12 @@ fn test_fold_batch_norm_inference_basic() {
     weights.insert("mean".to_string(), Tensor::new(vec![1.0], vec![1]));
     weights.insert("var".to_string(), Tensor::new(vec![4.0], vec![1]));
 
-    let result = fold_batch_norm_inference(nodes, &mut weights);
+    // BN input is `[N=1, C=1, H=4, W=4]` — gives synthesized constants
+    // shape `[1, 1, 1, 1]`.
+    let mut known_shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    known_shapes.insert("x".to_string(), vec![1, 1, 4, 4]);
+
+    let result = fold_batch_norm_inference(nodes, &mut weights, &known_shapes);
 
     // BN replaced with Mul + Add
     assert_eq!(result.len(), 2);
@@ -280,9 +285,11 @@ fn test_fold_batch_norm_inference_basic() {
     let expected_shift = 0.5 - 1.0 * expected_factor;
 
     let factor = weights.get("bn_bn_factor").expect("factor weight");
+    assert_eq!(factor.shape, vec![1, 1, 1, 1]);
     assert!((factor.data[0] - expected_factor).abs() < 1e-5);
 
     let shift = weights.get("bn_bn_shift").expect("shift weight");
+    assert_eq!(shift.shape, vec![1, 1, 1, 1]);
     assert!((shift.data[0] - expected_shift).abs() < 1e-5);
 }
 
@@ -305,7 +312,10 @@ fn test_fold_batch_norm_inference_skips_conv_preceded() {
     weights.insert("mean".to_string(), Tensor::new(vec![0.0], vec![1]));
     weights.insert("var".to_string(), Tensor::new(vec![1.0], vec![1]));
 
-    let result = fold_batch_norm_inference(nodes, &mut weights);
+    let mut known_shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    known_shapes.insert("conv_out".to_string(), vec![1, 1, 4, 4]);
+
+    let result = fold_batch_norm_inference(nodes, &mut weights, &known_shapes);
 
     // Should NOT fold — Conv precedes BN
     assert_eq!(result.len(), 2);
@@ -328,7 +338,10 @@ fn test_fold_batch_norm_inference_missing_weights() {
     weights.insert("scale".to_string(), Tensor::new(vec![1.0], vec![1]));
     // Missing bias, mean, var weights
 
-    let result = fold_batch_norm_inference(nodes, &mut weights);
+    let mut known_shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    known_shapes.insert("x".to_string(), vec![1, 1, 4, 4]);
+
+    let result = fold_batch_norm_inference(nodes, &mut weights, &known_shapes);
 
     // Should not fold — missing weights
     assert_eq!(result.len(), 1);
@@ -361,16 +374,20 @@ fn test_fold_batch_norm_inference_multi_channel() {
     );
     weights.insert("var".to_string(), Tensor::new(vec![1.0, 2.0, 4.0], vec![3]));
 
-    let result = fold_batch_norm_inference(nodes, &mut weights);
+    // BN input is `[1, 3, 8, 8]` → emitted constants shape `[1, 3, 1, 1]`.
+    let mut known_shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    known_shapes.insert("x".to_string(), vec![1, 3, 8, 8]);
+
+    let result = fold_batch_norm_inference(nodes, &mut weights, &known_shapes);
 
     assert_eq!(result.len(), 2);
     assert!(matches!(result[0].op, OpKind::Mul));
     assert!(matches!(result[1].op, OpKind::Add));
 
     let factor = weights.get("bn_bn_factor").expect("factor");
-    assert_eq!(factor.shape, vec![3]);
+    assert_eq!(factor.shape, vec![1, 3, 1, 1]);
     let shift = weights.get("bn_bn_shift").expect("shift");
-    assert_eq!(shift.shape, vec![3]);
+    assert_eq!(shift.shape, vec![1, 3, 1, 1]);
 
     // Verify channel 0: scale=1.0, var=1.0, eps=0.001
     let inv_std_0 = 1.0 / (1.0f32 + 0.001).sqrt();
@@ -395,11 +412,106 @@ fn test_fold_batch_norm_inference_shape_mismatch() {
     weights.insert("mean".to_string(), Tensor::new(vec![0.0, 0.0], vec![2]));
     weights.insert("var".to_string(), Tensor::new(vec![1.0, 1.0], vec![2]));
 
-    let result = fold_batch_norm_inference(nodes, &mut weights);
+    let mut known_shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    known_shapes.insert("x".to_string(), vec![1, 2, 4, 4]);
+
+    let result = fold_batch_norm_inference(nodes, &mut weights, &known_shapes);
 
     // Shape mismatch — should not fold
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::BatchNorm));
+}
+
+/// Regression: ArcFace (ResNet50) trips on the standalone BN fold when the
+/// input is `[1, 64, 112, 112]` — earlier versions emitted `factor`/`shift`
+/// as `[64]`, which fails strict NumPy alignment against `[N, C, H, W]`
+/// (the trailing dim becomes `64 vs 112`).  Verify both shapes and runtime
+/// elementwise correctness against the reference `BatchNormalization` op.
+#[test]
+fn test_fold_batch_norm_resnet_arcface_first_layer() {
+    use oxionnx_ops::math;
+    use oxionnx_ops::nn;
+
+    let mut bn = make_node(
+        OpKind::BatchNorm,
+        "bn",
+        vec!["x", "scale", "bias", "mean", "var"],
+        vec!["bn_out"],
+    );
+    bn.attrs.floats.insert("epsilon".to_string(), 1e-5);
+
+    let nodes = vec![bn];
+    let mut weights = HashMap::new();
+
+    // Deterministic per-channel parameters (C=64).
+    let c = 64usize;
+    let scale: Vec<f32> = (0..c).map(|i| 0.5 + (i as f32) * 0.01).collect();
+    let bias: Vec<f32> = (0..c).map(|i| 0.1 + (i as f32) * 0.005).collect();
+    let mean: Vec<f32> = (0..c).map(|i| (i as f32) * 0.02 - 0.5).collect();
+    let var: Vec<f32> = (0..c).map(|i| 0.25 + (i as f32) * 0.01).collect();
+    weights.insert("scale".to_string(), Tensor::new(scale.clone(), vec![c]));
+    weights.insert("bias".to_string(), Tensor::new(bias.clone(), vec![c]));
+    weights.insert("mean".to_string(), Tensor::new(mean.clone(), vec![c]));
+    weights.insert("var".to_string(), Tensor::new(var.clone(), vec![c]));
+
+    // ResNet first conv output: `[1, 64, 112, 112]`.
+    let n = 1usize;
+    let h = 112usize;
+    let w = 112usize;
+    let mut known_shapes: HashMap<String, Vec<usize>> = HashMap::new();
+    known_shapes.insert("x".to_string(), vec![n, c, h, w]);
+
+    let folded = fold_batch_norm_inference(nodes, &mut weights, &known_shapes);
+
+    // BN folded into Mul + Add.
+    assert_eq!(folded.len(), 2, "expected Mul + Add after fold");
+    assert!(matches!(folded[0].op, OpKind::Mul));
+    assert!(matches!(folded[1].op, OpKind::Add));
+
+    // Synthesized constants must broadcast against `[N, C, H, W]` under strict
+    // NumPy alignment from the trailing dim — i.e. `[1, C, 1, 1]`.
+    let factor = weights.get("bn_bn_factor").expect("factor weight");
+    assert_eq!(factor.shape, vec![1, c, 1, 1]);
+    let shift = weights.get("bn_bn_shift").expect("shift weight");
+    assert_eq!(shift.shape, vec![1, c, 1, 1]);
+
+    // Build a deterministic input tensor and run both paths.
+    let total = n * c * h * w;
+    let x_data: Vec<f32> = (0..total)
+        .map(|i| ((i % 257) as f32 - 128.0) / 64.0)
+        .collect();
+    let x_tensor = Tensor::new(x_data, vec![n, c, h, w]);
+
+    // Reference: run the bona fide BatchNormalization op.
+    let scale_t = Tensor::new(scale, vec![c]);
+    let bias_t = Tensor::new(bias, vec![c]);
+    let mean_t = Tensor::new(mean, vec![c]);
+    let var_t = Tensor::new(var, vec![c]);
+    let reference =
+        nn::batch_norm(&x_tensor, &scale_t, &bias_t, &mean_t, &var_t, 1e-5).expect("reference BN");
+
+    // Folded path: Mul(x, factor) → Add(_, shift).
+    let mul_out = math::mul(&x_tensor, factor).expect("mul broadcast");
+    let folded_out = math::add(&mul_out, shift).expect("add broadcast");
+
+    assert_eq!(folded_out.shape, reference.shape);
+    let mut max_abs_err = 0.0f32;
+    for (a, b) in folded_out.data.iter().zip(reference.data.iter()) {
+        let e = (a - b).abs();
+        if e > max_abs_err {
+            max_abs_err = e;
+        }
+    }
+    assert!(
+        max_abs_err < 1e-4,
+        "folded path diverges from BatchNorm: max abs err {max_abs_err}"
+    );
+
+    // Sanity: also verify the broadcaster alone accepts both `[1,C,1,1]` and
+    // `[C]` (trailing-dim broadcast still works for 1-D when matched).
+    let small = Tensor::new(vec![1.0_f32; n * c * h * w], vec![n, c, h, w]);
+    let bias_4d = Tensor::new(vec![0.5_f32; c], vec![1, c, 1, 1]);
+    let _ = math::add(&small, &bias_4d).expect("[N,C,H,W] + [1,C,1,1] should broadcast");
 }
 
 // --- fuse_conv_add_relu tests ---

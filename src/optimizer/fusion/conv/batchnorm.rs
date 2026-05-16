@@ -173,9 +173,17 @@ pub fn fuse_conv_batchnorm(nodes: Vec<Node>, weights: &mut HashMap<String, Tenso
 ///
 /// This eliminates the runtime overhead of computing mean/var lookups and the
 /// sqrt/div at inference time.
+///
+/// `known_shapes` provides the input rank for each tensor name, used to shape
+/// the synthesized `factor`/`shift` constants for proper NumPy broadcasting.
+/// For a `[N, C, H, W]` BN input the constants are emitted as `[1, C, 1, 1]`
+/// so that the synthesized `Mul`/`Add` ops align channel-dim broadcast under
+/// strict NumPy rules.  When the input rank is unknown the fold is skipped:
+/// leaving `BatchNormalization` in place is a perf miss, not a correctness bug.
 pub fn fold_batch_norm_inference(
     nodes: Vec<Node>,
     weights: &mut HashMap<String, Tensor>,
+    known_shapes: &HashMap<String, Vec<usize>>,
 ) -> Vec<Node> {
     if nodes.is_empty() {
         return nodes;
@@ -245,6 +253,24 @@ pub fn fold_batch_norm_inference(
             continue;
         }
 
+        // Determine the broadcast-friendly shape for the synthesized constants.
+        // ONNX BatchNormalization input is rank ≥ 2 (`[N, C, ...]`).  To make
+        // the emitted `Mul(X, factor)` and `Add(mul_out, shift)` succeed under
+        // strict NumPy alignment from the trailing dim, factor/shift must be
+        // shaped `[1, C, 1, 1, ...]` matching the input rank.  When the rank
+        // is unknown (no shape inference for this input), we cannot produce a
+        // correct broadcast shape — skip the fold rather than risk emitting a
+        // shape that fails at runtime.
+        let bn_const_shape: Vec<usize> = match known_shapes.get(x_name) {
+            Some(s) if s.len() >= 2 && s[1] == c_out => {
+                let rank = s.len();
+                let mut shape = vec![1usize; rank];
+                shape[1] = c_out;
+                shape
+            }
+            _ => continue,
+        };
+
         // Compute factor = scale / sqrt(var + eps)  and  shift = bias - mean * factor
         let mut factor_data = Vec::with_capacity(c_out);
         let mut shift_data = Vec::with_capacity(c_out);
@@ -259,8 +285,11 @@ pub fn fold_batch_norm_inference(
         let shift_name = format!("{}_bn_shift", node.name);
         let mul_out_name = format!("{}_bn_mul_out", node.name);
 
-        weights.insert(factor_name.clone(), Tensor::new(factor_data, vec![c_out]));
-        weights.insert(shift_name.clone(), Tensor::new(shift_data, vec![c_out]));
+        weights.insert(
+            factor_name.clone(),
+            Tensor::new(factor_data, bn_const_shape.clone()),
+        );
+        weights.insert(shift_name.clone(), Tensor::new(shift_data, bn_const_shape));
 
         // Emit Mul(X, factor) → Add(mul_out, shift)
         let mul_node = Node {

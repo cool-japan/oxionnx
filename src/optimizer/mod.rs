@@ -54,7 +54,13 @@ pub fn optimize(
     let nodes = fusion::fuse_conv_clip_to_conv_relu6(nodes);
     let nodes = fusion::fuse_mul_sigmoid_to_silu(nodes);
     let nodes = fusion::fuse_div_sqrt_to_rsqrt(nodes, weights);
-    let nodes = fusion::fold_batch_norm_inference(nodes, weights);
+    // Re-infer shapes after upstream fusions so that the standalone
+    // BatchNorm fold can size its synthesized `factor`/`shift` constants
+    // to broadcast correctly against the BN input (e.g. `[1, C, 1, 1]`
+    // for a 4-D `[N, C, H, W]` input).  Without per-input rank the fold
+    // would emit `[C]`-shaped constants that fail strict NumPy alignment.
+    let pre_fold_shapes = shape_inference::infer_shapes(&nodes, weights, &input_shapes);
+    let nodes = fusion::fold_batch_norm_inference(nodes, weights, &pre_fold_shapes);
     let nodes = fusion::fuse_layer_norm(nodes, weights);
     let nodes = fusion::cancel_consecutive_transpose(nodes);
     let nodes = fusion::fuse_matmul_transpose(nodes);
