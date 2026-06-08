@@ -20,6 +20,7 @@ fn make_ctx<'a>(node: &'a Node, inputs: Vec<Option<&'a Tensor>>) -> OpContext<'a
         node,
         inputs,
         outer_scope: None,
+        weights: None,
         registry: None,
     }
 }
@@ -211,6 +212,63 @@ fn test_split_execute_into_slots_correctness() {
         .expect("Split execute_into_slots failed");
     assert_tensor_eq(&slots[0], &expected[0], "split slots[0]");
     assert_tensor_eq(&slots[1], &expected[1], "split slots[1]");
+}
+
+/// Regression for issue #1 (YOLO11 fails with
+/// `reshape: element count mismatch (33600 vs [1, 128, 20, 20])`).
+///
+/// YOLO11's C2PSA attention block is exported at opset 11, where `Split`
+/// carries its chunk sizes in the `split` *attribute* (an int list), not in a
+/// second input tensor. The qkv tensor `[1, 2, 128, 400]` must be split along
+/// axis 2 into `[32, 32, 64]` (query/key/value channels). The previous
+/// implementation ignored the `split` attribute and fell back to an even
+/// 3-way split of 128 → `[43, 43, 42]`, so the value branch became
+/// `[1, 2, 42, 400]` (33600 elements) and the downstream Reshape to
+/// `[1, 128, 20, 20]` (51200 elements) failed.
+#[test]
+fn test_issue_1_split_uses_split_attribute() {
+    // Reproduce the failing C2PSA qkv split: [1, 2, 128, 400] split on axis 2
+    // into [32, 32, 64] via the opset-11 `split` attribute.
+    let node = {
+        let mut n = node_with_int_attrs(OpKind::Split, &[("axis", 2)]);
+        n.attrs
+            .int_lists
+            .insert("split".into(), vec![32i64, 32, 64]);
+        n.outputs = vec!["q".into(), "k".into(), "v".into()];
+        n
+    };
+    let input = Tensor::new(vec![0.0_f32; 2 * 128 * 400], vec![1, 2, 128, 400]);
+    // No second input tensor — sizes must come from the attribute.
+    let ctx = make_ctx(&node, vec![Some(&input)]);
+    let outputs = SplitOp.execute(&ctx).expect("Split execute failed");
+    assert_eq!(outputs.len(), 3, "expected 3 split outputs");
+    assert_eq!(outputs[0].shape, vec![1, 2, 32, 400], "query chunk shape");
+    assert_eq!(outputs[1].shape, vec![1, 2, 32, 400], "key chunk shape");
+    assert_eq!(
+        outputs[2].shape,
+        vec![1, 2, 64, 400],
+        "value chunk shape (33600-vs-51200 regression)",
+    );
+
+    // The output-slot path must honour the attribute identically.
+    let mut slots = vec![
+        Tensor::new(
+            vec![0.0_f32; outputs[0].data.len()],
+            outputs[0].shape.clone(),
+        ),
+        Tensor::new(
+            vec![0.0_f32; outputs[1].data.len()],
+            outputs[1].shape.clone(),
+        ),
+        Tensor::new(
+            vec![0.0_f32; outputs[2].data.len()],
+            outputs[2].shape.clone(),
+        ),
+    ];
+    SplitOp
+        .execute_into_slots(&ctx, &mut slots)
+        .expect("Split execute_into_slots failed");
+    assert_eq!(slots[2].shape, vec![1, 2, 64, 400], "value slot shape");
 }
 
 #[test]

@@ -16,6 +16,7 @@ fn make_ctx<'a>(node: &'a Node, inputs: Vec<Option<&'a Tensor>>) -> OpContext<'a
         node,
         inputs,
         outer_scope: None,
+        weights: None,
         registry: None,
     }
 }

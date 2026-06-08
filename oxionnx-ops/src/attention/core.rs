@@ -53,24 +53,52 @@ pub(super) fn mm_a_bt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec
 
 // ── Scaled Dot-Product Attention ─────────────────────────────────────────────
 
-/// Scaled dot-product attention.
+/// Compute output shape and flat buffer length for SDPA without running the kernel.
 ///
-/// # Arguments
-/// * `q` - Query `[..., seq_q, d_k]`
-/// * `k` - Key `[..., seq_k, d_k]`
-/// * `v` - Value `[..., seq_k, d_v]`
-/// * `mask` - Additive mask (optional), broadcastable to `[..., seq_q, seq_k]`
-/// * `scale` - Custom scale factor (default: 1/sqrt(d_k))
+/// Returns `(out_shape, len)` where `out_shape` is Q's leading dims + `[seq_q, d_v]`
+/// and `len = broadcast_batch * seq_q * d_v` (what the kernel writes into the buffer).
+/// Note: `len` may exceed `out_shape.iter().product()` when Q has a smaller batch dim
+/// than K or V (pre-existing broadcast semantics preserved byte-for-byte).
+pub(crate) fn sdpa_output_shape(q: &Tensor, k: &Tensor, v: &Tensor) -> (Vec<usize>, usize) {
+    let q_ndim = q.ndim();
+    let seq_q = if q_ndim >= 2 { q.shape[q_ndim - 2] } else { 0 };
+    let d_v = if v.ndim() >= 1 {
+        v.shape[v.ndim() - 1]
+    } else {
+        0
+    };
+    let q_batch: usize = q.shape[..q_ndim.saturating_sub(2)]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let k_batch: usize = k.shape[..k.ndim().saturating_sub(2)]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let v_batch: usize = v.shape[..v.ndim().saturating_sub(2)]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let batch = q_batch.max(k_batch).max(v_batch);
+    let mut out_shape = q.shape[..q_ndim.saturating_sub(2)].to_vec();
+    out_shape.push(seq_q);
+    out_shape.push(d_v);
+    (out_shape, batch * seq_q * d_v)
+}
+
+/// Allocation-free SDPA kernel core: writes results into a pre-sized buffer.
 ///
-/// # Returns
-/// `[..., seq_q, d_v]`
-pub fn scaled_dot_product_attention(
+/// `out` must be pre-sized to `len` from `sdpa_output_shape`. Returns the output shape.
+/// All shape validation and scale/mask/stride logic is identical to
+/// `scaled_dot_product_attention`.
+pub(crate) fn sdpa_into(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     mask: Option<&Tensor>,
     scale: Option<f32>,
-) -> Result<Tensor, OnnxError> {
+    out: &mut [f32],
+) -> Result<Vec<usize>, OnnxError> {
     let q_ndim = q.ndim();
     if q_ndim < 2 {
         return Err(OnnxError::ShapeMismatch(
@@ -103,12 +131,10 @@ pub fn scaled_dot_product_attention(
     } else {
         0
     };
-    let mut output = vec![0.0f32; batch * seq_q * d_v];
 
     #[cfg(feature = "simd")]
     {
         let mut row_scores = vec![0.0f32; seq_k];
-        let mut row_out = vec![0.0f32; d_v];
         for b in 0..batch {
             let q_off = (b % q_batch) * q_stride;
             let k_off = (b % k_batch) * k_stride;
@@ -141,15 +167,16 @@ pub fn scaled_dot_product_attention(
                 }
                 // (2) Row-wise softmax
                 crate::attention::simd_sdpa::softmax_inplace(&mut row_scores);
-                // (3) Softmax · V weighted sum
+                // (3) Softmax · V weighted sum — write directly into out
+                let o_slice = &mut out[o_off + q_i * d_v..o_off + (q_i + 1) * d_v];
+                o_slice.fill(0.0_f32);
                 crate::attention::simd_sdpa::weighted_sum_v(
                     &row_scores,
                     v_slice,
                     d_v,
                     seq_k,
-                    &mut row_out,
+                    o_slice,
                 );
-                output[o_off + q_i * d_v..o_off + (q_i + 1) * d_v].copy_from_slice(&row_out);
             }
         }
     }
@@ -178,13 +205,46 @@ pub fn scaled_dot_product_attention(
             }
             softmax_last_dim(&mut scores, seq_k);
             let v_slice = &v.data[v_off..v_off + v_stride];
-            let attn_out = mm(&scores, v_slice, seq_q, seq_k, d_v);
-            output[o_off..o_off + seq_q * d_v].copy_from_slice(&attn_out);
+            let o_slice = &mut out[o_off..o_off + seq_q * d_v];
+            o_slice.fill(0.0_f32);
+            for i in 0..seq_q {
+                for kk in 0..seq_k {
+                    let sv = scores[i * seq_k + kk];
+                    for j in 0..d_v {
+                        o_slice[i * d_v + j] += sv * v_slice[kk * d_v + j];
+                    }
+                }
+            }
         }
     }
+
     let mut out_shape = q.shape[..q_ndim - 2].to_vec();
     out_shape.push(seq_q);
     out_shape.push(d_v);
+    Ok(out_shape)
+}
+
+/// Scaled dot-product attention.
+///
+/// # Arguments
+/// * `q` - Query `[..., seq_q, d_k]`
+/// * `k` - Key `[..., seq_k, d_k]`
+/// * `v` - Value `[..., seq_k, d_v]`
+/// * `mask` - Additive mask (optional), broadcastable to `[..., seq_q, seq_k]`
+/// * `scale` - Custom scale factor (default: 1/sqrt(d_k))
+///
+/// # Returns
+/// `[..., seq_q, d_v]`
+pub fn scaled_dot_product_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: Option<f32>,
+) -> Result<Tensor, OnnxError> {
+    let (out_shape, len) = sdpa_output_shape(q, k, v);
+    let mut output = vec![0.0f32; len];
+    sdpa_into(q, k, v, mask, scale, &mut output)?;
     Ok(Tensor::new(output, out_shape))
 }
 
@@ -217,16 +277,18 @@ pub(crate) fn reshape_to_heads(
     Tensor::new(out, vec![batch, num_heads, seq, head_dim])
 }
 
-/// Reshape `[batch, num_heads, seq, head_dim]` back to `[batch, seq, num_heads*head_dim]`.
-pub(crate) fn reshape_from_heads(
+/// Write `[batch, num_heads, seq, head_dim]` → `[batch, seq, embed_dim]` scatter into `out`.
+///
+/// Caller must pre-size `out` to `batch * seq * num_heads * head_dim`.
+pub(crate) fn reshape_from_heads_into(
     t: &Tensor,
     batch: usize,
     seq: usize,
     num_heads: usize,
     head_dim: usize,
-) -> Tensor {
+    out: &mut [f32],
+) {
     let embed_dim = num_heads * head_dim;
-    let mut out = vec![0.0f32; batch * seq * embed_dim];
     for b in 0..batch {
         for h in 0..num_heads {
             for s in 0..seq {
@@ -239,6 +301,19 @@ pub(crate) fn reshape_from_heads(
             }
         }
     }
+}
+
+/// Reshape `[batch, num_heads, seq, head_dim]` back to `[batch, seq, num_heads*head_dim]`.
+pub(crate) fn reshape_from_heads(
+    t: &Tensor,
+    batch: usize,
+    seq: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Tensor {
+    let embed_dim = num_heads * head_dim;
+    let mut out = vec![0.0f32; batch * seq * embed_dim];
+    reshape_from_heads_into(t, batch, seq, num_heads, head_dim, &mut out);
     Tensor::new(out, vec![batch, seq, embed_dim])
 }
 
@@ -256,8 +331,11 @@ pub(crate) fn reshape_from_heads(
 /// * `out_proj_bias` - `[embed_dim]` (optional)
 /// * `mask` - Additive mask (optional)
 /// * `num_heads` - Number of attention heads
+/// * `out` - Pre-allocated output buffer, must be sized `batch * seq_q * embed_dim`.
+///
+/// Returns `[batch, seq_q, embed_dim]`.
 #[allow(clippy::too_many_arguments)]
-pub fn multi_head_attention(
+pub(crate) fn multi_head_attention_into(
     query: &Tensor,
     key: &Tensor,
     value: &Tensor,
@@ -267,7 +345,8 @@ pub fn multi_head_attention(
     out_proj_bias: Option<&Tensor>,
     mask: Option<&Tensor>,
     num_heads: usize,
-) -> Result<Tensor, OnnxError> {
+    out: &mut [f32],
+) -> Result<Vec<usize>, OnnxError> {
     let batch = query.shape[0];
     let seq_q = query.shape[1];
     let embed_dim = query.shape[2];
@@ -279,6 +358,7 @@ pub fn multi_head_attention(
         )));
     }
     let head_dim = embed_dim / num_heads;
+    // --- QKV projection (identical to multi_head_attention) ---
     let (q_proj, k_proj, v_proj) = if let Some(w) = qkv_weight {
         let dim3 = 3 * embed_dim;
         let bias_data = qkv_bias.map(|b| &b.data[..]);
@@ -332,33 +412,88 @@ pub fn multi_head_attention(
     } else {
         (query.clone(), key.clone(), value.clone())
     };
+    // --- SDPA over per-head views ---
     let q_heads = reshape_to_heads(&q_proj, batch, seq_q, num_heads, head_dim);
     let k_heads = reshape_to_heads(&k_proj, batch, seq_k, num_heads, head_dim);
     let v_heads = reshape_to_heads(&v_proj, batch, seq_k, num_heads, head_dim);
     let attn_out = scaled_dot_product_attention(&q_heads, &k_heads, &v_heads, mask, None)?;
-    let concat = reshape_from_heads(&attn_out, batch, seq_q, num_heads, head_dim);
-    let result = if let Some(w_out) = out_proj_weight {
-        let mut out_data = vec![0.0f32; batch * seq_q * embed_dim];
+    // --- Final write into out ---
+    if let Some(w_out) = out_proj_weight {
+        // Build concat (one allocation); project directly into out.
+        let concat = reshape_from_heads(&attn_out, batch, seq_q, num_heads, head_dim);
         for b_idx in 0..batch {
             let off = b_idx * seq_q * embed_dim;
             let src = &concat.data[off..off + seq_q * embed_dim];
-            let projected = mm_a_bt(src, &w_out.data, seq_q, embed_dim, embed_dim);
-            out_data[off..off + seq_q * embed_dim].copy_from_slice(&projected);
+            let o_slice = &mut out[off..off + seq_q * embed_dim];
+            // mm_a_bt: src[seq_q, embed] @ w_out[embed, embed]^T  -> o_slice[seq_q, embed]
+            for i in 0..seq_q {
+                for j in 0..embed_dim {
+                    let mut s = 0.0f32;
+                    for kk in 0..embed_dim {
+                        s += src[i * embed_dim + kk] * w_out.data[j * embed_dim + kk];
+                    }
+                    o_slice[i * embed_dim + j] = s;
+                }
+            }
         }
         if let Some(bias) = out_proj_bias {
             for b_idx in 0..batch {
                 for s in 0..seq_q {
                     for d in 0..embed_dim {
-                        out_data[b_idx * seq_q * embed_dim + s * embed_dim + d] += bias.data[d];
+                        out[b_idx * seq_q * embed_dim + s * embed_dim + d] += bias.data[d];
                     }
                 }
             }
         }
-        Tensor::new(out_data, vec![batch, seq_q, embed_dim])
     } else {
-        concat
-    };
-    Ok(result)
+        // No out-projection: scatter attn_out directly into out (avoids concat alloc).
+        reshape_from_heads_into(&attn_out, batch, seq_q, num_heads, head_dim, out);
+    }
+    Ok(vec![batch, seq_q, embed_dim])
+}
+
+/// Multi-head attention.
+///
+/// # Arguments
+/// * `query` - `[batch, seq_q, embed_dim]`
+/// * `key` - `[batch, seq_k, embed_dim]`
+/// * `value` - `[batch, seq_k, embed_dim]`
+/// * `qkv_weight` - Packed QKV projection `[3*embed_dim, embed_dim]` (optional)
+/// * `qkv_bias` - `[3*embed_dim]` (optional)
+/// * `out_proj_weight` - `[embed_dim, embed_dim]` (optional)
+/// * `out_proj_bias` - `[embed_dim]` (optional)
+/// * `mask` - Additive mask (optional)
+/// * `num_heads` - Number of attention heads
+#[allow(clippy::too_many_arguments)]
+pub fn multi_head_attention(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    qkv_weight: Option<&Tensor>,
+    qkv_bias: Option<&Tensor>,
+    out_proj_weight: Option<&Tensor>,
+    out_proj_bias: Option<&Tensor>,
+    mask: Option<&Tensor>,
+    num_heads: usize,
+) -> Result<Tensor, OnnxError> {
+    let batch = query.shape[0];
+    let seq_q = query.shape[1];
+    let embed_dim = query.shape[2];
+    let out_len = batch * seq_q * embed_dim;
+    let mut out = vec![0.0f32; out_len];
+    let shape = multi_head_attention_into(
+        query,
+        key,
+        value,
+        qkv_weight,
+        qkv_bias,
+        out_proj_weight,
+        out_proj_bias,
+        mask,
+        num_heads,
+        &mut out,
+    )?;
+    Ok(Tensor::new(out, shape))
 }
 
 // ── Rotary Embedding (RoPE) ──────────────────────────────────────────────────

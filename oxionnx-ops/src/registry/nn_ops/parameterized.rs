@@ -71,6 +71,24 @@ impl Operator for SoftmaxOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal("SoftmaxOp: no output slots".into()));
+        }
+        let x = ctx.input(0)?;
+        let axis = ctx.attrs().i("axis", -1);
+        let n = x.numel();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&x.shape);
+        nn::normalization::softmax_into(x, axis, &mut slots[0].data)?;
+        Ok(())
+    }
 }
 
 // ── LogSoftmax ──────────────────────────────────────────────────────────────
@@ -86,6 +104,24 @@ impl Operator for LogSoftmaxOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal("LogSoftmaxOp: no output slots".into()));
+        }
+        let x = ctx.input(0)?;
+        let axis = ctx.attrs().i("axis", -1);
+        let n = x.numel();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&x.shape);
+        nn::normalization::log_softmax_into(x, axis, &mut slots[0].data)?;
+        Ok(())
     }
 }
 

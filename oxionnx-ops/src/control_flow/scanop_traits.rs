@@ -76,7 +76,8 @@ impl Operator for ScanOp {
         })?;
         let empty_scope = HashMap::new();
         let outer = ctx.outer_scope.unwrap_or(&empty_scope);
-        let weights = HashMap::new();
+        let empty_weights = HashMap::new();
+        let weights = ctx.weights.unwrap_or(&empty_weights);
         let num_body_outputs = body.output_names.len();
         if num_body_outputs < num_state {
             return Err(OnnxError::InvalidModel(format!(
@@ -110,7 +111,7 @@ impl Operator for ScanOp {
                     }
                 }
             }
-            let outputs = execute_subgraph(body, subgraph_inputs, outer, &weights, registry)?;
+            let outputs = execute_subgraph(body, subgraph_inputs, outer, weights, registry)?;
             states.clear();
             for i in 0..num_state {
                 let state = outputs.get(i).ok_or_else(|| {

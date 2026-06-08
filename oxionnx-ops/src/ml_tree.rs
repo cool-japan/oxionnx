@@ -448,6 +448,7 @@ mod tests {
             node,
             inputs: inputs.to_vec(),
             outer_scope: None,
+            weights: None,
             registry: None,
         }
     }

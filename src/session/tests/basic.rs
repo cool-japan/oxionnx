@@ -132,6 +132,128 @@ fn test_export_dot() {
 }
 
 #[test]
+fn test_issue_2_node_introspection() {
+    // Two-node graph: x -> Relu -> r -> Split(axis=1, split=[32, 32, 64]) -> [a, b, c]
+    let relu = Node {
+        op: OpKind::Relu,
+        name: "relu1".to_string(),
+        inputs: vec!["x".to_string()],
+        outputs: vec!["r".to_string()],
+        attrs: Attributes::default(),
+    };
+    let mut split_attrs = Attributes::default();
+    split_attrs.ints.insert("axis".to_string(), 1);
+    split_attrs
+        .int_lists
+        .insert("split".to_string(), vec![32, 32, 64]);
+    let split = Node {
+        op: OpKind::Split,
+        name: "split1".to_string(),
+        inputs: vec!["r".to_string(), "".to_string()],
+        outputs: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        attrs: split_attrs,
+    };
+    let graph = Graph {
+        nodes: vec![relu, split],
+        input_names: vec!["x".to_string()],
+        output_names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        ..Default::default()
+    };
+
+    // OptLevel::None: keep nodes verbatim (no fusion) for a deterministic count.
+    let session = Session::builder()
+        .with_optimization_level(OptLevel::None)
+        .build_from_graph(graph, HashMap::new())
+        .expect("build_from_graph");
+
+    let nodes = session.nodes();
+
+    // Expected node count.
+    assert_eq!(nodes.len(), 2);
+
+    // Topological order: Relu must precede Split (Split consumes Relu's output).
+    assert_eq!(nodes[0].op_type, "Relu");
+    assert_eq!(nodes[0].name, "relu1");
+    assert_eq!(nodes[0].inputs, vec!["x".to_string()]);
+    assert_eq!(nodes[0].outputs, vec!["r".to_string()]);
+    // Relu carries no attributes.
+    assert!(nodes[0].attributes.is_empty());
+
+    // Second node: Split, with its wiring (including the optional "" input).
+    assert_eq!(nodes[1].op_type, "Split");
+    assert_eq!(nodes[1].name, "split1");
+    assert_eq!(nodes[1].inputs, vec!["r".to_string(), "".to_string()]);
+    assert_eq!(
+        nodes[1].outputs,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
+
+    // Attribute projection: deterministic, sorted by name; int + int_list rendered.
+    assert_eq!(
+        nodes[1].attributes,
+        vec![
+            ("axis".to_string(), "1".to_string()),
+            ("split".to_string(), "[32, 32, 64]".to_string()),
+        ]
+    );
+
+    // Order is deterministic across repeated calls.
+    let nodes_again = session.nodes();
+    assert_eq!(nodes, nodes_again);
+}
+
+#[test]
+fn test_issue_2_attribute_summary_all_kinds() {
+    // Exercise every attribute kind in Attributes::summary(), confirming the
+    // rendered form and the stable (name-sorted) ordering.
+    let mut attrs = Attributes::default();
+    attrs.ints.insert("axis".to_string(), 2);
+    attrs.floats.insert("alpha".to_string(), 0.5);
+    attrs
+        .strings
+        .insert("mode".to_string(), "constant".to_string());
+    attrs.int_lists.insert("pads".to_string(), vec![0, 1, 0, 1]);
+    attrs
+        .float_lists
+        .insert("scales".to_string(), vec![1.0, 2.0]);
+    attrs
+        .string_lists
+        .insert("names".to_string(), vec!["a".to_string(), "b".to_string()]);
+    attrs
+        .tensors
+        .insert("value".to_string(), Tensor::new(vec![1.0, 2.0], vec![2]));
+    attrs.graphs.insert(
+        "body".to_string(),
+        Graph {
+            name: "sub".to_string(),
+            nodes: vec![Node {
+                op: OpKind::Identity,
+                name: "n".to_string(),
+                inputs: vec![],
+                outputs: vec![],
+                attrs: Attributes::default(),
+            }],
+            ..Default::default()
+        },
+    );
+
+    let summary = attrs.summary();
+    assert_eq!(
+        summary,
+        vec![
+            ("alpha".to_string(), "0.5".to_string()),
+            ("axis".to_string(), "2".to_string()),
+            ("body".to_string(), "<graph \"sub\" nodes=1>".to_string()),
+            ("mode".to_string(), "constant".to_string()),
+            ("names".to_string(), "[a, b]".to_string()),
+            ("pads".to_string(), "[0, 1, 0, 1]".to_string()),
+            ("scales".to_string(), "[1, 2]".to_string()),
+            ("value".to_string(), "<tensor dims=[2]>".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn test_profiling() {
     let node = Node {
         op: OpKind::Identity,

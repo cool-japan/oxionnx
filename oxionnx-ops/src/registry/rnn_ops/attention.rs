@@ -198,6 +198,39 @@ impl Operator for AttentionOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal(
+                "AttentionOp: expected at least 1 output slot, got 0".into(),
+            ));
+        }
+        let q = ctx.input(0)?;
+        let k = ctx.input(1)?;
+        let v = ctx.input(2)?;
+        let mask = ctx.optional_input(3);
+        let attrs = ctx.attrs();
+        let scale = {
+            let s = attrs.f("scale", 0.0_f32);
+            if s == 0.0 {
+                None
+            } else {
+                Some(s)
+            }
+        };
+
+        let (out_shape, len) = attention::sdpa_output_shape(q, k, v);
+        if slots[0].data.len() != len {
+            slots[0].data.resize(len, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&out_shape);
+        attention::sdpa_into(q, k, v, mask, scale, &mut slots[0].data)?;
+        Ok(())
+    }
 }
 
 // ── MultiHeadAttention ──────────────────────────────────────────────────────
@@ -414,5 +447,51 @@ impl Operator for MultiHeadAttentionOp {
 
     fn supports_output_slots(&self) -> bool {
         true
+    }
+
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal(
+                "MultiHeadAttentionOp: expected at least 1 output slot, got 0".into(),
+            ));
+        }
+        let query = ctx.input(0)?;
+        let key = ctx.input(1)?;
+        let value = ctx.input(2)?;
+        let qkv_weight = ctx.optional_input(3);
+        let qkv_bias = ctx.optional_input(4);
+        let out_proj_weight = ctx.optional_input(5);
+        let out_proj_bias = ctx.optional_input(6);
+        let mask = ctx.optional_input(7);
+        let num_heads = ctx.attrs().i("num_heads", 1) as usize;
+
+        // Output shape is always [batch, seq_q, embed_dim].
+        let batch = query.shape[0];
+        let seq_q = query.shape[1];
+        let embed_dim = query.shape[2];
+        let out_len = batch * seq_q * embed_dim;
+
+        if slots[0].data.len() != out_len {
+            slots[0].data.resize(out_len, 0.0_f32);
+        }
+        slots[0].shape = vec![batch, seq_q, embed_dim];
+
+        attention::multi_head_attention_into(
+            query,
+            key,
+            value,
+            qkv_weight,
+            qkv_bias,
+            out_proj_weight,
+            out_proj_bias,
+            mask,
+            num_heads,
+            &mut slots[0].data,
+        )?;
+        Ok(())
     }
 }

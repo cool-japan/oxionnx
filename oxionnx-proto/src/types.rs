@@ -72,6 +72,9 @@ pub struct AttributeValue {
     pub i: i64,
     pub s: String,
     pub t: Option<TensorProto>,
+    /// Subgraph attribute (ONNX AttributeType::GRAPH, wire field 6).
+    /// Boxed to avoid an unbounded recursive type via GraphProto→NodeProto→AttributeProto→AttributeValue.
+    pub g: Option<Box<GraphProto>>,
     pub floats: Vec<f32>,
     pub ints: Vec<i64>,
     pub strings: Vec<String>,
@@ -206,6 +209,8 @@ pub struct TrainingInfo {
     pub learning_rate: f64,
     /// Training graph (if present).
     pub training_graph: Option<GraphProto>,
+    /// Initialization graph (if present): computes initial values for trainable tensors.
+    pub initialization_graph: Option<GraphProto>,
     /// Initialization bindings: maps parameter name to initializer name.
     pub initialization_bindings: Vec<(String, String)>,
     /// Update bindings: maps parameter name to gradient name.

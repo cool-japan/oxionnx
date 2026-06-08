@@ -119,6 +119,7 @@ impl Session {
                     node,
                     inputs: f32_refs,
                     outer_scope: None,
+                    weights: None,
                     registry: Some(&self.registry),
                 };
                 let f32_results = operator.execute(&ctx)?;

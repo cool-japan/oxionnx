@@ -9,7 +9,7 @@
 //!
 //! ## Threading
 //!
-//! [`MLModel`] is documented as thread-safe by Apple — multiple threads may
+//! `MLModel` is documented as thread-safe by Apple — multiple threads may
 //! call `predictionFromFeatures_error:` concurrently on the same instance.
 //! We expose this as `predict(&self, ...)` and provide manual `Send` + `Sync`
 //! impls for [`MlPackageModel`] (the `Retained<MLModel>` field does not

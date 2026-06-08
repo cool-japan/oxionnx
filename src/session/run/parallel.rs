@@ -1,11 +1,17 @@
+#[cfg(not(target_arch = "wasm32"))]
 use crate::graph::OpKind;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::memory::SizeClassPool;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tensor::Tensor;
 use crate::OnnxError;
+#[cfg(not(target_arch = "wasm32"))]
 use oxionnx_core::{OpContext, Operator};
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::super::types::NodeProfile;
 use super::super::Session;
 use super::state::SessionRunState;
@@ -391,7 +397,8 @@ impl Session {
                                 node,
                                 inputs: inputs.clone(),
                                 outer_scope: None,
-                                registry: None,
+                                weights: Some(&self.weights),
+                                registry: Some(&self.registry),
                             };
                             let start = std::time::Instant::now();
                             let res = operator.execute(&ctx)?;

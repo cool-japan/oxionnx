@@ -612,6 +612,119 @@ impl Attributes {
     pub fn graph(&self, name: &str) -> Option<&Graph> {
         self.graphs.get(name)
     }
+
+    /// Project all attributes into a deterministic list of readable
+    /// `(name, value)` pairs, suitable for introspection / display.
+    ///
+    /// The list is sorted by attribute name (ascending). Every attribute kind
+    /// is covered:
+    /// - `ints` render as the bare integer (e.g. `2`),
+    /// - `floats` render via the default float formatting (e.g. `0.5`),
+    /// - `strings` render verbatim,
+    /// - `int_lists` / `float_lists` / `string_lists` render compactly as
+    ///   `[a, b, c]`,
+    /// - `tensors` render as `<tensor dims=[...]>` (data omitted),
+    /// - `graphs` (subgraphs) render as `<graph "name" nodes=N>`.
+    ///
+    /// If two attribute kinds share a name (not expected for valid ONNX), all
+    /// matching entries are emitted; ties are broken deterministically by the
+    /// rendered value so the output is stable.
+    pub fn summary(&self) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+
+        for (name, value) in &self.ints {
+            pairs.push((name.clone(), value.to_string()));
+        }
+        for (name, value) in &self.floats {
+            pairs.push((name.clone(), format_float(*value)));
+        }
+        for (name, value) in &self.strings {
+            pairs.push((name.clone(), value.clone()));
+        }
+        for (name, values) in &self.int_lists {
+            pairs.push((name.clone(), format_int_list(values)));
+        }
+        for (name, values) in &self.float_lists {
+            pairs.push((name.clone(), format_float_list(values)));
+        }
+        for (name, values) in &self.string_lists {
+            pairs.push((name.clone(), format_string_list(values)));
+        }
+        for (name, tensor) in &self.tensors {
+            pairs.push((
+                name.clone(),
+                format!("<tensor dims={}>", format_usize_list(&tensor.shape)),
+            ));
+        }
+        for (name, graph) in &self.graphs {
+            pairs.push((
+                name.clone(),
+                format!("<graph {:?} nodes={}>", graph.name, graph.nodes.len()),
+            ));
+        }
+
+        // Deterministic ordering: primarily by attribute name, then by the
+        // rendered value to break any (unexpected) duplicate-name ties.
+        pairs.sort();
+        pairs
+    }
+}
+
+/// Format an `f32` in its shortest round-trippable form via the default
+/// `Display` impl (e.g. `0.5`, `1`, `-3.25`). Whole-valued floats therefore
+/// render without a fractional part (`1.0` -> `1`).
+fn format_float(value: f32) -> String {
+    // `{}` on f32 already produces the shortest round-trippable form
+    // (e.g. `0.5`, `1`, `-3.25`), which is what we want for a summary.
+    format!("{value}")
+}
+
+fn format_int_list(values: &[i64]) -> String {
+    let mut out = String::from("[");
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&v.to_string());
+    }
+    out.push(']');
+    out
+}
+
+fn format_usize_list(values: &[usize]) -> String {
+    let mut out = String::from("[");
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&v.to_string());
+    }
+    out.push(']');
+    out
+}
+
+fn format_float_list(values: &[f32]) -> String {
+    let mut out = String::from("[");
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format_float(*v));
+    }
+    out.push(']');
+    out
+}
+
+fn format_string_list(values: &[String]) -> String {
+    let mut out = String::from("[");
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(v);
+    }
+    out.push(']');
+    out
 }
 
 /// A single computation node in the ONNX graph.
@@ -672,6 +785,42 @@ impl TensorInfo {
                 },
             })
             .collect()
+    }
+}
+
+/// Read-only, public projection of a single compute [`Node`] for graph
+/// introspection.
+///
+/// Produced by `Session::nodes()`, this mirrors the shape of [`TensorInfo`]
+/// (an inert, clonable snapshot) so callers can enumerate a model's operators
+/// — their op type, wiring, and attributes — without reaching into engine
+/// internals.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeInfo {
+    /// Node name. May be empty for unnamed nodes.
+    pub name: String,
+    /// Canonical ONNX op type string, from [`OpKind::as_str`] (e.g. `"Split"`).
+    pub op_type: String,
+    /// Input tensor names. May contain `""` for optional / omitted inputs.
+    pub inputs: Vec<String>,
+    /// Output tensor names.
+    pub outputs: Vec<String>,
+    /// Attribute summary as deterministic `name -> value` pairs, sorted by
+    /// attribute name (see [`Attributes::summary`]). For example
+    /// `[("axis", "2"), ("split", "[32, 32, 64]")]`.
+    pub attributes: Vec<(String, String)>,
+}
+
+impl NodeInfo {
+    /// Project an internal [`Node`] into its read-only public snapshot.
+    pub fn from_node(node: &Node) -> Self {
+        Self {
+            name: node.name.clone(),
+            op_type: node.op.as_str().to_string(),
+            inputs: node.inputs.clone(),
+            outputs: node.outputs.clone(),
+            attributes: node.attrs.summary(),
+        }
     }
 }
 

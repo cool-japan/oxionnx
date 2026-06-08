@@ -39,6 +39,73 @@ impl Session {
         &self.output_infos
     }
 
+    /// Enumerate the model's compute nodes in deterministic topological
+    /// (graph execution) order.
+    ///
+    /// Each returned [`NodeInfo`](oxionnx_core::NodeInfo) is a read-only
+    /// snapshot of one operator: its `name`, `op_type` (the canonical ONNX op
+    /// string such as `"Split"` or `"Conv"`), `inputs`, `outputs`, and a
+    /// deterministic `attributes` summary (`name -> value` pairs, e.g.
+    /// `axis -> 2`, `split -> [32, 32, 64]`).
+    ///
+    /// The order matches `model_info()` / `export_dot()` (the internal
+    /// topologically-sorted node list), so repeated calls are stable.
+    ///
+    /// # Example
+    ///
+    /// Print every node's wiring — directly answering "get nodes from the
+    /// model to print them as input/output fields":
+    ///
+    /// ```
+    /// use oxionnx::{Session, Graph, Node, OpKind, Attributes};
+    /// use std::collections::HashMap;
+    ///
+    /// // Build a tiny two-node graph: x -> Relu -> r -> Identity -> out
+    /// let relu = Node {
+    ///     op: OpKind::Relu,
+    ///     name: "relu1".to_string(),
+    ///     inputs: vec!["x".to_string()],
+    ///     outputs: vec!["r".to_string()],
+    ///     attrs: Attributes::default(),
+    /// };
+    /// let id = Node {
+    ///     op: OpKind::Identity,
+    ///     name: "id1".to_string(),
+    ///     inputs: vec!["r".to_string()],
+    ///     outputs: vec!["out".to_string()],
+    ///     attrs: Attributes::default(),
+    /// };
+    /// let graph = Graph {
+    ///     nodes: vec![relu, id],
+    ///     input_names: vec!["x".to_string()],
+    ///     output_names: vec!["out".to_string()],
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let session = Session::from_graph(graph, HashMap::new())?;
+    /// for node in session.nodes() {
+    ///     println!(
+    ///         "{} ({}): inputs={:?} outputs={:?}",
+    ///         node.name, node.op_type, node.inputs, node.outputs
+    ///     );
+    ///     for (attr_name, attr_value) in &node.attributes {
+    ///         println!("    {attr_name} = {attr_value}");
+    ///     }
+    /// }
+    ///
+    /// let nodes = session.nodes();
+    /// assert_eq!(nodes.len(), 2);
+    /// assert_eq!(nodes[0].op_type, "Relu");
+    /// assert_eq!(nodes[0].outputs, vec!["r".to_string()]);
+    /// # Ok::<(), oxionnx::Error>(())
+    /// ```
+    pub fn nodes(&self) -> Vec<oxionnx_core::NodeInfo> {
+        self.sorted_nodes
+            .iter()
+            .map(oxionnx_core::NodeInfo::from_node)
+            .collect()
+    }
+
     /// Return a reference to the model's weight tensors.
     pub fn weights(&self) -> &HashMap<String, Tensor> {
         &self.weights

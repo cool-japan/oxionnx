@@ -99,8 +99,9 @@ impl Session {
                 let ctx = OpContext {
                     node,
                     inputs: resolved_inputs,
-                    outer_scope: None,
-                    registry: None,
+                    outer_scope: Some(state.as_map()),
+                    weights: Some(&self.weights),
+                    registry: Some(&self.registry),
                 };
                 let start = std::time::Instant::now();
                 operator.execute_into_slots(&ctx, &mut slots)?;
@@ -135,8 +136,9 @@ impl Session {
             let ctx = OpContext {
                 node,
                 inputs: resolved_inputs,
-                outer_scope: None,
-                registry: None,
+                outer_scope: Some(state.as_map()),
+                weights: Some(&self.weights),
+                registry: Some(&self.registry),
             };
             match owned_input {
                 Some(tensor) => operator.execute_inplace(tensor, &ctx)?,
@@ -158,8 +160,9 @@ impl Session {
             let ctx = OpContext {
                 node,
                 inputs: resolved_inputs,
-                outer_scope: None,
-                registry: None,
+                outer_scope: Some(state.as_map()),
+                weights: Some(&self.weights),
+                registry: Some(&self.registry),
             };
             operator.execute(&ctx)?
         };

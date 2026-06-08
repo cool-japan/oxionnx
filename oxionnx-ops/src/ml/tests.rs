@@ -30,6 +30,7 @@ fn ctx_from<'a>(node: &'a Node, inputs: &'a [Option<&'a Tensor>]) -> OpContext<'
         node,
         inputs: inputs.to_vec(),
         outer_scope: None,
+        weights: None,
         registry: None,
     }
 }

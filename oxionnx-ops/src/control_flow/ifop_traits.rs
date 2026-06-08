@@ -41,8 +41,9 @@ impl Operator for IfOp {
         let empty_scope = HashMap::new();
         let outer = ctx.outer_scope.unwrap_or(&empty_scope);
         let subgraph_inputs = HashMap::new();
-        let weights = HashMap::new();
-        execute_subgraph(graph, subgraph_inputs, outer, &weights, registry)
+        let empty_weights = HashMap::new();
+        let weights = ctx.weights.unwrap_or(&empty_weights);
+        execute_subgraph(graph, subgraph_inputs, outer, weights, registry)
     }
     fn supports_output_slots(&self) -> bool {
         true

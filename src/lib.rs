@@ -112,7 +112,7 @@ pub use memory_tracker::MemoryTracker;
 pub use oxionnx_core::OnnxError;
 pub use oxionnx_core::OnnxError as Error;
 pub use oxionnx_core::Tensor;
-pub use oxionnx_core::{DType, TensorInfo, TensorStorage, TypedTensor};
+pub use oxionnx_core::{DType, NodeInfo, TensorInfo, TensorStorage, TypedTensor};
 #[cfg(feature = "gpu")]
 pub use session::GpuExecutionProvider;
 pub use session::{ModelInfo, ModelMetadata, NodeProfile, OptLevel, Session, SessionBuilder};

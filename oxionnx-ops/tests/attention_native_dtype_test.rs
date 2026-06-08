@@ -182,6 +182,7 @@ fn test_sdpa_f32_baseline() {
         node: &node,
         inputs: vec![Some(&q_ref), Some(&k_ref), Some(&v_ref), None],
         outer_scope: None,
+        weights: None,
         registry: None,
     };
     let ref_out = AttentionOp.execute(&ref_ctx).expect("F32 SDPA execute");
@@ -241,6 +242,7 @@ fn test_sdpa_f16_parity() {
         node: &node,
         inputs: vec![Some(&q_ref), Some(&k_ref), Some(&v_ref), None],
         outer_scope: None,
+        weights: None,
         registry: None,
     };
     let ref_out = AttentionOp.execute(&ref_ctx).expect("F32 ref");
@@ -291,6 +293,7 @@ fn test_sdpa_bf16_parity() {
         node: &node,
         inputs: vec![Some(&q_ref), Some(&k_ref), Some(&v_ref), None],
         outer_scope: None,
+        weights: None,
         registry: None,
     };
     let ref_out = AttentionOp.execute(&ref_ctx).expect("F32 ref");
@@ -368,6 +371,7 @@ fn test_mha_f16_parity() {
             None,
         ],
         outer_scope: None,
+        weights: None,
         registry: None,
     };
     let ref_out = MultiHeadAttentionOp.execute(&ref_ctx).expect("F32 MHA ref");
@@ -441,6 +445,7 @@ fn test_mha_bf16_parity() {
             None,
         ],
         outer_scope: None,
+        weights: None,
         registry: None,
     };
     let ref_out = MultiHeadAttentionOp.execute(&ref_ctx).expect("F32 MHA ref");

@@ -216,6 +216,11 @@ impl Session {
             .transpose()
             .map_err(|e| OnnxError::Internal(format!("thread pool: {e}")))?;
 
+        // `num_threads` configures the rayon thread pool, which is native-only.
+        // On wasm32 there is no thread pool, so the argument is intentionally unused.
+        #[cfg(target_arch = "wasm32")]
+        let _ = num_threads;
+
         Ok(Self {
             sorted_nodes,
             weights,

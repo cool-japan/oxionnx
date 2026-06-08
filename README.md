@@ -9,12 +9,12 @@ OxiONNX is a high-performance ONNX inference engine written in pure Rust.
 It supports 165 ONNX operators, GPU acceleration via wgpu, SIMD optimization,
 and runs on any platform including WebAssembly.
 
-**63,460 lines of Rust | 1,179 tests | 0 clippy warnings**
+**67,129 lines of Rust | 1,264 tests | 0 clippy warnings**
 
 ## Features
 
 - **Pure Rust** -- Zero C/C++/Fortran dependencies. Safe, portable, auditable.
-- **165 ONNX operators** -- Math, NN, Conv, Shape, Indexing, Comparison, RNN, Attention, ML
+- **165 ONNX operators** -- Math, NN, Conv, Shape, Indexing, Comparison, RNN, Attention, ML; real-world detection models run, including YOLOv8 and YOLO11 (opset 11+)
 - **GPU acceleration** -- wgpu compute shaders for MatMul, Softmax, ReLU, etc.
 - **SIMD optimization** -- NEON (aarch64) and AVX2 (x86_64) for element-wise ops
 - **Multi-dtype** -- f32, f16, bf16, i8, i32, i64 with automatic type promotion
@@ -31,22 +31,23 @@ and runs on any platform including WebAssembly.
 - **Session caching** -- Save/load pre-optimized graphs to skip re-optimization
 - **Native dtype dispatch** -- `run_typed()` path executes 40+ operators natively (no f32 round-trip) via `TypedOpContext`; MatMul natively handles F32/F16/BF16/I8→I32/I32 dtypes
 - **DirectML backend** -- Windows D3D12 execution provider (`directml` feature) with CPU fallback on other platforms
-- **Zero-copy output reuse** -- All 121 operators support pre-allocated output slot reuse via `execute_into_slots`; 52 operators have hand-coded zero-copy kernels (Gather, ScatterND, ScatterElements, shape/pool/elementwise ops) — no memcpy, pointer-identity across inference runs with `IoBinding`
+- **Zero-copy output reuse** -- All 121 operators support pre-allocated output slot reuse via `execute_into_slots`; 105 operators have hand-coded zero-copy kernels (normalization, reduce, shape, attention, control-flow, and all elementwise/pool ops) — no memcpy, pointer-identity across inference runs with `IoBinding`
+- **Graph introspection** -- Enumerate a model's compute nodes (op type, inputs, outputs, attributes) via `Session::nodes()` / `NodeInfo`
 
 ## Status
 
 | Crate | Status | Tests |
 |-------|--------|-------|
-| `oxionnx` (root) | Alpha | 525 passing |
+| `oxionnx` (root) | Alpha | 536 passing |
 | `oxionnx-core` | Stable | 36 passing |
-| `oxionnx-ops` | Alpha | 554 passing |
-| `oxionnx-proto` | Stable | 37 passing |
+| `oxionnx-ops` | Alpha | 624 passing |
+| `oxionnx-proto` | Stable | 41 passing |
 | `oxionnx-gpu` | Alpha | 17 passing |
 | `oxionnx-cuda` | Partial | 4 passing (GEMM/elementwise/softmax via OxiCUDA; Conv stubbed) |
 | `oxionnx-directml` | Planned | 4 passing (Windows scaffold; HLSL shaders defined but not yet bound) |
 | `oxionnx-coreml` | Partial | 2 passing (CoreML session bridge; macOS only) |
 
-**Total: 1,179 tests passing, 0 clippy warnings, 63,460 SLoC**
+**Total: 1,264 tests passing, 0 clippy warnings, 67,129 SLoC**
 
 ## Quick Start
 

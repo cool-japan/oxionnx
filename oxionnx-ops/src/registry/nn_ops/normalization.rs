@@ -24,6 +24,27 @@ impl Operator for LayerNormOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal("LayerNormOp: no output slots".into()));
+        }
+        let x = ctx.input(0)?;
+        let scale = ctx.input(1)?;
+        let bias = ctx.optional_input(2);
+        let eps = ctx.attrs().f("epsilon", 1e-5);
+        let axis = ctx.attrs().i("axis", -1);
+        let n = x.numel();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&x.shape);
+        nn::normalization::layer_norm_into(x, scale, bias, eps, axis, &mut slots[0].data)?;
+        Ok(())
+    }
 }
 
 // ── GroupNorm ───────────────────────────────────────────────────────────────
@@ -44,6 +65,27 @@ impl Operator for GroupNormOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal("GroupNormOp: no output slots".into()));
+        }
+        let x = ctx.input(0)?;
+        let scale = ctx.input(1)?;
+        let bias = ctx.optional_input(2);
+        let num_groups = ctx.attrs().i("num_groups", 1) as usize;
+        let eps = ctx.attrs().f("epsilon", 1e-5);
+        let n = x.numel();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&x.shape);
+        nn::normalization::group_norm_into(x, scale, bias, num_groups, eps, &mut slots[0].data)?;
+        Ok(())
     }
 }
 
@@ -66,6 +108,28 @@ impl Operator for BatchNormOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal("BatchNormOp: no output slots".into()));
+        }
+        let x = ctx.input(0)?;
+        let scale = ctx.input(1)?;
+        let bias = ctx.input(2)?;
+        let mean = ctx.input(3)?;
+        let var = ctx.input(4)?;
+        let eps = ctx.attrs().f("epsilon", 1e-5);
+        let n = x.numel();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&x.shape);
+        nn::normalization::batch_norm_into(x, scale, bias, mean, var, eps, &mut slots[0].data)?;
+        Ok(())
+    }
 }
 
 // ── RMSNorm ─────────────────────────────────────────────────────────────────
@@ -83,6 +147,25 @@ impl Operator for RmsNormOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal("RmsNormOp: no output slots".into()));
+        }
+        let x = ctx.input(0)?;
+        let scale = ctx.input(1)?;
+        let eps = ctx.attrs().f("epsilon", 1e-6);
+        let n = x.numel();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&x.shape);
+        nn::normalization::rms_norm_into(x, scale, eps, &mut slots[0].data)?;
+        Ok(())
     }
 }
 
@@ -102,6 +185,28 @@ impl Operator for InstanceNormOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Err(OnnxError::Internal(
+                "InstanceNormOp: no output slots".into(),
+            ));
+        }
+        let x = ctx.input(0)?;
+        let scale = ctx.input(1)?;
+        let bias = ctx.input(2)?;
+        let eps = ctx.attrs().f("epsilon", 1e-5);
+        let n = x.numel();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&x.shape);
+        nn::normalization::instance_norm_into(x, scale, bias, eps, &mut slots[0].data)?;
+        Ok(())
     }
 }
 

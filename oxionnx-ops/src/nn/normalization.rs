@@ -2,6 +2,292 @@
 
 use oxionnx_core::Tensor;
 
+pub(crate) fn layer_norm_into(
+    x: &Tensor,
+    scale: &Tensor,
+    bias: Option<&Tensor>,
+    eps: f32,
+    axis: i64,
+    out: &mut [f32],
+) -> Result<(), String> {
+    out.copy_from_slice(&x.data);
+    let ndim = x.ndim();
+    let ax = if axis < 0 {
+        (axis + ndim as i64) as usize
+    } else {
+        axis as usize
+    };
+    let norm_size: usize = x.shape[ax..].iter().product();
+
+    #[cfg(feature = "simd")]
+    {
+        let bias_data = bias.map(|b| b.data.as_slice());
+        crate::simd_ops::simd_layer_norm_strided(out, norm_size, &scale.data, bias_data, eps);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "simd"))]
+    {
+        let outer: usize = x.shape[..ax].iter().product::<usize>().max(1);
+        for o in 0..outer {
+            let slice = &mut out[o * norm_size..(o + 1) * norm_size];
+            let mean = slice.iter().sum::<f32>() / norm_size as f32;
+            let var = slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / norm_size as f32;
+            let inv_std = (var + eps).sqrt().recip();
+            for v in slice.iter_mut() {
+                *v = (*v - mean) * inv_std;
+            }
+        }
+        let scale_len = scale.numel();
+        for (i, v) in out.iter_mut().enumerate() {
+            *v *= scale.data[i % scale_len];
+        }
+        if let Some(b) = bias {
+            let bias_len = b.numel();
+            for (i, v) in out.iter_mut().enumerate() {
+                *v += b.data[i % bias_len];
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn rms_norm_into(
+    x: &Tensor,
+    scale: &Tensor,
+    eps: f32,
+    out: &mut [f32],
+) -> Result<(), String> {
+    if x.ndim() < 1 {
+        return Err("rms_norm: input must be at least 1D".into());
+    }
+    let norm_size = *x
+        .shape
+        .last()
+        .ok_or_else(|| "rms_norm: empty shape".to_string())?;
+    let outer = x.numel() / norm_size;
+    let scale_len = scale.numel();
+
+    for o in 0..outer {
+        let slice = &x.data[o * norm_size..(o + 1) * norm_size];
+        let mean_sq = slice.iter().map(|&v| v * v).sum::<f32>() / norm_size as f32;
+        let inv_rms = (mean_sq + eps).sqrt().recip();
+        for j in 0..norm_size {
+            out[o * norm_size + j] =
+                x.data[o * norm_size + j] * inv_rms * scale.data[j % scale_len];
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn batch_norm_into(
+    x: &Tensor,
+    scale: &Tensor,
+    bias: &Tensor,
+    mean: &Tensor,
+    var: &Tensor,
+    eps: f32,
+    out: &mut [f32],
+) -> Result<(), String> {
+    if x.ndim() < 2 {
+        return Err("batch_norm: need at least 2D".into());
+    }
+    let n = x.shape[0];
+    let c = x.shape[1];
+    let spatial: usize = if x.ndim() > 2 {
+        x.shape[2..].iter().product()
+    } else {
+        1
+    };
+
+    out.copy_from_slice(&x.data);
+    for ni in 0..n {
+        for ci in 0..c {
+            let s = scale.data[ci];
+            let b = bias.data[ci];
+            let m = mean.data[ci];
+            let v = var.data[ci];
+            let inv_std = (v + eps).sqrt().recip();
+            for si in 0..spatial {
+                let idx = ni * c * spatial + ci * spatial + si;
+                out[idx] = (out[idx] - m) * inv_std * s + b;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn group_norm_into(
+    x: &Tensor,
+    scale: &Tensor,
+    bias: Option<&Tensor>,
+    num_groups: usize,
+    eps: f32,
+    out: &mut [f32],
+) -> Result<(), String> {
+    if x.ndim() < 2 {
+        return Err("group_norm: need at least 2D input".into());
+    }
+    let n = x.shape[0];
+    let c = x.shape[1];
+    let spatial: usize = x.shape[2..].iter().product::<usize>().max(1);
+    if c % num_groups != 0 {
+        return Err(format!(
+            "group_norm: C={c} not divisible by num_groups={num_groups}"
+        ));
+    }
+    let group_size = c / num_groups * spatial;
+
+    out.copy_from_slice(&x.data);
+    for ni in 0..n {
+        for g in 0..num_groups {
+            let start = ni * c * spatial + g * group_size;
+            let slice = &mut out[start..start + group_size];
+            let mean = slice.iter().sum::<f32>() / group_size as f32;
+            let var = slice.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / group_size as f32;
+            let inv_std = (var + eps).sqrt().recip();
+            for v in slice.iter_mut() {
+                *v = (*v - mean) * inv_std;
+            }
+        }
+    }
+    for ni in 0..n {
+        for ci in 0..c {
+            let s = scale.data[ci % scale.numel()];
+            let b = bias.map(|b| b.data[ci % b.numel()]).unwrap_or(0.0);
+            for si in 0..spatial {
+                let idx = ni * c * spatial + ci * spatial + si;
+                out[idx] = out[idx] * s + b;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn instance_norm_into(
+    x: &Tensor,
+    scale: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+    out: &mut [f32],
+) -> Result<(), String> {
+    if x.ndim() < 3 {
+        return Err("instance_norm: input must have at least 3 dimensions".into());
+    }
+    let n = x.shape[0];
+    let c = x.shape[1];
+    let spatial: usize = x.shape[2..].iter().product();
+
+    for batch in 0..n {
+        for ch in 0..c {
+            let offset = (batch * c + ch) * spatial;
+            let slice = &x.data[offset..offset + spatial];
+            let mean = slice.iter().sum::<f32>() / spatial as f32;
+            let var = slice.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / spatial as f32;
+            let inv_std = 1.0 / (var + eps).sqrt();
+            let s = scale.data[ch];
+            let b = bias.data[ch];
+            for i in 0..spatial {
+                out[offset + i] = (slice[i] - mean) * inv_std * s + b;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn softmax_into(x: &Tensor, axis: i64, out: &mut [f32]) -> Result<(), String> {
+    let ndim = x.ndim();
+    let ax = if axis < 0 {
+        (axis + ndim as i64) as usize
+    } else {
+        axis as usize
+    };
+    if ax >= ndim {
+        return Err(format!(
+            "softmax: axis {axis} out of range for {ndim}D tensor"
+        ));
+    }
+
+    out.copy_from_slice(&x.data);
+    let inner: usize = x.shape[ax + 1..].iter().product();
+    let axis_len = x.shape[ax];
+
+    #[cfg(feature = "simd")]
+    {
+        if inner == 1 {
+            crate::simd_ops::simd_softmax_strided(out, axis_len);
+            return Ok(());
+        }
+    }
+
+    let outer: usize = x.shape[..ax].iter().product();
+    for o in 0..outer {
+        for i in 0..inner {
+            let mut max_val = f32::NEG_INFINITY;
+            for k in 0..axis_len {
+                let idx = o * axis_len * inner + k * inner + i;
+                if out[idx] > max_val {
+                    max_val = out[idx];
+                }
+            }
+            let mut sum = 0.0f32;
+            for k in 0..axis_len {
+                let idx = o * axis_len * inner + k * inner + i;
+                out[idx] = (out[idx] - max_val).exp();
+                sum += out[idx];
+            }
+            let inv = sum.recip();
+            for k in 0..axis_len {
+                let idx = o * axis_len * inner + k * inner + i;
+                out[idx] *= inv;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn log_softmax_into(x: &Tensor, axis: i64, out: &mut [f32]) -> Result<(), String> {
+    let ndim = x.ndim();
+    let ax = if axis < 0 {
+        (axis + ndim as i64) as usize
+    } else {
+        axis as usize
+    };
+    if ax >= ndim {
+        return Err(format!(
+            "log_softmax: axis {axis} out of range for {ndim}D tensor"
+        ));
+    }
+
+    out.copy_from_slice(&x.data);
+    let outer: usize = x.shape[..ax].iter().product();
+    let inner: usize = x.shape[ax + 1..].iter().product();
+    let axis_len = x.shape[ax];
+
+    for o in 0..outer {
+        for i in 0..inner {
+            let mut max_val = f32::NEG_INFINITY;
+            for k in 0..axis_len {
+                let idx = o * axis_len * inner + k * inner + i;
+                if out[idx] > max_val {
+                    max_val = out[idx];
+                }
+            }
+            let mut sum_exp = 0.0f32;
+            for k in 0..axis_len {
+                let idx = o * axis_len * inner + k * inner + i;
+                sum_exp += (out[idx] - max_val).exp();
+            }
+            let log_sum_exp = sum_exp.ln();
+            for k in 0..axis_len {
+                let idx = o * axis_len * inner + k * inner + i;
+                out[idx] = out[idx] - max_val - log_sum_exp;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Numerically stable softmax along the specified axis.
 pub fn softmax(x: &Tensor, axis: i64) -> Result<Tensor, String> {
     let ndim = x.ndim();

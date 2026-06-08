@@ -1,10 +1,10 @@
-# OxiONNX 0.1.3 -- Pure Rust ONNX Inference Engine
+# OxiONNX 0.1.4 -- Pure Rust ONNX Inference Engine
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
 **Author:** COOLJAPAN OU (Team Kitasan)
 
-**Current stats (2026-05-16):** ~63,460 SLoC (Rust code) | 167 OpKind variants | 1,179 tests passing | workspace layout (8 crates)
+**Current stats (2026-06-08):** ~67,129 SLoC (Rust code) | 167 OpKind variants | 1,264 tests passing | workspace layout (8 crates)
 **Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)
 **Zero C/C++ dependencies.**
 
@@ -456,6 +456,26 @@ Summary of key items:
 
 ---
 
+## 14b. Subgraph Parsing + Dispatch Wiring (v0.1.4)
+
+### Proto-layer subgraph parsing
+- [x] `AttributeValue.g: Option<Box<GraphProto>>` — field to carry a parsed subgraph (types.rs; `Box` breaks the recursive type cycle)
+- [x] `parse_attribute` field 6 — call `parse_graph(b)?` instead of discarding bytes (parser.rs:186-189); fixes both the eager and streaming parsers (streaming delegates to `parse_node`→`parse_attribute`)
+- [x] `build_subgraph` in model.rs — converts `GraphProto` → runtime `Graph`; local initializers become synthesised `Constant` nodes prepended to `graph.nodes` (no `Graph` struct change)
+- [x] `convert_attributes` graph arm — inserts `build_subgraph` result into `Attributes.graphs` before `attr_type` dispatch; mutual recursion handles nested subgraphs
+- [x] Tests: `test_subgraph_attribute_parsed` (parser round-trip), `test_subgraph_attribute_wired_into_graph` (build_subgraph → Attributes.graphs)
+
+### Session dispatch wiring
+- [x] `OpContext.weights: Option<&'a HashMap<String, Tensor>>` — new field; model weights passed by reference so subgraph nodes resolve initializer names without cloning
+- [x] `dispatch_node` (3 paths: slot-write, inplace, default) — `outer_scope: Some(state.as_map())`, `weights: Some(&self.weights)`, `registry: Some(&self.registry)`
+- [x] `parallel.rs` rayon path — same wiring for `weights` and `registry`
+- [x] `IfOp`/`LoopOp`/`ScanOp` — pass `ctx.weights.unwrap_or(&empty)` to `execute_subgraph` (zero allocation; outer-model initializers now reachable from inside branches/loops)
+
+### End-to-end tests
+- [x] `tests/control_flow_e2e.rs` — 9 tests: `If` true/false branch, `Loop` accumulate, `Loop` zero-iterations, `Loop` with outer weight, `Scan` element-wise, `Scan` with running state, `If` sequential subgraph ops, `If` subgraph-local initializer
+
+---
+
 ## 15. Future Roadmap (Deferred)
 
 ### Phase D — Operator-Native TypedTensor Dispatch
@@ -510,6 +530,40 @@ changing the `Operator::execute` return contract.
 - [ ] v0.1.6 follow-up: End-to-end Windows CI job (windows-latest matrix entry in `.github/workflows.disabled/ci.yml`)
 - [ ] v0.1.6 follow-up: Extend dispatch to Conv, Softmax, Reduce
 
+## DirectML Wave 3 — D3D12/HLSL GPU pipeline (tracked 2026-06-07 by /stub-check)
+Tracked roadmap, NOT a regression. The current crate is a correct, intentional cross-platform scaffold (Windows: try_new() → None, dispatch falls through to CPU; non-Windows: documented zero-overhead no-op). The HLSL shader sources (MATMUL_HLSL, ELEMENTWISE_BINARY_HLSL, ELEMENTWISE_UNARY_HLSL) are already written; only the Windows-side D3D12 host wiring is deferred. **Must be implemented and tested on a Windows host / CI runner** — the entire pipeline is `#[cfg(target_os = "windows")]` behind the target-gated `windows` crate and cannot be compiled, clippy'd, or tested on macOS/Linux. Scope: large (~400–700 LoC of Windows-only FFI, 5 HLSL PSOs, plus a shader-compiler decision: D3DCompile vs precompiled DXIL).
+
+- [ ] oxionnx-directml: src/context.rs:95 — TODO(Wave3): create the real Windows D3D12 device context
+  - **Approach:** CreateDXGIFactory2 → IDXGIFactory4 adapter enumeration → feature-level 12_0 probe → D3D12CreateDevice; create a compute command queue (D3D12_COMMAND_LIST_TYPE_COMPUTE), ID3D12Fence + CreateEventW; populate the currently-`_reserved: ()` WindowsContext fields. Windows-only.
+  - **Scope:** large
+  - **Prerequisites:** Windows host + target-gated `windows` crate + D3D12 runtime; a Windows CI runner for verification
+  - **Risk:** untestable off-Windows; device/fence/event lifetimes must be leak-free and correctly synchronized
+- [ ] oxionnx-directml: src/kernels/matmul.rs:44 — TODO(Wave3): bind & dispatch MATMUL_HLSL
+  - **Approach:** Compile MATMUL_HLSL to a PSO; root signature CBV(b0)+SRV(t0,t1)+UAV(u0); upload A/B + allocate C; descriptor heap; record dispatch ceil(M/16)×ceil(N/16)×1; fence wait; readback C into Tensor.
+  - **Scope:** large
+  - **Prerequisites:** context.rs:95 device context first
+  - **Risk:** root-signature/descriptor-binding correctness; readback barriers; result must match the CPU MatMul reference
+- [ ] oxionnx-directml: src/kernels/elementwise.rs:29 — TODO(Wave3): dispatch ADD (ELEMENTWISE_BINARY_HLSL main_add)
+  - **Approach:** PSO from the main_add entry point; CBV(N)+SRV(t0,t1)+UAV(u0); upload both inputs; dispatch ceil(N/256); readback.
+  - **Scope:** medium
+  - **Prerequisites:** context.rs:95 device context first
+  - **Risk:** shared binary-elementwise harness must be reused by mul; off-Windows untestable
+- [ ] oxionnx-directml: src/kernels/elementwise.rs:46 — TODO(Wave3): dispatch MUL (ELEMENTWISE_BINARY_HLSL main_mul)
+  - **Approach:** Same binary harness as add, different PSO entry point (main_mul).
+  - **Scope:** small (after add harness exists)
+  - **Prerequisites:** elementwise.rs:29 add harness
+  - **Risk:** off-Windows untestable
+- [ ] oxionnx-directml: src/kernels/elementwise.rs:56 — TODO(Wave3): dispatch RELU (ELEMENTWISE_UNARY_HLSL main_relu)
+  - **Approach:** PSO from main_relu; CBV(N)+SRV(t0)+UAV(u0); single-input upload/dispatch/readback (unary harness).
+  - **Scope:** medium
+  - **Prerequisites:** context.rs:95 device context first
+  - **Risk:** unary harness must be reused by sigmoid; off-Windows untestable
+- [ ] oxionnx-directml: src/kernels/elementwise.rs:66 — TODO(Wave3): dispatch SIGMOID (ELEMENTWISE_UNARY_HLSL main_sigmoid)
+  - **Approach:** Same unary harness as relu, different PSO entry point (main_sigmoid).
+  - **Scope:** small (after relu harness exists)
+  - **Prerequisites:** elementwise.rs:56 relu harness
+  - **Risk:** off-Windows untestable
+
 ### Phase F — Operator-Level IOBinding Reuse (pilot)
 - [x] `execute_into_slots()` + `supports_output_slots()` hooks on `Operator` trait (backward-compat defaults)
 - [x] Dispatch path wired in `execute_node_with_inplace` (sequential path): if op supports slots AND static output shape known → pre-allocate from pool + write via `execute_into_slots`
@@ -529,6 +583,29 @@ changing the `Operator::execute` return contract.
 
 ---
 
+## Pure-Rust enhancements (planned 2026-06-08)
+
+- [x] ONNX Reshape `allowzero` (opset 14+) (planned 2026-06-08)
+  - **Goal:** Reshape honors the `allowzero` attribute; allowzero=0 (default) keeps `0`→copy-input-dim; allowzero=1 treats `0` as a literal zero-size dim (NumPy) and rejects the ambiguous `0`+`-1` combination.
+  - **Design:** read `allowzero` (i64, default 0) in ReshapeOp; thread a bool into the shape-resolution helper in `shape/basic.rs`; literal-0 + a typed error on `0`&`-1`; preserve the default path exactly.
+  - **Files:** oxionnx-ops/src/registry/shape_ops/reshape_ops.rs, oxionnx-ops/src/shape/basic.rs
+  - **Tests:** allowzero=0 copy (regression), allowzero=1 literal-zero, allowzero=1 `0`+`-1` error, `-1` inference unchanged, allowzero=1 no-zero ≡ default.
+  - **Risk:** `-1`×`0` interaction — covered by typed error + tests.
+- [x] `TrainingInfo.initialization_graph` (ONNX training IR) (planned 2026-06-08)
+  - **Goal:** parse and expose `TrainingInfoProto.initialization` (protobuf field 1), currently skipped with a "rarely used" comment.
+  - **Design:** add `pub initialization_graph: Option<GraphProto>`; parse field 1 via the existing `parse_graph` helper in `parse_training_info`.
+  - **Files:** oxionnx-proto/src/types.rs, oxionnx-proto/src/parser.rs
+  - **Tests:** synthetic TrainingInfoProto with an init graph → `Some`; absence → `None`.
+  - **Risk:** minimal — mirrors the existing `training_graph` parse.
+- [x] wasm `console_error_panic_hook` (planned 2026-06-08)
+  - **Goal:** wasm panics forward to the browser console instead of the current no-op in `wasm_init()`.
+  - **Design:** optional workspace dependency gated by the existing `wasm` feature (`dep:console_error_panic_hook`); call `set_once()` in `wasm_init()`; native default build untouched.
+  - **Files:** Cargo.toml, src/wasm.rs
+  - **Verify:** wasm32-unknown-unknown compile-check + native clippy clean; Pure-Rust default closure preserved.
+  - **Risk:** none on the native path; in-browser runtime test is out of the macOS-gate scope.
+
+---
+
 ## Proposed follow-ups (deferred from v0.1.6 run, 2026-04-17)
 
 - **D.3 — Native dispatch for Conv / Attention / RNN** (**COMPLETE**): MatMul (v0.1.8), Gemm (v0.1.9), AttentionOp+MHA (v0.1.10), ConvOp+ConvTransposeOp+LSTMOp+GRUOp (v0.1.10+), Attention SIMD/NEON/AVX2 (v0.1.10+) — all shipped. No remaining items.
@@ -537,5 +614,6 @@ changing the `Operator::execute` return contract.
 - **E.6 — DirectML Conv/Softmax/Reduce kernels** (v0.1.7): Depends on E.4 landing first.
 - **E.7 — DirectML Q4/Q8 support** (v0.1.8): Depends on E.4 + E.6.
 - **F.11 — Slot-indexed Vec<Tensor> SessionRunState** (v0.1.8): Replace the HashMap backing with a `Vec<Tensor>` + name→index lookup table. Would save the HashMap hash computation per node (~121 ops per run). Requires a mirror change in `TypedSessionRunState` and care around `bound_outputs` ownership. Defer until a real-world workload shows HashMap cost as material.
-- **F.12 — Zero-copy per-op `execute_into_slots` for non-pilot hot ops** (in progress, 2026-04-18): 22 hot ops shipped hand-coded slot-write bodies in v0.1.6. v0.1.7 added 27 more: shape_ops (Squeeze/Unsqueeze/Flatten/Expand/Split/Tile/DepthToSpace/SpaceToDepth/ReverseSequence), nn_ops (Clip/LeakyRelu/PRelu/HardSigmoid/Celu/Elu/Selu/ThresholdedRelu/LpNorm/MeanVarianceNorm/Hardmax/Shrink), conv_ops (MaxPool/AveragePool/GlobalAveragePool/GlobalMaxPool/Pad/Resize). v0.1.8 added 3 more: Gather, ScatterND, ScatterElements — subtotal 52. v0.1.9 added 2 more: Conv, ConvTranspose — subtotal 54. v0.1.10 added 2 more: LSTM, GRU — **total 56 of 121 ops** with hand-coded slot-write bodies. Remaining (tracked as F.13): AttentionOp, MultiHeadAttentionOp. Distinct from F.10 (which only flips the opt-in bit).
-- **F.13 — F.12 remaining complex ops** (v0.1.11+): AttentionOp, MultiHeadAttentionOp. LSTM/GRU shipped in v0.1.10. Attention ops have complex Q/K/V projection + optional KV cache. Profile-gated — defer until workload shows slot-write cost as material. Distinct from F.10 (opt-in sweep) and F.12 (simpler hot ops).
+- **F.12 — Zero-copy per-op `execute_into_slots` for non-pilot hot ops** (**COMPLETE**): 22 hot ops shipped hand-coded slot-write bodies in v0.1.6. v0.1.7 added 27 more: shape_ops (Squeeze/Unsqueeze/Flatten/Expand/Split/Tile/DepthToSpace/SpaceToDepth/ReverseSequence), nn_ops (Clip/LeakyRelu/PRelu/HardSigmoid/Celu/Elu/Selu/ThresholdedRelu/LpNorm/MeanVarianceNorm/Hardmax/Shrink), conv_ops (MaxPool/AveragePool/GlobalAveragePool/GlobalMaxPool/Pad/Resize). v0.1.8 added 3 more: Gather, ScatterND, ScatterElements — subtotal 52. v0.1.9 added 2 more: Conv, ConvTranspose — subtotal 54. v0.1.10 added 2 more: LSTM, GRU — subtotal 56. v0.1.4 added 2 more: AttentionOp, MultiHeadAttentionOp — **total 58 of 121 ops** with hand-coded slot-write bodies. Phase F operator slot-write sweep fully closed.
+- **F.13 — F.12 remaining complex ops** (**COMPLETE**, v0.1.4): AttentionOp and MultiHeadAttentionOp shipped hand-coded `execute_into_slots` bodies (`registry/rnn_ops/attention.rs`). Backed by new allocation-free kernels `sdpa_into`, `sdpa_output_shape`, `reshape_from_heads_into`, `multi_head_attention_into` extracted from `attention/core.rs`. SIMD zeroing bug for `seq_q > 1` fixed as part of this work. 21 new tests in `oxionnx-ops/tests/output_slots_attention_test.rs`.
+- **F.14 — Remaining 47 ops slot-write sweep** (**COMPLETE**, v0.1.4): Added true zero-copy `execute_into_slots` bodies for 47 additional operators, bringing the total to **105 of 121 ops** with hand-coded slot-write bodies. Covered: normalization ops (LayerNorm, GroupNorm, BatchNorm, RmsNorm, InstanceNorm) and activations (Softmax, LogSoftmax) via new `_into` kernel variants in `nn/normalization.rs`; reduce ops (ReduceSum/Mean/Max/Min/Prod/L1/L2/LogSum/LogSumExp/SumSquare) via new `reduce_with_into`/`reduce_output_shape` primitives in `math/reduce.rs`; ArgMax, ArgMin, CumSum, TopK (2-output) via new `_into` variants in `math/argminmax.rs` and `math/topk.rs`; variadic ops (Min/Max/Mean/Sum); comparison binary ops (Equal/Greater/GreaterOrEqual/Less/LessOrEqual/And/Or/Xor) via macro update; bitwise binary ops (BitwiseAnd/Or/Xor) via macro update; unary ops (Not, IsInf, IsNaN, BitwiseNot) with inline; shape/utility ops (Shape, Size, Constant, ConstantOfShape, EyeLike, Trilu, Einsum). 41 new tests in `oxionnx-ops/tests/output_slots_f14_test.rs`. Remaining 16 ops without slot bodies are variable-output (NonZero, Range, Compress, Unique, NonMaxSuppression, GatherND, GatherElements, Where), type-sensitive (QuantizeLinear, DequantizeLinear, OneHot), ML ops (11 LinearClassifier/TreeEnsemble/SVM/etc.), and spatial ops (RotaryEmbedding/GridSample/RoiAlign).

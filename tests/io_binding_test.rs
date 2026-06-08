@@ -216,6 +216,7 @@ fn test_execute_into_slots_identity_success() {
         node: &node,
         inputs: vec![Some(&input)],
         outer_scope: None,
+        weights: None,
         registry: None,
     };
 
@@ -253,6 +254,7 @@ fn test_execute_into_slots_identity_empty_slots_error() {
         node: &node,
         inputs: vec![Some(&input)],
         outer_scope: None,
+        weights: None,
         registry: None,
     };
 
@@ -285,6 +287,7 @@ fn test_execute_into_slots_add_op() {
         node: &node,
         inputs: vec![Some(&a), Some(&b)],
         outer_scope: None,
+        weights: None,
         registry: None,
     };
 

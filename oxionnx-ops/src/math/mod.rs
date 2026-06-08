@@ -17,12 +17,19 @@ pub use reduce::{
     reduce_l1, reduce_l2, reduce_log_sum, reduce_log_sum_exp, reduce_max, reduce_mean, reduce_min,
     reduce_prod, reduce_sum, reduce_sum_square,
 };
+pub(crate) use reduce::{
+    reduce_l1_into, reduce_l2_into, reduce_log_sum_exp_into, reduce_log_sum_into, reduce_max_into,
+    reduce_mean_into, reduce_min_into, reduce_output_shape, reduce_prod_into, reduce_sum_into,
+    reduce_sum_square_into,
+};
 
 // ── ArgMax / ArgMin / CumSum / Range ─────────────────────────────────────────
 pub use argminmax::{arg_max, arg_min, cumsum, range};
+pub(crate) use argminmax::{arg_output_shape, arg_reduce_into, cumsum_into};
 
 // ── TopK ─────────────────────────────────────────────────────────────────────
 pub use topk::top_k;
+pub(crate) use topk::{top_k_into, top_k_output_shape};
 
 // ── MatMul / Gemm ─────────────────────────────────────────────────────────────
 pub use matmul::{gemm, gemm_into, matmul, matmul_into};

@@ -184,8 +184,7 @@ pub fn parse_attribute(buf: &[u8]) -> Result<AttributeProto, String> {
             (4, WireValue::Bytes(b)) => attr.value.s = String::from_utf8_lossy(b).into_owned(),
             (5, WireValue::Bytes(b)) => attr.value.t = Some(parse_tensor_proto(b)?),
             (6, WireValue::Bytes(b)) => {
-                /* g: GraphProto, skip for now */
-                let _ = b;
+                attr.value.g = Some(Box::new(parse_graph(b)?));
             }
             (7, WireValue::Bytes(b)) => {
                 // floats: packed
@@ -496,8 +495,10 @@ fn parse_training_info(buf: &[u8]) -> Result<crate::types::TrainingInfo, String>
         let (field, value, next) = read_field(buf, pos)?;
         pos = next;
         match (field, value) {
-            (1, WireValue::Bytes(_b)) => {
-                // initialization graph — skip for now (rarely used)
+            (1, WireValue::Bytes(b)) => {
+                // initialization: GraphProto computing initial values for trainable tensors
+                let graph = parse_graph(b)?;
+                info.initialization_graph = Some(graph);
             }
             (2, WireValue::Bytes(b)) => {
                 // algorithm / training graph
@@ -748,5 +749,115 @@ mod tests {
         assert_eq!(info.update_bindings.len(), 1);
         assert_eq!(info.update_bindings[0].0, "weight");
         assert_eq!(info.update_bindings[0].1, "weight_grad");
+        // No initialization graph (field 1) was supplied in this message.
+        assert!(info.initialization_graph.is_none());
+    }
+
+    #[test]
+    fn test_training_info_initialization_graph_parsed() {
+        // Build a TrainingInfoProto whose field 1 (initialization) is a GraphProto
+        // containing one node (Constant) and a graph name.
+
+        // ── encode a Constant NodeProto for the initialization graph ──────────
+        let mut const_node = Vec::new();
+        const_node.extend(encode_bytes_field(2, b"weight")); // output (field 2)
+        const_node.extend(encode_bytes_field(3, b"init_const")); // name (field 3)
+        const_node.extend(encode_bytes_field(4, b"Constant")); // op_type (field 4)
+
+        // ── encode the initialization GraphProto: field 1 = node, field 2 = name ──
+        let mut init_graph = Vec::new();
+        init_graph.extend(encode_bytes_field(1, &const_node)); // node (field 1)
+        init_graph.extend(encode_bytes_field(2, b"init_graph")); // name (field 2)
+
+        // field 2 = algorithm/training graph with name "SGD"
+        let train_graph = encode_bytes_field(2, b"SGD"); // GraphProto field 2 = name
+
+        let mut training_bytes = Vec::new();
+        training_bytes.extend(encode_bytes_field(1, &init_graph)); // initialization graph
+        training_bytes.extend(encode_bytes_field(2, &train_graph)); // training graph
+
+        // ModelProto with field 20 = training_info
+        let mut model_bytes = encode_varint_field(1, 8);
+        model_bytes.extend(encode_bytes_field(20, &training_bytes));
+
+        let model =
+            parse_model(&model_bytes).expect("should parse model with initialization graph");
+        assert_eq!(model.training_info.len(), 1);
+
+        let info = &model.training_info[0];
+        assert_eq!(info.algorithm, "SGD");
+        assert!(info.training_graph.is_some());
+
+        let init = info
+            .initialization_graph
+            .as_ref()
+            .expect("initialization graph must be parsed");
+        assert_eq!(init.name, "init_graph");
+        assert_eq!(init.nodes.len(), 1);
+        assert_eq!(init.nodes[0].op_type, "Constant");
+    }
+
+    #[test]
+    fn test_training_info_without_initialization_graph() {
+        // A TrainingInfoProto with only a training graph (field 2) and no field 1
+        // must yield initialization_graph == None.
+        let train_graph = encode_bytes_field(2, b"Adam"); // GraphProto field 2 = name
+
+        let mut training_bytes = Vec::new();
+        training_bytes.extend(encode_bytes_field(2, &train_graph)); // training graph only
+
+        let mut model_bytes = encode_varint_field(1, 8);
+        model_bytes.extend(encode_bytes_field(20, &training_bytes));
+
+        let model = parse_model(&model_bytes).expect("should parse model");
+        assert_eq!(model.training_info.len(), 1);
+        assert!(model.training_info[0].initialization_graph.is_none());
+    }
+
+    #[test]
+    fn test_subgraph_attribute_parsed() {
+        // Build a minimal If node with a then_branch subgraph.
+        // The subgraph has one node (Relu) with input "X" and output "Y".
+
+        // ── encode a Relu NodeProto ──────────────────────────────────────────
+        let mut relu_node = Vec::new();
+        relu_node.extend(encode_bytes_field(1, b"X")); // input
+        relu_node.extend(encode_bytes_field(2, b"Y")); // output
+        relu_node.extend(encode_bytes_field(3, b"relu_node")); // name
+        relu_node.extend(encode_bytes_field(4, b"Relu")); // op_type
+
+        // ── encode a GraphProto (then_graph): field 1 = node, field 2 = name ──
+        let mut then_graph = Vec::new();
+        then_graph.extend(encode_bytes_field(1, &relu_node)); // node (field 1)
+        then_graph.extend(encode_bytes_field(2, b"then_graph")); // name (field 2)
+
+        // ── encode an AttributeProto: name="then_branch", g=then_graph (field 6), attr_type=5 ──
+        let mut then_attr = Vec::new();
+        then_attr.extend(encode_bytes_field(1, b"then_branch")); // name (field 1)
+        then_attr.extend(encode_bytes_field(6, &then_graph)); // g: GraphProto (field 6)
+        then_attr.extend(encode_varint_field(20, 5)); // attr_type = GRAPH (field 20)
+
+        // ── encode an If NodeProto ────────────────────────────────────────────
+        let mut if_node = Vec::new();
+        if_node.extend(encode_bytes_field(1, b"cond")); // input
+        if_node.extend(encode_bytes_field(2, b"result")); // output
+        if_node.extend(encode_bytes_field(3, b"if_node")); // name
+        if_node.extend(encode_bytes_field(4, b"If")); // op_type
+        if_node.extend(encode_bytes_field(5, &then_attr)); // attribute
+
+        let node = parse_node(&if_node).expect("parse_node failed");
+        assert_eq!(node.op_type, "If");
+        assert_eq!(node.attributes.len(), 1);
+
+        let attr = &node.attributes[0];
+        assert_eq!(attr.name, "then_branch");
+        assert!(
+            attr.value.g.is_some(),
+            "then_branch subgraph must be parsed into g"
+        );
+
+        let subgraph = attr.value.g.as_ref().unwrap();
+        assert_eq!(subgraph.nodes.len(), 1);
+        assert_eq!(subgraph.nodes[0].op_type, "Relu");
     }
 }

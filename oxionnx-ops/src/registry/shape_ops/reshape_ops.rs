@@ -14,8 +14,9 @@ impl Operator for ReshapeOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let shape_t = ctx.input(1)?;
+        let allowzero = ctx.attrs().i("allowzero", 0) != 0;
         let s: Vec<i64> = shape_t.data.iter().map(|&v| v as i64).collect();
-        Ok(vec![shape::reshape(x, &s)?])
+        Ok(vec![shape::reshape(x, &s, allowzero)?])
     }
     fn native_dtypes(&self) -> &'static [oxionnx_core::DType] {
         &[
@@ -53,32 +54,9 @@ impl Operator for ReshapeOp {
             .iter()
             .map(|&v| v as i64)
             .collect();
-        let numel = input.numel();
-
-        let neg_count = s.iter().filter(|&&d| d == -1).count();
-        if neg_count > 1 {
-            return Err(OnnxError::ShapeMismatch(
-                "Reshape: at most one -1 allowed".into(),
-            ));
-        }
-        let known: usize = s
-            .iter()
-            .filter(|&&d| d != -1)
-            .map(|&d| d as usize)
-            .product();
-        let new_shape: Vec<usize> = if neg_count == 1 {
-            s.iter()
-                .map(|&d| if d == -1 { numel / known } else { d as usize })
-                .collect()
-        } else {
-            s.iter().map(|&d| d as usize).collect()
-        };
-
-        if new_shape.iter().product::<usize>() != numel {
-            return Err(OnnxError::ShapeMismatch(format!(
-                "Reshape: element count mismatch ({numel} vs {new_shape:?})"
-            )));
-        }
+        let allowzero = ctx.attrs().i("allowzero", 0) != 0;
+        let new_shape = shape::resolve_reshape(&input.shape, input.numel(), &s, allowzero)
+            .map_err(OnnxError::ShapeMismatch)?;
 
         // Same typed storage, new shape — zero-copy view.
         let mut out = input.clone();
@@ -98,8 +76,9 @@ impl Operator for ReshapeOp {
         }
         let x = ctx.input(0)?;
         let shape_t = ctx.input(1)?;
+        let allowzero = ctx.attrs().i("allowzero", 0) != 0;
         let s: Vec<i64> = shape_t.data.iter().map(|&v| v as i64).collect();
-        let result = shape::reshape(x, &s)?;
+        let result = shape::reshape(x, &s, allowzero)?;
         let out = &mut slots[0];
         if out.shape == result.shape && out.data.len() == result.data.len() {
             out.data.copy_from_slice(&result.data);

@@ -327,9 +327,9 @@ impl SessionBuilder {
     ///
     /// Provider variants are only present when the corresponding Cargo feature
     /// is enabled:
-    /// - [`ProviderKind::Gpu`] requires feature `gpu`
-    /// - [`ProviderKind::Cuda`] requires feature `cuda`
-    /// - [`ProviderKind::DirectMl`] requires feature `directml`
+    /// - `ProviderKind::Gpu` requires feature `gpu`
+    /// - `ProviderKind::Cuda` requires feature `cuda`
+    /// - `ProviderKind::DirectMl` requires feature `directml`
     ///
     /// Passing a provider whose feature is not enabled is a compile error.
     pub fn with_provider_kinds(

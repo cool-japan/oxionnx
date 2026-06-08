@@ -20,6 +20,23 @@ macro_rules! comparison_binary_op {
             fn supports_output_slots(&self) -> bool {
                 true
             }
+            fn execute_into_slots(
+                &self,
+                ctx: &OpContext<'_>,
+                slots: &mut [Tensor],
+            ) -> Result<(), OnnxError> {
+                if slots.is_empty() {
+                    return Ok(());
+                }
+                let result = $func(ctx.input(0)?, ctx.input(1)?)?;
+                let out = &mut slots[0];
+                if out.data.len() == result.data.len() && out.shape == result.shape {
+                    out.data.copy_from_slice(&result.data);
+                } else {
+                    *out = result;
+                }
+                Ok(())
+            }
         }
     };
 }
@@ -50,6 +67,25 @@ impl Operator for NotOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let input = ctx.input(0)?;
+        let n = input.data.len();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&input.shape);
+        for (dst, &x) in slots[0].data.iter_mut().zip(input.data.iter()) {
+            *dst = if x == 0.0 { 1.0 } else { 0.0 };
+        }
+        Ok(())
+    }
 }
 
 // ── IsInf ───────────────────────────────────────────────────────────────────
@@ -72,6 +108,32 @@ impl Operator for IsInfOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let input = ctx.input(0)?;
+        let attrs = ctx.attrs();
+        let detect_neg = attrs.i("detect_negative", 1) != 0;
+        let detect_pos = attrs.i("detect_positive", 1) != 0;
+        let n = input.data.len();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&input.shape);
+        for (dst, &x) in slots[0].data.iter_mut().zip(input.data.iter()) {
+            *dst = if (detect_pos && x == f32::INFINITY) || (detect_neg && x == f32::NEG_INFINITY) {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        Ok(())
+    }
 }
 
 // ── IsNaN ───────────────────────────────────────────────────────────────────
@@ -86,6 +148,25 @@ impl Operator for IsNaNOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let input = ctx.input(0)?;
+        let n = input.data.len();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&input.shape);
+        for (dst, &x) in slots[0].data.iter_mut().zip(input.data.iter()) {
+            *dst = if x.is_nan() { 1.0 } else { 0.0 };
+        }
+        Ok(())
     }
 }
 
@@ -125,6 +206,32 @@ impl Operator for ConstantOfShapeOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let shape_t = ctx.input(0)?;
+        let target_shape: Vec<usize> = shape_t.data.iter().map(|&v| v as usize).collect();
+        let fill_value = ctx
+            .attrs()
+            .tensors
+            .get("value")
+            .map(|t| t.data[0])
+            .unwrap_or(0.0_f32);
+        let n: usize = target_shape.iter().product::<usize>().max(1);
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&target_shape);
+        for v in slots[0].data.iter_mut() {
+            *v = fill_value;
+        }
+        Ok(())
+    }
 }
 
 // ── EyeLike ─────────────────────────────────────────────────────────────────
@@ -141,6 +248,27 @@ impl Operator for EyeLikeOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let result = self
+            .execute(ctx)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| OnnxError::Internal("EyeLikeOp: no output".into()))?;
+        let out = &mut slots[0];
+        if out.data.len() == result.data.len() && out.shape == result.shape {
+            out.data.copy_from_slice(&result.data);
+        } else {
+            *out = result;
+        }
+        Ok(())
     }
 }
 
@@ -159,6 +287,27 @@ impl Operator for TriluOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let result = self
+            .execute(ctx)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| OnnxError::Internal("TriluOp: no output".into()))?;
+        let out = &mut slots[0];
+        if out.data.len() == result.data.len() && out.shape == result.shape {
+            out.data.copy_from_slice(&result.data);
+        } else {
+            *out = result;
+        }
+        Ok(())
     }
 }
 
@@ -322,6 +471,25 @@ impl Operator for ShapeOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let x = ctx.input(0)?;
+        let ndim = x.ndim();
+        if slots[0].data.len() != ndim {
+            slots[0].data.resize(ndim, 0.0_f32);
+        }
+        slots[0].shape = vec![ndim];
+        for (d, &dim) in slots[0].data.iter_mut().zip(x.shape.iter()) {
+            *d = dim as f32;
+        }
+        Ok(())
+    }
 }
 
 // ── Constant ────────────────────────────────────────────────────────────────
@@ -346,6 +514,43 @@ impl Operator for ConstantOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let attrs = ctx.attrs();
+        if let Some(t) = attrs.tensors.get("value") {
+            let n = t.data.len();
+            if slots[0].data.len() != n {
+                slots[0].data.resize(n, 0.0_f32);
+            }
+            slots[0].shape.clone_from(&t.shape);
+            slots[0].data.copy_from_slice(&t.data);
+        } else if let Some(&v) = attrs.floats.get("value_float") {
+            if slots[0].data.len() != 1 {
+                slots[0].data.resize(1, 0.0_f32);
+            }
+            slots[0].shape = vec![1];
+            slots[0].data[0] = v;
+        } else if let Some(&v) = attrs.ints.get("value_int") {
+            if slots[0].data.len() != 1 {
+                slots[0].data.resize(1, 0.0_f32);
+            }
+            slots[0].shape = vec![1];
+            slots[0].data[0] = v as f32;
+        } else {
+            if slots[0].data.len() != 1 {
+                slots[0].data.resize(1, 0.0_f32);
+            }
+            slots[0].shape = vec![1];
+            slots[0].data[0] = 0.0_f32;
+        }
+        Ok(())
+    }
 }
 
 // ── Einsum ──────────────────────────────────────────────────────────────────
@@ -363,6 +568,27 @@ impl Operator for EinsumOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let result = self
+            .execute(ctx)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| OnnxError::Internal("EinsumOp: no output".into()))?;
+        let out = &mut slots[0];
+        if out.data.len() == result.data.len() && out.shape == result.shape {
+            out.data.copy_from_slice(&result.data);
+        } else {
+            *out = result;
+        }
+        Ok(())
+    }
 }
 
 // ── Bitwise ──────────────────────────────────────────────────────────────
@@ -379,6 +605,23 @@ macro_rules! bitwise_binary_op {
             }
             fn supports_output_slots(&self) -> bool {
                 true
+            }
+            fn execute_into_slots(
+                &self,
+                ctx: &OpContext<'_>,
+                slots: &mut [Tensor],
+            ) -> Result<(), OnnxError> {
+                if slots.is_empty() {
+                    return Ok(());
+                }
+                let result = $func(ctx.input(0)?, ctx.input(1)?)?;
+                let out = &mut slots[0];
+                if out.data.len() == result.data.len() && out.shape == result.shape {
+                    out.data.copy_from_slice(&result.data);
+                } else {
+                    *out = result;
+                }
+                Ok(())
             }
         }
     };
@@ -399,6 +642,25 @@ impl Operator for BitwiseNotOp {
     fn supports_output_slots(&self) -> bool {
         true
     }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let input = ctx.input(0)?;
+        let n = input.data.len();
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
+        }
+        slots[0].shape.clone_from(&input.shape);
+        for (dst, &x) in slots[0].data.iter_mut().zip(input.data.iter()) {
+            *dst = (!(x as u32)) as f32;
+        }
+        Ok(())
+    }
 }
 
 // ── Size ─────────────────────────────────────────────────────────────────
@@ -415,6 +677,22 @@ impl Operator for SizeOp {
     }
     fn supports_output_slots(&self) -> bool {
         true
+    }
+    fn execute_into_slots(
+        &self,
+        ctx: &OpContext<'_>,
+        slots: &mut [Tensor],
+    ) -> Result<(), OnnxError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let n = ctx.input(0)?.numel();
+        if slots[0].data.len() != 1 {
+            slots[0].data.resize(1, 0.0_f32);
+        }
+        slots[0].shape = vec![1];
+        slots[0].data[0] = n as f32;
+        Ok(())
     }
 }
 

@@ -44,7 +44,8 @@ impl Operator for LoopOp {
         })?;
         let empty_scope = HashMap::new();
         let outer = ctx.outer_scope.unwrap_or(&empty_scope);
-        let weights = HashMap::new();
+        let empty_weights = HashMap::new();
+        let weights = ctx.weights.unwrap_or(&empty_weights);
         let num_carried = carried_deps.len();
         let num_body_outputs = body.output_names.len();
         if num_body_outputs < 1 + num_carried {
@@ -87,7 +88,7 @@ impl Operator for LoopOp {
                     }
                 }
             }
-            let outputs = execute_subgraph(body, subgraph_inputs, outer, &weights, registry)?;
+            let outputs = execute_subgraph(body, subgraph_inputs, outer, weights, registry)?;
             let new_cond = outputs
                 .first()
                 .ok_or_else(|| OnnxError::InvalidModel("Loop: body produced no outputs".into()))?;

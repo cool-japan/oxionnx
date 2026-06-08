@@ -33,6 +33,7 @@ pub fn default_typed_via_f32(
         node: ctx.node,
         inputs: refs,
         outer_scope: None,
+        weights: None,
         registry: ctx.registry,
     };
 

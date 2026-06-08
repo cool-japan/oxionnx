@@ -11,7 +11,9 @@ pub mod variants;
 // Re-export public API
 pub use cached::{cached_attention, cached_multi_head_attention};
 pub use core::{multi_head_attention, rotary_embedding, scaled_dot_product_attention};
-pub(crate) use core::{reshape_from_heads, reshape_to_heads};
+pub(crate) use core::{
+    multi_head_attention_into, reshape_from_heads, reshape_to_heads, sdpa_into, sdpa_output_shape,
+};
 pub use variants::{alibi_attention, grouped_query_attention, multi_query_attention};
 
 // Re-export typed kernel types

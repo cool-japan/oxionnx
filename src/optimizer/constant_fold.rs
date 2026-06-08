@@ -86,6 +86,7 @@ pub fn constant_fold(
                 node: &node,
                 inputs: resolved_inputs,
                 outer_scope: None,
+                weights: None,
                 registry: None,
             };
 

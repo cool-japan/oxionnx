@@ -2,32 +2,83 @@
 
 use oxionnx_core::Tensor;
 
-pub fn reshape(x: &Tensor, shape: &[i64]) -> Result<Tensor, String> {
-    let numel = x.numel();
+/// Reshape `x` to the target `shape`, honouring the ONNX `allowzero` attribute.
+///
+/// Special entries in `shape`:
+/// - `-1` infers a single dimension from the remaining element count (at most one allowed).
+/// - `0` copies the corresponding input dimension when `allowzero` is `false` (the ONNX
+///   default); when `allowzero` is `true` a `0` is a literal zero-size dimension (NumPy
+///   semantics) and is taken verbatim.
+///
+/// When `allowzero` is `true`, combining a `-1` with an explicit `0` is ambiguous and
+/// returns an error.
+pub fn reshape(x: &Tensor, shape: &[i64], allowzero: bool) -> Result<Tensor, String> {
+    let new_shape = resolve_reshape(&x.shape, x.numel(), shape, allowzero)?;
+    Ok(Tensor::new(x.data.clone(), new_shape))
+}
+
+/// Resolve a concrete output shape for Reshape from the target `shape` spec.
+///
+/// `input_dims` and `numel` describe the source tensor; `allowzero` selects whether a `0`
+/// copies the input dimension (`false`, ONNX default) or is a literal zero (`true`).
+pub fn resolve_reshape(
+    input_dims: &[usize],
+    numel: usize,
+    shape: &[i64],
+    allowzero: bool,
+) -> Result<Vec<usize>, String> {
     let neg_count = shape.iter().filter(|&&d| d == -1).count();
     if neg_count > 1 {
         return Err("reshape: at most one -1 allowed".into());
     }
-    let known: usize = shape
-        .iter()
-        .filter(|&&d| d != -1)
-        .map(|&d| d as usize)
-        .product();
-    let new_shape: Vec<usize> = if neg_count == 1 {
-        shape
-            .iter()
-            .map(|&d| if d == -1 { numel / known } else { d as usize })
-            .collect()
-    } else {
-        shape.iter().map(|&d| d as usize).collect()
-    };
+    let has_explicit_zero = shape.contains(&0);
+    if allowzero && neg_count == 1 && has_explicit_zero {
+        return Err(
+            "Reshape: cannot infer dimension (-1) when an explicit 0 is present under allowzero=1"
+                .into(),
+        );
+    }
+
+    // Resolve every non-(-1) entry first: a 0 either copies the input dim (allowzero=false)
+    // or stays a literal zero (allowzero=true). The -1 entry is filled in afterwards.
+    let mut new_shape: Vec<usize> = Vec::with_capacity(shape.len());
+    for (i, &d) in shape.iter().enumerate() {
+        let dim = if d == -1 {
+            usize::MAX // placeholder, overwritten below
+        } else if d == 0 && !allowzero {
+            *input_dims.get(i).ok_or_else(|| {
+                format!(
+                    "reshape: 0 at index {i} has no matching input dimension (rank {})",
+                    input_dims.len()
+                )
+            })?
+        } else {
+            d as usize
+        };
+        new_shape.push(dim);
+    }
+
+    if neg_count == 1 {
+        let known: usize = new_shape.iter().filter(|&&d| d != usize::MAX).product();
+        if known == 0 {
+            return Err(format!(
+                "reshape: cannot infer dimension (-1) when remaining dimensions multiply to 0 ({new_shape:?})"
+            ));
+        }
+        let inferred = numel / known;
+        for d in new_shape.iter_mut() {
+            if *d == usize::MAX {
+                *d = inferred;
+            }
+        }
+    }
+
     if new_shape.iter().product::<usize>() != numel {
         return Err(format!(
-            "reshape: element count mismatch ({numel} vs {:?})",
-            new_shape
+            "reshape: element count mismatch ({numel} vs {new_shape:?})"
         ));
     }
-    Ok(Tensor::new(x.data.clone(), new_shape))
+    Ok(new_shape)
 }
 
 pub fn flatten(x: &Tensor, axis: i64) -> Result<Tensor, String> {

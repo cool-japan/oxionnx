@@ -148,8 +148,11 @@ impl Operator for SplitOp {
             axis as usize
         };
         let num_outputs = ctx.node.outputs.len().max(1);
+        let split_attr = attrs.ints("split");
         let split_sizes: Vec<usize> = if let Some(t) = ctx.optional_input(1) {
             t.data.iter().map(|&v| v as usize).collect()
+        } else if !split_attr.is_empty() {
+            split_attr.iter().map(|&v| v as usize).collect()
         } else if attrs.i("num_outputs", 0) > 0 {
             equal_split(
                 x.shape[ax_u],
@@ -186,8 +189,11 @@ impl Operator for SplitOp {
             )));
         }
         let num_outputs = slots.len().max(1);
+        let split_attr = attrs.ints("split");
         let split_sizes: Vec<usize> = if let Some(t) = ctx.optional_input(1) {
             t.data.iter().map(|&v| v as usize).collect()
+        } else if !split_attr.is_empty() {
+            split_attr.iter().map(|&v| v as usize).collect()
         } else if attrs.i("num_outputs", 0) > 0 {
             equal_split(
                 x.shape[ax_u],

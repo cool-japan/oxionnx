@@ -7,7 +7,7 @@ use oxionnx_core::Tensor;
 #[test]
 fn test_reshape() -> Result<(), OnnxError> {
     let x = Tensor::new(vec![1.0; 6], vec![2, 3]);
-    let y = reshape(&x, &[3, 2])?;
+    let y = reshape(&x, &[3, 2], false)?;
     assert_eq!(y.shape, vec![3, 2]);
     Ok(())
 }
@@ -15,8 +15,89 @@ fn test_reshape() -> Result<(), OnnxError> {
 #[test]
 fn test_reshape_neg1() -> Result<(), OnnxError> {
     let x = Tensor::new(vec![1.0; 6], vec![6]);
-    let y = reshape(&x, &[2, -1])?;
+    let y = reshape(&x, &[2, -1], false)?;
     assert_eq!(y.shape, vec![2, 3]);
+    Ok(())
+}
+
+#[test]
+fn test_reshape_allowzero_default_copies_input_dim() -> Result<(), OnnxError> {
+    // allowzero=0 (default): a 0 copies the input dimension at the same index.
+    // input [2,3,4], shape [2,0,4] -> [2,3,4].
+    let resolved = resolve_reshape(&[2, 3, 4], 24, &[2, 0, 4], false)?;
+    assert_eq!(resolved, vec![2, 3, 4]);
+    Ok(())
+}
+
+#[test]
+fn test_reshape_allowzero_default_copy_with_infer() -> Result<(), OnnxError> {
+    // allowzero=0: 0 copies input dim 0 (=2), -1 infers the rest. input [2,3,4]=24 elems.
+    // shape [0,-1] -> [2, 12].
+    let resolved = resolve_reshape(&[2, 3, 4], 24, &[0, -1], false)?;
+    assert_eq!(resolved, vec![2, 12]);
+    Ok(())
+}
+
+#[test]
+fn test_reshape_allowzero_true_literal_zero() -> Result<(), OnnxError> {
+    // allowzero=1: a 0 is a literal zero-size dimension (NOT copied from input).
+    // input [2,0,4] (0 elements), shape [2,0,4] -> literal [2,0,4].
+    let resolved = resolve_reshape(&[2, 0, 4], 0, &[2, 0, 4], true)?;
+    assert_eq!(resolved, vec![2, 0, 4]);
+    Ok(())
+}
+
+#[test]
+fn test_reshape_allowzero_true_neg1_and_zero_is_error() {
+    // allowzero=1: combining -1 with an explicit 0 is ambiguous -> Err.
+    let err = resolve_reshape(&[2, 0, 4], 0, &[0, -1], true);
+    assert!(err.is_err());
+}
+
+#[test]
+fn test_reshape_allowzero_true_infer_no_zero() -> Result<(), OnnxError> {
+    // allowzero=1 with no zero present behaves identically to the default path.
+    // input [2,3,4]=24 elems, shape [-1,4] -> [6,4].
+    let resolved = resolve_reshape(&[2, 3, 4], 24, &[-1, 4], true)?;
+    assert_eq!(resolved, vec![6, 4]);
+    Ok(())
+}
+
+#[test]
+fn test_reshape_neg1_inference_unchanged() -> Result<(), OnnxError> {
+    // Regression: existing -1 inference is unchanged. input [2,3,4]=24, shape [-1,4] -> [6,4].
+    let x = Tensor::new(vec![1.0; 24], vec![2, 3, 4]);
+    let y = reshape(&x, &[-1, 4], false)?;
+    assert_eq!(y.shape, vec![6, 4]);
+    Ok(())
+}
+
+#[test]
+fn test_reshape_op_allowzero_default_path() -> Result<(), OnnxError> {
+    // Op-level regression: ReshapeOp::execute with allowzero absent (default 0) and a 0
+    // in the shape tensor copies the input dim. input [2,3,4], shape [2,0,4] -> [2,3,4].
+    use crate::registry::shape_ops::ReshapeOp;
+    use oxionnx_core::graph::{Attributes, Node, OpKind};
+    use oxionnx_core::{OpContext, Operator};
+
+    let x = Tensor::new(vec![1.0; 24], vec![2, 3, 4]);
+    let shape_t = Tensor::new(vec![2.0, 0.0, 4.0], vec![3]);
+    let node = Node {
+        op: OpKind::Reshape,
+        name: "reshape_test".to_string(),
+        inputs: vec![],
+        outputs: vec![],
+        attrs: Attributes::default(),
+    };
+    let ctx = OpContext {
+        node: &node,
+        inputs: vec![Some(&x), Some(&shape_t)],
+        outer_scope: None,
+        weights: None,
+        registry: None,
+    };
+    let out = ReshapeOp.execute(&ctx)?;
+    assert_eq!(out[0].shape, vec![2, 3, 4]);
     Ok(())
 }
 

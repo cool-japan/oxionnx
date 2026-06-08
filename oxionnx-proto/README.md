@@ -21,7 +21,7 @@ tree minimal and fully Pure Rust.
 
 ```toml
 [dependencies]
-oxionnx-proto = "0.1.3"
+oxionnx-proto = "0.1.4"
 ```
 
 ```rust

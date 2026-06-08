@@ -67,6 +67,7 @@ pub(super) fn execute_subgraph(
             node,
             inputs: resolved_inputs,
             outer_scope: Some(&merged_scope),
+            weights: Some(weights),
             registry: Some(registry),
         };
         let results = operator.execute(&ctx)?;
@@ -275,6 +276,7 @@ mod tests {
             node: &node,
             inputs,
             outer_scope: Some(&outer_scope),
+            weights: None,
             registry: Some(&registry),
         };
         let results = IfOp.execute(&ctx).expect("If op should succeed");
@@ -327,6 +329,7 @@ mod tests {
             node: &node,
             inputs,
             outer_scope: Some(&outer_scope),
+            weights: None,
             registry: Some(&registry),
         };
         let results = IfOp.execute(&ctx).expect("If op should succeed");
@@ -385,6 +388,7 @@ mod tests {
             node: &node,
             inputs,
             outer_scope: Some(&outer_scope),
+            weights: None,
             registry: Some(&registry),
         };
         let results = LoopOp.execute(&ctx).expect("Loop op should succeed");
@@ -422,6 +426,7 @@ mod tests {
             node: &node,
             inputs,
             outer_scope: None,
+            weights: None,
             registry: Some(&registry),
         };
         let results = LoopOp.execute(&ctx).expect("Loop op should succeed");
@@ -468,6 +473,7 @@ mod tests {
             node: &node,
             inputs,
             outer_scope: None,
+            weights: None,
             registry: Some(&registry),
         };
         let results = ScanOp.execute(&ctx).expect("Scan op should succeed");
@@ -523,6 +529,7 @@ mod tests {
             node: &node,
             inputs,
             outer_scope: Some(&outer_scope),
+            weights: None,
             registry: Some(&registry),
         };
         let results = IfOp.execute(&ctx).expect("If op should succeed");

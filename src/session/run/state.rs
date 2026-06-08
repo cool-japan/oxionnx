@@ -52,10 +52,6 @@ impl SessionRunState {
     /// Expose the tensor map as an immutable reference (for GPU dispatch functions
     /// that accept `&HashMap<String, Tensor>`).
     #[inline]
-    #[cfg_attr(
-        not(any(feature = "gpu", feature = "cuda", feature = "directml")),
-        allow(dead_code)
-    )]
     pub(crate) fn as_map(&self) -> &HashMap<String, Tensor> {
         &self.tensors
     }

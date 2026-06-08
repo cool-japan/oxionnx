@@ -341,6 +341,52 @@ pub fn extract_training_info(bytes: &[u8]) -> Result<Vec<crate::types::TrainingI
     Ok(model.training_info)
 }
 
+/// Convert a `GraphProto` subgraph into a runtime `Graph`, prepending synthesized
+/// `Constant` nodes for the subgraph's own initializers and removing those names
+/// from `input_names` (they are not real external inputs).
+fn build_subgraph(
+    gp: &crate::types::GraphProto,
+    weights: &HashMap<String, Tensor>,
+) -> Result<Graph, String> {
+    // Convert the nested graph (nodes, input_names, output_names, etc.)
+    let mut graph = build_graph(gp, weights)?;
+
+    // Convert local initializers into synthesized Constant nodes prepended to the graph.
+    // These initializers are "constants" within the subgraph — they must not appear in
+    // input_names, and must be resolved before any node that references them.
+    let local_init_names: std::collections::HashSet<String> =
+        gp.initializers.iter().map(|i| i.name.clone()).collect();
+
+    // Remove local initializer names from input_names (they are not real graph inputs)
+    graph.input_names.retain(|n| !local_init_names.contains(n));
+    graph
+        .input_infos
+        .retain(|vi| !local_init_names.contains(&vi.name));
+
+    // Prepend one Constant node per local initializer
+    let mut const_nodes: Vec<Node> = gp
+        .initializers
+        .iter()
+        .map(|init| {
+            let mut constant_attrs = Attributes::default();
+            constant_attrs
+                .tensors
+                .insert("value".to_string(), init.to_tensor());
+            Node {
+                op: OpKind::Constant,
+                name: format!("__const_{}", init.name),
+                inputs: vec![],
+                outputs: vec![init.name.clone()],
+                attrs: constant_attrs,
+            }
+        })
+        .collect();
+    const_nodes.append(&mut graph.nodes);
+    graph.nodes = const_nodes;
+
+    Ok(graph)
+}
+
 fn convert_attributes(
     attrs: &[AttributeProto],
     weights: &HashMap<String, Tensor>,
@@ -349,6 +395,14 @@ fn convert_attributes(
     for attr in attrs {
         let name = attr.name.clone();
         let v = &attr.value;
+
+        // Handle graph-valued attributes (If then_branch/else_branch, Loop/Scan body).
+        // These are parsed into AttributeValue.g and do not use attr_type dispatch.
+        if let Some(ref gp) = v.g {
+            a.graphs.insert(name.clone(), build_subgraph(gp, weights)?);
+            continue; // skip the attr_type match for this attribute
+        }
+
         // attr_type: 1=f, 2=i, 3=s, 4=t, 6=floats, 7=ints
         match v.attr_type {
             1 => {
@@ -532,5 +586,78 @@ mod tests {
 
         let result = load(&model_bytes);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_subgraph_attribute_wired_into_graph() {
+        // Build a minimal ONNX model containing an If node whose then_branch carries
+        // a subgraph (a single Relu node). Verify that after load(), the If node's
+        // Attributes.graphs map contains "then_branch" with one Relu node.
+
+        // ── encode a Relu NodeProto ───────────────────────────────────────────
+        let mut relu_node = Vec::new();
+        relu_node.extend(encode_bytes_field(1, b"X")); // input
+        relu_node.extend(encode_bytes_field(2, b"Y")); // output
+        relu_node.extend(encode_bytes_field(3, b"relu_sub")); // name
+        relu_node.extend(encode_bytes_field(4, b"Relu")); // op_type
+
+        // ── encode a GraphProto for then_branch ───────────────────────────────
+        let mut then_graph = Vec::new();
+        then_graph.extend(encode_bytes_field(1, &relu_node)); // node
+        then_graph.extend(encode_bytes_field(2, b"then_branch")); // name
+
+        // ── encode AttributeProto: name="then_branch", g=then_graph, attr_type=5 ──
+        let mut then_attr = Vec::new();
+        then_attr.extend(encode_bytes_field(1, b"then_branch")); // name
+        then_attr.extend(encode_bytes_field(6, &then_graph)); // g: GraphProto (field 6)
+        then_attr.extend(encode_varint_field(20, 5)); // attr_type = GRAPH
+
+        // ── encode an If NodeProto ────────────────────────────────────────────
+        let mut if_node = Vec::new();
+        if_node.extend(encode_bytes_field(1, b"cond")); // input
+        if_node.extend(encode_bytes_field(2, b"result")); // output
+        if_node.extend(encode_bytes_field(3, b"if_op")); // name
+        if_node.extend(encode_bytes_field(4, b"If")); // op_type
+        if_node.extend(encode_bytes_field(5, &then_attr)); // attribute
+
+        // ── encode a GraphProto (outer model graph) ────────────────────────────
+        let mut graph_bytes = Vec::new();
+        graph_bytes.extend(encode_bytes_field(1, &if_node)); // node
+
+        // ── encode a full ModelProto ──────────────────────────────────────────
+        let opset = encode_varint_field(2, 13); // OperatorSetIdProto: version=13
+        let mut model_bytes = encode_varint_field(1, 7); // ir_version=7
+        model_bytes.extend(encode_bytes_field(8, &opset)); // opset_import
+        model_bytes.extend(encode_bytes_field(7, &graph_bytes)); // graph
+
+        let (graph, _weights) = load(&model_bytes).expect("load should succeed");
+
+        // The outer graph has one node: the If node.
+        assert_eq!(graph.nodes.len(), 1);
+        let if_graph_node = &graph.nodes[0];
+
+        // The If node's attrs must contain the then_branch subgraph.
+        assert!(
+            if_graph_node.attrs.graphs.contains_key("then_branch"),
+            "If node must have then_branch in attrs.graphs"
+        );
+
+        let then_branch = if_graph_node
+            .attrs
+            .graphs
+            .get("then_branch")
+            .expect("then_branch must exist");
+
+        // The then_branch subgraph must contain exactly one node: Relu.
+        assert_eq!(
+            then_branch.nodes.len(),
+            1,
+            "then_branch subgraph should have 1 node"
+        );
+        assert_eq!(
+            then_branch.nodes[0].op,
+            oxionnx_core::OpKind::Relu,
+            "then_branch subgraph node must be Relu"
+        );
     }
 }

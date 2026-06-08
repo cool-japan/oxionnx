@@ -275,8 +275,9 @@ impl WasmSession {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub fn wasm_init() {
-    // console_error_panic_hook integration could go here if the crate is added.
-    // For now this is a no-op placeholder that wasm-bindgen requires for start.
+    // Install a panic hook that forwards Rust panics to `console.error`,
+    // giving readable stack traces in the browser devtools.
+    console_error_panic_hook::set_once();
 }
 
 #[cfg(test)]

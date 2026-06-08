@@ -14,6 +14,9 @@ pub struct OpContext<'a> {
     pub inputs: Vec<Option<&'a Tensor>>,
     /// Outer scope tensors for subgraph operators (If, Loop, Scan).
     pub outer_scope: Option<&'a HashMap<String, Tensor>>,
+    /// Model weights, passed by reference so control-flow subgraphs can
+    /// resolve initialiser names without cloning the entire weight map.
+    pub weights: Option<&'a HashMap<String, Tensor>>,
     /// Operator registry for subgraph execution (If, Loop, Scan).
     pub registry: Option<&'a OperatorRegistry>,
 }
@@ -138,6 +141,7 @@ pub trait Operator: Send + Sync {
             node: ctx.node,
             inputs: refs,
             outer_scope: None,
+            weights: None,
             registry: ctx.registry,
         };
         // Execute on f32.
