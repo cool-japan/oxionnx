@@ -1,4 +1,5 @@
 use crate::context::GpuContext;
+use crate::device_guard::{checked_storage_bytes, dispatch_2d_fits, read_back, ErrorScope};
 use oxionnx_core::Tensor;
 use wgpu;
 use wgpu::util::DeviceExt;
@@ -12,6 +13,24 @@ const GPU_THRESHOLD: usize = 10_000_000;
 /// Minimum dimension size for tiled matmul (shared-memory tiles are 16x16).
 const TILED_MIN_DIM: usize = 32;
 
+/// Soft byte budget for the buffers of one batched Conv2D submission.
+///
+/// [a7-21] `gpu_conv2d` groups its `(batch, group)` iterations into chunks that
+/// fit this budget and submits each chunk as a single command buffer with a
+/// single read-back. Batching trades fence latency for a larger *live* working
+/// set: every iteration in a chunk holds its own im2col upload and result
+/// buffer at the same time, where the old one-at-a-time loop reused the same
+/// few megabytes. Measured on Metal with the audit's 32-iteration conv, an
+/// unbounded chunk was slower than the old loop under memory pressure while a
+/// bounded one was consistently faster, so both bounds below are real.
+const CONV_CHUNK_BYTE_BUDGET: u64 = 32 << 20;
+
+/// Hard cap on iterations per submission, independent of their size.
+///
+/// Fence latency is amortized almost completely after a handful of dispatches,
+/// so batching past this point buys little and costs residency.
+const CONV_MAX_CHUNK_ITERS: usize = 16;
+
 /// Uniform buffer params — must match the WGSL `Params` struct layout.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -23,40 +42,40 @@ struct GemmParams {
 }
 
 // ========================================================================
-// Helper: read back a staging buffer into Vec<f32>
+// Helper: GEMM shape / resource validation
 // ========================================================================
 
-/// Read back GPU staging buffer contents into a `Vec<f32>`.
+/// Byte sizes of the three GEMM operands, or `None` when any of them overflows
+/// or exceeds what this device can allocate and bind.
 ///
-/// On wasm32, blocking device poll is not supported, so this returns `None`.
-/// Callers on wasm32 should use async readback instead.
-fn read_back_matmul(
-    _device: &wgpu::Device,
-    _staging: &wgpu::Buffer,
-    _count: usize,
-) -> Option<Vec<f32>> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        // Cannot block on wasm32 — sync readback is not supported.
-        None
+/// `a` is [M, K], `b` is [K, N], `c` is [M, N]. Declining here is what keeps an
+/// `lm_head`-sized projection (`b = [4096, 32000]`, 524 MB) from turning into a
+/// wgpu validation error — which, by default, is a process-wide panic.
+fn gemm_buffer_sizes(
+    ctx: &GpuContext,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<u64> {
+    if m == 0 || k == 0 || n == 0 {
+        return None;
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let slice = _staging.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        _device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        if receiver.recv().ok()?.is_err() {
-            return None;
-        }
-        let data = slice.get_mapped_range();
-        let result: Vec<f32> = bytemuck::cast_slice(&data)[.._count].to_vec();
-        drop(data);
-        _staging.unmap();
-        Some(result)
+    let a_len = m.checked_mul(k)?;
+    let b_len = k.checked_mul(n)?;
+    let c_len = m.checked_mul(n)?;
+    if a.len() < a_len || b.len() < b_len {
+        return None;
     }
+    checked_storage_bytes(&ctx.limits, a_len)?;
+    checked_storage_bytes(&ctx.limits, b_len)?;
+    let c_size = checked_storage_bytes(&ctx.limits, c_len)?;
+    // The staging copy is not bound, but still has to be allocatable.
+    if !ctx.limits.buffer_fits(c_size) {
+        return None;
+    }
+    Some(c_size)
 }
 
 /// Run matrix multiplication on GPU: C = A * B
@@ -74,8 +93,10 @@ pub fn gpu_matmul(
     k: usize,
     n: usize,
 ) -> Option<Vec<f32>> {
-    // Skip GPU for small matrices — overhead not worth it.
-    if m * k * n < GPU_THRESHOLD {
+    // Skip GPU for small matrices — overhead not worth it. A shape whose
+    // product overflows `usize` is nonsensical, not "big enough for the GPU".
+    let flops = m.checked_mul(k)?.checked_mul(n)?;
+    if flops < GPU_THRESHOLD {
         return None;
     }
 
@@ -101,7 +122,7 @@ pub fn gpu_matmul_tiled(
     n: usize,
 ) -> Option<Vec<f32>> {
     // Only use GPU for large enough matrices
-    let flops = m * k * n;
+    let flops = m.checked_mul(k)?.checked_mul(n)?;
     if flops < GPU_THRESHOLD {
         return None;
     }
@@ -123,22 +144,35 @@ fn gpu_matmul_tiled_inner(
     k: usize,
     n: usize,
 ) -> Option<Vec<f32>> {
+    if ctx.is_degraded() {
+        return None;
+    }
+    let c_size = gemm_buffer_sizes(ctx, a, b, m, k, n)?;
+    // Tiled kernel uses workgroup_size(16, 16): dispatch enough workgroups so
+    // global_invocation covers all (col, row) pairs.
+    let wg_x = u32::try_from(n).ok()?.div_ceil(16);
+    let wg_y = u32::try_from(m).ok()?.div_ceil(16);
+    if !dispatch_2d_fits(&ctx.limits, wg_x, wg_y) {
+        return None;
+    }
+
     let device = &ctx.device;
     let queue = &ctx.queue;
 
+    let scope = ErrorScope::begin(ctx);
+
     let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("tiled_A"),
-        contents: bytemuck::cast_slice(a),
+        contents: bytemuck::cast_slice(&a[..m * k]),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
     let b_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("tiled_B"),
-        contents: bytemuck::cast_slice(b),
+        contents: bytemuck::cast_slice(&b[..k * n]),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let c_size = (m * n * std::mem::size_of::<f32>()) as u64;
     let c_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tiled_C"),
         size: c_size,
@@ -199,17 +233,17 @@ fn gpu_matmul_tiled_inner(
         });
         cpass.set_pipeline(&ctx.tiled_matmul_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        // Tiled kernel uses workgroup_size(16, 16): dispatch enough workgroups
-        // so global_invocation covers all (col, row) pairs.
-        let wg_x = (n as u32).div_ceil(16);
-        let wg_y = (m as u32).div_ceil(16);
         cpass.dispatch_workgroups(wg_x, wg_y, 1);
     }
 
     encoder.copy_buffer_to_buffer(&c_buf, 0, &staging_buf, 0, c_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    read_back_matmul(device, &staging_buf, m * n)
+    if !scope.finish(ctx) {
+        return None;
+    }
+
+    read_back(ctx, &staging_buf, m * n)
 }
 
 /// Basic (non-tiled) GPU matmul — used as fallback for matrices with small dimensions.
@@ -221,22 +255,34 @@ fn gpu_matmul_basic(
     k: usize,
     n: usize,
 ) -> Option<Vec<f32>> {
+    if ctx.is_degraded() {
+        return None;
+    }
+    let c_size = gemm_buffer_sizes(ctx, a, b, m, k, n)?;
+    // Basic kernel uses workgroup_size(8, 8) with `gid.x` = row, `gid.y` = col.
+    let wg_x = u32::try_from(m).ok()?.div_ceil(8);
+    let wg_y = u32::try_from(n).ok()?.div_ceil(8);
+    if !dispatch_2d_fits(&ctx.limits, wg_x, wg_y) {
+        return None;
+    }
+
     let device = &ctx.device;
     let queue = &ctx.queue;
 
+    let scope = ErrorScope::begin(ctx);
+
     let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("A"),
-        contents: bytemuck::cast_slice(a),
+        contents: bytemuck::cast_slice(&a[..m * k]),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
     let b_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("B"),
-        contents: bytemuck::cast_slice(b),
+        contents: bytemuck::cast_slice(&b[..k * n]),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let c_size = (m * n * std::mem::size_of::<f32>()) as u64;
     let c_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("C"),
         size: c_size,
@@ -297,18 +343,118 @@ fn gpu_matmul_basic(
         });
         cpass.set_pipeline(&ctx.matmul_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        let wg_x = (m as u32).div_ceil(8);
-        let wg_y = (n as u32).div_ceil(8);
         cpass.dispatch_workgroups(wg_x, wg_y, 1);
     }
 
     encoder.copy_buffer_to_buffer(&c_buf, 0, &staging_buf, 0, c_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    read_back_matmul(device, &staging_buf, m * n)
+    if !scope.finish(ctx) {
+        return None;
+    }
+
+    read_back(ctx, &staging_buf, m * n)
+}
+
+/// How many `(batch, group)` iterations of a conv may share one submission.
+///
+/// Split out from [`gpu_conv2d`] so the bounds are testable without a device.
+/// `per_iter_bytes` is what one iteration holds live (its im2col upload, its
+/// result buffer and its slice of the shared staging buffer); `c_size` is one
+/// result, which the chunk's staging buffer holds `chunk_len` of.
+///
+/// A zero divisor means "this term imposes no bound" — an iteration that costs
+/// no bytes cannot exhaust a byte budget. Returns 0 only for an empty range.
+fn conv_chunk_len(
+    total_iters: usize,
+    per_iter_bytes: u64,
+    c_size: u64,
+    max_buffer_size: u64,
+) -> usize {
+    if total_iters == 0 {
+        return 0;
+    }
+    let by_budget = CONV_CHUNK_BYTE_BUDGET
+        .checked_div(per_iter_bytes)
+        .map_or(total_iters, |v| usize::try_from(v).unwrap_or(usize::MAX));
+    let by_staging = max_buffer_size
+        .checked_div(c_size)
+        .map_or(total_iters, |v| usize::try_from(v).unwrap_or(usize::MAX));
+    by_budget
+        .min(by_staging)
+        .min(CONV_MAX_CHUNK_ITERS)
+        .clamp(1, total_iters)
+}
+
+/// Which GEMM kernel a conv's inner multiply uses, plus its dispatch grid.
+///
+/// Every `(batch, group)` iteration of a conv runs the *same* `[m, k] x [k, n]`
+/// shape, so the kernel choice and the grid are computed once for the whole
+/// call instead of being re-derived per iteration inside `gpu_matmul`.
+struct ConvGemmPlan<'a> {
+    pipeline: &'a wgpu::ComputePipeline,
+    layout: &'a wgpu::BindGroupLayout,
+    wg_x: u32,
+    wg_y: u32,
+}
+
+/// Pick the tiled or basic GEMM kernel for `[m, k] x [k, n]` and validate its
+/// dispatch grid against the device limits. Mirrors `gpu_matmul`'s selection
+/// exactly, so a conv runs the same kernel it always did.
+fn plan_conv_gemm(ctx: &GpuContext, m: usize, k: usize, n: usize) -> Option<ConvGemmPlan<'_>> {
+    if m >= TILED_MIN_DIM && n >= TILED_MIN_DIM && k >= TILED_MIN_DIM {
+        // Tiled kernel: workgroup_size(16, 16), gid.x = col, gid.y = row.
+        let wg_x = u32::try_from(n).ok()?.div_ceil(16);
+        let wg_y = u32::try_from(m).ok()?.div_ceil(16);
+        if !dispatch_2d_fits(&ctx.limits, wg_x, wg_y) {
+            return None;
+        }
+        Some(ConvGemmPlan {
+            pipeline: &ctx.tiled_matmul_pipeline,
+            layout: &ctx.tiled_matmul_bind_group_layout,
+            wg_x,
+            wg_y,
+        })
+    } else {
+        // Basic kernel: workgroup_size(8, 8), gid.x = row, gid.y = col.
+        let wg_x = u32::try_from(m).ok()?.div_ceil(8);
+        let wg_y = u32::try_from(n).ok()?.div_ceil(8);
+        if !dispatch_2d_fits(&ctx.limits, wg_x, wg_y) {
+            return None;
+        }
+        Some(ConvGemmPlan {
+            pipeline: &ctx.matmul_pipeline,
+            layout: &ctx.matmul_bind_group_layout,
+            wg_x,
+            wg_y,
+        })
+    }
 }
 
 /// GPU-accelerated Conv2D: im2col on CPU, GEMM on GPU.
+///
+/// [a7-21] The `(batch, group)` iterations are batched. Previously this loop
+/// called `gpu_matmul` once per iteration, and each call allocated fresh
+/// A/B/C/params/staging buffers, built a bind group, submitted, and then
+/// blocked in `read_back` on `poll(Wait)` before the next iteration could even
+/// start — for a batch of 8 with `group = 4`, 32 serialized submit-and-fence
+/// round trips, each paying the full pipeline-drain latency, plus 160 buffer
+/// allocations that never touched `ctx.pool`.
+///
+/// Now the per-group weight buffers and the GEMM params buffer are created
+/// once for the whole call (their contents do not vary with `batch`), the
+/// iterations are grouped into chunks bounded by `CONV_CHUNK_BYTE_BUDGET`,
+/// and each chunk is encoded into **one** command buffer — a single compute
+/// pass holding every dispatch, then one copy per result into a shared staging
+/// buffer — and submitted and read back **once**. The C buffers are routed
+/// through `ctx.pool` like every other kernel in this crate.
+///
+/// # Numerics
+///
+/// Results are bit-identical to the previous implementation: the same kernel
+/// runs on the same inputs in the same order, only the submission grouping
+/// changed. Each dispatch in a chunk owns distinct col and C buffers, so no
+/// dispatch can observe another's writes.
 ///
 /// Falls back to `None` if the GEMM is too small for GPU benefit.
 #[allow(clippy::too_many_arguments)]
@@ -322,40 +468,170 @@ pub fn gpu_conv2d(
     dilations: [usize; 2],
     group: usize,
 ) -> Option<Tensor> {
-    let n = input.shape[0];
-    let c_in = input.shape[1];
-    let h = input.shape[2];
-    let w = input.shape[3];
-    let c_out = weight.shape[0];
-    let c_per_group = weight.shape[1];
-    let kh = weight.shape[2];
-    let kw = weight.shape[3];
-    let oh = (h + pads[0] + pads[2] - dilations[0] * (kh - 1) - 1) / strides[0] + 1;
-    let ow = (w + pads[1] + pads[3] - dilations[1] * (kw - 1) - 1) / strides[1] + 1;
-
-    let c_out_per_group = c_out / group;
-    let col_rows = c_per_group * kh * kw;
-    let col_cols = oh * ow;
-
-    // Check if the GEMM is large enough for GPU.
-    if c_out_per_group * col_rows * col_cols < GPU_THRESHOLD {
+    // Every dimension here comes from the model file: validate the ranks and
+    // the divisors before doing any arithmetic, so a malformed Conv declines
+    // (and the CPU operator reports a typed error) instead of panicking.
+    if input.shape.len() != 4 || weight.shape.len() != 4 {
+        return None;
+    }
+    let [n, c_in, h, w] = [
+        input.shape[0],
+        input.shape[1],
+        input.shape[2],
+        input.shape[3],
+    ];
+    let [c_out, c_per_group, kh, kw] = [
+        weight.shape[0],
+        weight.shape[1],
+        weight.shape[2],
+        weight.shape[3],
+    ];
+    if group == 0 || strides[0] == 0 || strides[1] == 0 || kh == 0 || kw == 0 {
+        return None;
+    }
+    if c_out % group != 0 || c_in != c_per_group.checked_mul(group)? {
+        return None;
+    }
+    if input.data.len() < n.checked_mul(c_in)?.checked_mul(h)?.checked_mul(w)?
+        || weight.data.len()
+            < c_out
+                .checked_mul(c_per_group)?
+                .checked_mul(kh)?
+                .checked_mul(kw)?
+    {
         return None;
     }
 
-    let mut out = vec![0.0f32; n * c_out * oh * ow];
+    // Output extents, using checked arithmetic: a padded/dilated window larger
+    // than the padded input would underflow `usize`.
+    let padded_h = h.checked_add(pads[0])?.checked_add(pads[2])?;
+    let padded_w = w.checked_add(pads[1])?.checked_add(pads[3])?;
+    let span_h = dilations[0].checked_mul(kh - 1)?.checked_add(1)?;
+    let span_w = dilations[1].checked_mul(kw - 1)?.checked_add(1)?;
+    let oh = padded_h.checked_sub(span_h)? / strides[0] + 1;
+    let ow = padded_w.checked_sub(span_w)? / strides[1] + 1;
 
-    for batch in 0..n {
-        for g in 0..group {
-            let in_c_start = g * c_per_group;
+    let c_out_per_group = c_out / group;
+    let col_rows = c_per_group.checked_mul(kh)?.checked_mul(kw)?;
+    let col_cols = oh.checked_mul(ow)?;
+    if col_rows == 0 || col_cols == 0 || c_out_per_group == 0 {
+        return None;
+    }
+    if let Some(b) = bias {
+        if b.data.len() < c_out {
+            return None;
+        }
+    }
 
-            // im2col on CPU.
-            let mut col = vec![0.0f32; col_rows * col_cols];
+    // Check if the GEMM is large enough for GPU.
+    if c_out_per_group
+        .checked_mul(col_rows)?
+        .checked_mul(col_cols)?
+        < GPU_THRESHOLD
+    {
+        return None;
+    }
+
+    if ctx.is_degraded() {
+        return None;
+    }
+
+    let out_len = n.checked_mul(c_out)?.checked_mul(oh)?.checked_mul(ow)?;
+
+    // Every iteration runs the same GEMM shape, so validate and plan it once.
+    let (gemm_m, gemm_k, gemm_n) = (c_out_per_group, col_rows, col_cols);
+    let a_len = gemm_m.checked_mul(gemm_k)?;
+    let col_len = gemm_k.checked_mul(gemm_n)?;
+    let c_len = gemm_m.checked_mul(gemm_n)?;
+    // All three operands must be allocatable and bindable on this device. The
+    // weight and col buffers are sized by their contents, so for those only the
+    // check matters; `c_size` is also the copy/staging stride below.
+    checked_storage_bytes(&ctx.limits, a_len)?;
+    let col_size = checked_storage_bytes(&ctx.limits, col_len)?;
+    let c_size = checked_storage_bytes(&ctx.limits, c_len)?;
+    let plan = plan_conv_gemm(ctx, gemm_m, gemm_k, gemm_n)?;
+
+    // Flat list of the (batch, group) iterations, in the original order.
+    let total_iters = n.checked_mul(group)?;
+
+    let device = &ctx.device;
+    let mut out = vec![0.0f32; out_len];
+
+    // A zero-length batch has nothing to convolve. The old loop simply never
+    // ran; returning here keeps that behaviour and, more importantly, keeps the
+    // chunk clamp below from being handed an empty range.
+    if total_iters == 0 {
+        return Some(Tensor::new(out, vec![n, c_out, oh, ow]));
+    }
+
+    // How many iterations may share one submission. Each one holds a col
+    // buffer, a C buffer and its slice of the shared staging buffer; the
+    // per-group weight buffers are hoisted out and counted once.
+    let per_iter_bytes = col_size.checked_add(c_size)?.checked_add(c_size)?;
+    let chunk_len = conv_chunk_len(
+        total_iters,
+        per_iter_bytes,
+        c_size,
+        ctx.limits.max_buffer_size,
+    );
+
+    // Hoisted: one buffer per group (weights do not vary with `batch`) and one
+    // params buffer (m/k/n are identical for every iteration).
+    let mut weight_bufs = Vec::with_capacity(group);
+    for g in 0..group {
+        let w_off = g.checked_mul(c_out_per_group)?.checked_mul(col_rows)?;
+        let w_end = w_off.checked_add(a_len)?;
+        let weight_slice = weight.data.get(w_off..w_end)?;
+        weight_bufs.push(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("conv_weight"),
+                contents: bytemuck::cast_slice(weight_slice),
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+        );
+    }
+    let params = GemmParams {
+        m: u32::try_from(gemm_m).ok()?,
+        k: u32::try_from(gemm_k).ok()?,
+        n: u32::try_from(gemm_n).ok()?,
+        _pad: 0,
+    };
+    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("conv_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let mut col = vec![0.0f32; col_len];
+    let mut iter_start = 0usize;
+    while iter_start < total_iters {
+        let this_chunk = chunk_len.min(total_iters - iter_start);
+        let staging_size = c_size.checked_mul(u64::try_from(this_chunk).ok()?)?;
+        if !ctx.limits.buffer_fits(staging_size) {
+            return None;
+        }
+
+        let scope = ErrorScope::begin(ctx);
+
+        // Build every buffer and bind group of the chunk before encoding, so
+        // each dispatch owns distinct col and C buffers — no dispatch in the
+        // pass can observe another's writes, whatever the backend does about
+        // same-usage barriers.
+        let mut col_bufs = Vec::with_capacity(this_chunk);
+        let mut c_bufs = Vec::with_capacity(this_chunk);
+        let mut bind_groups = Vec::with_capacity(this_chunk);
+        for slot in 0..this_chunk {
+            let flat = iter_start + slot;
+            let batch = flat / group;
+            let g = flat % group;
+
+            // im2col on CPU into the reused scratch buffer.
             im2col(
                 &input.data,
                 c_in,
                 h,
                 w,
-                in_c_start,
+                g * c_per_group,
                 c_per_group,
                 kh,
                 kw,
@@ -367,29 +643,119 @@ pub fn gpu_conv2d(
                 batch,
                 &mut col,
             );
+            col_bufs.push(
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("conv_col"),
+                    contents: bytemuck::cast_slice(&col),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+            );
+            let c_buf = {
+                let mut pool = ctx.pool.lock().ok()?;
+                pool.get_buffer(
+                    device,
+                    c_size,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                )
+            };
+            bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("conv_gemm_bg"),
+                layout: plan.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weight_bufs.get(g)?.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: col_bufs.get(slot)?.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: c_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            }));
+            c_bufs.push(c_buf);
+        }
 
-            // GEMM on GPU: weight_slice[c_out_per_group, col_rows] * col[col_rows, col_cols]
-            let w_off = g * c_out_per_group * col_rows;
-            let w_end = w_off + c_out_per_group * col_rows;
-            let weight_slice = &weight.data[w_off..w_end];
+        let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("conv_staging"),
+            size: staging_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-            let gemm_result =
-                gpu_matmul(ctx, weight_slice, &col, c_out_per_group, col_rows, col_cols)?;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("conv_enc"),
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("conv_gemm_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(plan.pipeline);
+            for bind_group in &bind_groups {
+                cpass.set_bind_group(0, bind_group, &[]);
+                cpass.dispatch_workgroups(plan.wg_x, plan.wg_y, 1);
+            }
+        }
+        // One copy per result into the shared staging buffer. `c_size` is a
+        // multiple of 4 (it is a count of f32s), so every destination offset
+        // satisfies `COPY_BUFFER_ALIGNMENT`.
+        for (slot, c_buf) in c_bufs.iter().enumerate() {
+            let dst = c_size.checked_mul(u64::try_from(slot).ok()?)?;
+            encoder.copy_buffer_to_buffer(c_buf, 0, &staging_buf, dst, c_size);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
 
-            // Copy result + add bias on CPU.
-            let o_off = (batch * c_out + g * c_out_per_group) * col_cols;
-            out[o_off..o_off + c_out_per_group * col_cols].copy_from_slice(&gemm_result);
+        if !scope.finish(ctx) {
+            return None;
+        }
+
+        let chunk_data = read_back(ctx, &staging_buf, c_len.checked_mul(this_chunk)?)?;
+
+        // The read-back completed, so the submission has retired and the C
+        // buffers are safe to recycle.
+        if let Ok(mut pool) = ctx.pool.lock() {
+            for c_buf in c_bufs {
+                pool.return_buffer(c_buf);
+            }
+        }
+
+        // Scatter each result into its place in the output, adding bias.
+        for slot in 0..this_chunk {
+            let flat = iter_start + slot;
+            let batch = flat / group;
+            let g = flat % group;
+            let gemm_result = chunk_data.get(slot * c_len..(slot + 1) * c_len)?;
+
+            let o_off = batch
+                .checked_mul(c_out)?
+                .checked_add(g.checked_mul(c_out_per_group)?)?
+                .checked_mul(col_cols)?;
+            let o_end = o_off.checked_add(c_out_per_group.checked_mul(col_cols)?)?;
+            let out_slice = out.get_mut(o_off..o_end)?;
+            if out_slice.len() != gemm_result.len() {
+                return None;
+            }
+            out_slice.copy_from_slice(gemm_result);
 
             if let Some(b) = bias {
-                for oc in 0..c_out_per_group {
-                    let bv = b.data[g * c_out_per_group + oc];
-                    let start = o_off + oc * col_cols;
-                    for j in 0..col_cols {
-                        out[start + j] += bv;
+                for (oc, chunk) in out_slice.chunks_exact_mut(col_cols).enumerate() {
+                    let bv = *b.data.get(g * c_out_per_group + oc)?;
+                    for value in chunk.iter_mut() {
+                        *value += bv;
                     }
                 }
             }
         }
+
+        iter_start += this_chunk;
     }
 
     Some(Tensor::new(out, vec![n, c_out, oh, ow]))
@@ -452,7 +818,6 @@ fn im2col(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::GpuTensorTracker;
 
     /// CPU reference matmul for verification.
     fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -595,50 +960,75 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // a7-21 — conv chunk planning (pure arithmetic, no device needed)
+    // ------------------------------------------------------------------
+
+    const HUGE_BUFFER: u64 = 8 << 30;
+
     #[test]
-    fn test_gpu_tensor_tracker() {
-        // Test tracker store, check, take operations (no GPU needed)
-        let mut tracker = GpuTensorTracker::new();
-        assert_eq!(tracker.count(), 0);
-        assert!(!tracker.is_on_gpu("tensor_a"));
+    fn conv_chunk_len_batches_small_iterations_and_caps_at_the_limit() {
+        // The audit's conv: col = 72 * 8836 f32, C = 16 * 8836 f32.
+        let col_size = 72 * 8836 * 4;
+        let c_size = 16 * 8836 * 4;
+        let per_iter = col_size + 2 * c_size;
+        let chunk = conv_chunk_len(32, per_iter, c_size, HUGE_BUFFER);
+        assert!(
+            (2..=CONV_MAX_CHUNK_ITERS).contains(&chunk),
+            "expected a real batch bounded by the cap, got {chunk}"
+        );
+        // Never more than the hard cap, however cheap the iterations are.
+        assert_eq!(
+            conv_chunk_len(1000, 1, 1, HUGE_BUFFER),
+            CONV_MAX_CHUNK_ITERS
+        );
+        // Never more iterations than exist.
+        assert_eq!(conv_chunk_len(3, 1, 1, HUGE_BUFFER), 3);
+    }
 
-        // We cannot create real wgpu::Buffer without a device, so test
-        // the logic with an actual GPU context if available.
-        let ctx = match GpuContext::try_new() {
-            Some(ctx) => ctx,
-            None => return,
+    #[test]
+    fn conv_chunk_len_degenerates_to_one_for_huge_iterations() {
+        // An im2col matrix larger than the whole budget: one per submission,
+        // i.e. exactly the pre-a7-21 behaviour, so a big conv cannot regress.
+        let per_iter = CONV_CHUNK_BYTE_BUDGET * 2;
+        assert_eq!(conv_chunk_len(32, per_iter, 1 << 20, HUGE_BUFFER), 1);
+    }
+
+    #[test]
+    fn conv_chunk_len_respects_the_staging_buffer_limit() {
+        // A device that can only allocate 4 results' worth must not be asked
+        // for a staging buffer holding more than that.
+        let c_size = 1 << 20;
+        assert_eq!(conv_chunk_len(32, 1, c_size, c_size * 4), 4);
+    }
+
+    #[test]
+    fn conv_chunk_len_handles_degenerate_inputs_without_panicking() {
+        // An empty iteration range must not reach `clamp(1, 0)`.
+        assert_eq!(conv_chunk_len(0, 1024, 1024, HUGE_BUFFER), 0);
+        // Zero-byte divisors mean "no bound from this term", never a divide by
+        // zero; the cap still applies.
+        assert_eq!(conv_chunk_len(4, 0, 0, HUGE_BUFFER), 4);
+        assert_eq!(conv_chunk_len(100, 0, 0, 0), CONV_MAX_CHUNK_ITERS);
+        // The result is always a usable chunk size for a non-empty range.
+        assert!(conv_chunk_len(7, u64::MAX, u64::MAX, 1) >= 1);
+    }
+
+    #[test]
+    fn test_gpu_conv2d_zero_batch_returns_an_empty_tensor() {
+        let Some(ctx) = GpuContext::try_new() else {
+            return;
         };
-
-        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test_tracker"),
-            size: 1024,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        tracker.store("tensor_a".to_string(), buf, 1024);
-        assert!(tracker.is_on_gpu("tensor_a"));
-        assert!(!tracker.is_on_gpu("tensor_b"));
-        assert_eq!(tracker.count(), 1);
-
-        let taken = tracker.take("tensor_a");
-        assert!(taken.is_some());
-        let (_, size) = taken.expect("just checked");
-        assert_eq!(size, 1024);
-        assert!(!tracker.is_on_gpu("tensor_a"));
-        assert_eq!(tracker.count(), 0);
-
-        // Test clear
-        let buf2 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test_tracker2"),
-            size: 2048,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        tracker.store("tensor_b".to_string(), buf2, 2048);
-        assert_eq!(tracker.count(), 1);
-        tracker.clear();
-        assert_eq!(tracker.count(), 0);
+        // N = 0 used to run the loop zero times; the batched path must reach
+        // the same answer rather than dividing by, or clamping to, an empty
+        // range. Shapes come from model files, so this must never panic.
+        let input = Tensor::new(Vec::new(), vec![0, 32, 96, 96]);
+        let weight = Tensor::new(vec![0.5; 32 * 32 * 9], vec![32, 32, 3, 3]);
+        let result = gpu_conv2d(&ctx, &input, &weight, None, [1, 1], [0, 0, 0, 0], [1, 1], 1);
+        if let Some(out) = result {
+            assert_eq!(out.shape, vec![0, 32, 94, 94]);
+            assert!(out.data.is_empty());
+        }
     }
 
     #[test]

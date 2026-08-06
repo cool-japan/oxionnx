@@ -28,12 +28,7 @@ impl Operator for GatherOp {
         let data = ctx.input(0)?;
         let indices = ctx.input(1)?;
         let axis_raw = ctx.attrs().i("axis", 0);
-        let ndim = data.shape.len();
-        let axis = if axis_raw < 0 {
-            (axis_raw + ndim as i64) as usize
-        } else {
-            axis_raw as usize
-        };
+        let axis = indexing::normalize_axis(axis_raw, data.shape.len(), "Gather")?;
         // Output shape: data.shape[..axis] ++ indices.shape ++ data.shape[axis+1..]
         let out_shape: Vec<usize> = data.shape[..axis]
             .iter()
@@ -46,7 +41,7 @@ impl Operator for GatherOp {
             slots[0].data.resize(out_len, 0.0_f32);
         }
         slots[0].shape.clone_from(&out_shape);
-        indexing::gather_into(data, &indices.data, axis, &mut slots[0].data);
+        indexing::gather_into(data, &indices.data, axis, &mut slots[0].data)?;
         Ok(())
     }
 }
@@ -119,8 +114,9 @@ impl Operator for ScatterElementsOp {
         let indices = ctx.input(1)?;
         let updates = ctx.input(2)?;
         let axis = ctx.attrs().i("axis", 0);
-        Ok(vec![indexing::scatter_elements(
-            data, indices, updates, axis,
+        let reduction = indexing::ScatterReduction::parse(ctx.attrs().s("reduction"))?;
+        Ok(vec![indexing::scatter_elements_reduce(
+            data, indices, updates, axis, reduction,
         )?])
     }
     fn supports_output_slots(&self) -> bool {
@@ -135,12 +131,8 @@ impl Operator for ScatterElementsOp {
         let indices = ctx.input(1)?;
         let updates = ctx.input(2)?;
         let axis_raw = ctx.attrs().i("axis", 0);
-        let ndim = data.shape.len();
-        let axis = if axis_raw < 0 {
-            (axis_raw + ndim as i64) as usize
-        } else {
-            axis_raw as usize
-        };
+        let axis = indexing::normalize_axis(axis_raw, data.shape.len(), "ScatterElements")?;
+        let reduction = indexing::ScatterReduction::parse(ctx.attrs().s("reduction"))?;
         if slots[0].data.len() != data.data.len() {
             slots[0].data.resize(data.data.len(), 0.0_f32);
         }
@@ -152,8 +144,9 @@ impl Operator for ScatterElementsOp {
             &indices.data,
             &updates.data,
             axis,
+            reduction,
             &mut slots[0].data,
-        );
+        )?;
         Ok(())
     }
 }
@@ -169,7 +162,10 @@ impl Operator for ScatterNDOp {
         let data = ctx.input(0)?;
         let indices = ctx.input(1)?;
         let updates = ctx.input(2)?;
-        Ok(vec![indexing::scatter_nd(data, indices, updates)?])
+        let reduction = indexing::ScatterReduction::parse(ctx.attrs().s("reduction"))?;
+        Ok(vec![indexing::scatter_nd_reduce(
+            data, indices, updates, reduction,
+        )?])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -182,7 +178,10 @@ impl Operator for ScatterNDOp {
         let data = ctx.input(0)?;
         let indices = ctx.input(1)?;
         let updates = ctx.input(2)?;
-        let k = indices.shape.last().copied().unwrap_or(0);
+        let k = *indices.shape.last().ok_or_else(|| {
+            OnnxError::ShapeMismatch("ScatterND: indices must be at least 1D".to_string())
+        })?;
+        let reduction = indexing::ScatterReduction::parse(ctx.attrs().s("reduction"))?;
         if slots[0].data.len() != data.data.len() {
             slots[0].data.resize(data.data.len(), 0.0_f32);
         }
@@ -193,8 +192,9 @@ impl Operator for ScatterNDOp {
             k,
             &indices.data,
             &updates.data,
+            reduction,
             &mut slots[0].data,
-        );
+        )?;
         Ok(())
     }
 }
@@ -210,7 +210,8 @@ impl Operator for QuantizeLinearOp {
         let x = ctx.input(0)?;
         let scale = ctx.input(1)?;
         let zp = ctx.optional_input(2);
-        Ok(vec![indexing::quantize_linear(x, scale, zp)?])
+        let axis = ctx.attrs().i("axis", 1);
+        Ok(vec![indexing::quantize_linear_axis(x, scale, zp, axis)?])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -228,7 +229,8 @@ impl Operator for DequantizeLinearOp {
         let x = ctx.input(0)?;
         let scale = ctx.input(1)?;
         let zp = ctx.optional_input(2);
-        Ok(vec![indexing::dequantize_linear(x, scale, zp)?])
+        let axis = ctx.attrs().i("axis", 1);
+        Ok(vec![indexing::dequantize_linear_axis(x, scale, zp, axis)?])
     }
     fn supports_output_slots(&self) -> bool {
         true

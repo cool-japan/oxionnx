@@ -13,7 +13,7 @@ use oxionnx_core::operator::{OpContext, Operator};
 use oxionnx_core::tensor::Tensor;
 use std::collections::HashMap;
 
-use super::functions::{concatenate_tensors_axis0, execute_subgraph};
+use super::functions::{execute_subgraph, stack_tensors_axis0};
 use super::types::LoopOp;
 
 impl Operator for LoopOp {
@@ -69,16 +69,23 @@ impl Operator for LoopOp {
                     break;
                 }
             }
+            // The Loop body signature declares `iteration_num` and `cond` as rank-0 scalars
+            // (`tensor(int64)` / `tensor(bool)` with no dimensions), so feed them as genuine
+            // rank-0 tensors rather than the legacy `[1]` of `Tensor::scalar`. Body graphs
+            // that read `data[0]` — which is every consumer in this engine — behave
+            // identically at either rank; what changes is a body that inspects the value's
+            // `Shape`, or broadcasts it against a carried dependency, where a stray leading
+            // axis would propagate into the result.
             let mut subgraph_inputs = HashMap::new();
             if let Some(iter_name) = body.input_names.first() {
                 if !iter_name.is_empty() {
-                    subgraph_inputs.insert(iter_name.clone(), Tensor::scalar(iteration as f32));
+                    subgraph_inputs.insert(iter_name.clone(), Tensor::rank0(iteration as f32));
                 }
             }
             if let Some(cond_name) = body.input_names.get(1) {
                 if !cond_name.is_empty() {
                     let cond_val = if condition { 1.0_f32 } else { 0.0_f32 };
-                    subgraph_inputs.insert(cond_name.clone(), Tensor::scalar(cond_val));
+                    subgraph_inputs.insert(cond_name.clone(), Tensor::rank0(cond_val));
                 }
             }
             for (i, dep) in carried_deps.iter().enumerate() {
@@ -124,8 +131,15 @@ impl Operator for LoopOp {
             if accumulator.is_empty() {
                 final_outputs.push(Tensor::new(vec![], vec![0]));
             } else {
-                let concatenated = concatenate_tensors_axis0(&accumulator)?;
-                final_outputs.push(concatenated);
+                // ONNX shape inference for Loop (and ONNX Runtime's LoopImpl)
+                // build scan outputs as `[num_iterations] + per_iteration_shape`,
+                // i.e. a NEW leading axis, not a concatenation along an
+                // existing axis 0. Use `stack_tensors_axis0` (already used by
+                // ScanOp for the identical accumulation pattern) so a
+                // per-iteration shape [K] over N iterations yields [N, K]
+                // rather than collapsing to [N*K].
+                let stacked = stack_tensors_axis0(&accumulator)?;
+                final_outputs.push(stacked);
             }
         }
         Ok(final_outputs)

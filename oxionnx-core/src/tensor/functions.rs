@@ -2,6 +2,13 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
+// `alloc`-backed types/macros, imported unconditionally: `alloc` is always
+// linked by the crate root (see lib.rs), and `alloc::vec::Vec` /
+// `alloc::string::String` are the exact same items as `std::vec::Vec` /
+// `std::string::String`, so this resolves identically whether or not the
+// `std` feature is enabled.
+use alloc::{format, string::String, vec, vec::Vec};
+
 use super::types::{Tensor, TensorLayout};
 
 /// Convert a tensor from NCHW to NHWC layout.

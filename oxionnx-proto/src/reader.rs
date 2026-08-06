@@ -20,7 +20,7 @@
 //! The error type used by this module is [`ReaderError`]. Downstream error
 //! enums typically wrap it via `#[from]` so `?`-propagation keeps working.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
@@ -28,16 +28,58 @@ use crate::types::{AttributeProto, TensorProto};
 
 /// ONNX element-type codes understood by [`bytes_to_f32`].
 ///
-/// The numeric values come from the ONNX `TensorProto::DataType` enum. Only
-/// the floating-point subset that this module can decode directly is
-/// exposed here; richer consumers should consult the full ONNX spec.
+/// The numeric values come from the ONNX `TensorProto::DataType` enum. Every
+/// fixed-width numeric dtype is listed; codes without a constant here
+/// (`STRING`, `COMPLEX64/128`, the `FLOAT8*` and 4-bit families) cannot be
+/// decoded into `f32` by this crate and are reported through
+/// [`ReaderError::UnsupportedDtype`].
 pub mod dtype_code {
+    /// Sentinel used by `TensorProto.data_type` when the field is unset.
+    pub const UNDEFINED: i32 = 0;
     /// IEEE 754 `float32`.
     pub const FLOAT32: i32 = 1;
+    /// Unsigned 8-bit integer.
+    pub const UINT8: i32 = 2;
+    /// Signed 8-bit integer.
+    pub const INT8: i32 = 3;
+    /// Unsigned 16-bit integer.
+    pub const UINT16: i32 = 4;
+    /// Signed 16-bit integer.
+    pub const INT16: i32 = 5;
+    /// Signed 32-bit integer.
+    pub const INT32: i32 = 6;
+    /// Signed 64-bit integer.
+    pub const INT64: i32 = 7;
+    /// UTF-8 string (not convertible to `f32`).
+    pub const STRING: i32 = 8;
+    /// Boolean, one byte per element in `raw_data`.
+    pub const BOOL: i32 = 9;
     /// IEEE 754 `float16`.
     pub const FLOAT16: i32 = 10;
+    /// IEEE 754 `float64`.
+    pub const DOUBLE: i32 = 11;
+    /// Unsigned 32-bit integer.
+    pub const UINT32: i32 = 12;
+    /// Unsigned 64-bit integer.
+    pub const UINT64: i32 = 13;
     /// Brain floating-point `bfloat16`.
     pub const BFLOAT16: i32 = 16;
+}
+
+/// Size in bytes of one `raw_data` element of `data_type`.
+///
+/// Returns `None` for dtypes this crate cannot decode into `f32`
+/// (`STRING`, complex, `FLOAT8*`, 4-bit families, and `UNDEFINED`).
+pub fn dtype_size_bytes(data_type: i32) -> Option<usize> {
+    match data_type {
+        dtype_code::BOOL | dtype_code::INT8 | dtype_code::UINT8 => Some(1),
+        dtype_code::FLOAT16 | dtype_code::BFLOAT16 | dtype_code::INT16 | dtype_code::UINT16 => {
+            Some(2)
+        }
+        dtype_code::FLOAT32 | dtype_code::INT32 | dtype_code::UINT32 => Some(4),
+        dtype_code::DOUBLE | dtype_code::INT64 | dtype_code::UINT64 => Some(8),
+        _ => None,
+    }
 }
 
 /// ONNX `AttributeProto::AttributeType` codes used by the typed attribute
@@ -61,7 +103,12 @@ pub mod attr_type {
 ///
 /// Downstream error enums typically wrap this via `#[from]` so `?`
 /// propagation continues to work unchanged in callers.
+///
+/// `#[non_exhaustive]`: new reader failure modes may be added as more of the
+/// ONNX wire format is covered. Downstream `match`es need a wildcard arm;
+/// existing variants remain constructible as before.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ReaderError {
     /// I/O failure while reading a file (`.onnx` or sidecar).
     #[error("I/O error for {path:?}: {source}")]
@@ -100,6 +147,73 @@ pub enum ReaderError {
         dtype: i32,
     },
 
+    /// A raw byte payload is not a whole number of elements of its dtype.
+    #[error(
+        "tensor '{tensor}': raw data length {len} is not a multiple of \
+         element size {elem_size} (dtype {dtype})"
+    )]
+    RaggedRawData {
+        /// Tensor name.
+        tensor: String,
+        /// ONNX dtype code.
+        dtype: i32,
+        /// Byte length of the payload.
+        len: usize,
+        /// Size of one element in bytes.
+        elem_size: usize,
+    },
+
+    /// A `TensorProto.dims` entry is negative or too large for this platform.
+    #[error("tensor '{tensor}': invalid dimension {dim}")]
+    InvalidDim {
+        /// Tensor name.
+        tensor: String,
+        /// Offending dimension as declared on the wire.
+        dim: i64,
+    },
+
+    /// The product of `TensorProto.dims` overflows `usize`.
+    #[error("tensor '{tensor}': shape {dims:?} overflows the addressable range")]
+    ShapeOverflow {
+        /// Tensor name.
+        tensor: String,
+        /// Declared dimensions.
+        dims: Vec<i64>,
+    },
+
+    /// The decoded payload does not hold exactly `product(dims)` elements.
+    #[error("tensor '{tensor}': expected {expected} elements for shape {dims:?}, found {found}")]
+    ElementCountMismatch {
+        /// Tensor name.
+        tensor: String,
+        /// Declared dimensions.
+        dims: Vec<i64>,
+        /// Element count implied by `dims`.
+        expected: usize,
+        /// Element count actually decoded.
+        found: usize,
+    },
+
+    /// A non-empty initializer carries no data in any field.
+    #[error("tensor '{tensor}': no tensor data (expected {expected} elements)")]
+    MissingTensorData {
+        /// Tensor name.
+        tensor: String,
+        /// Element count implied by `dims`.
+        expected: usize,
+    },
+
+    /// An `external_data` `location` is unusable or escapes the model directory.
+    #[error("tensor '{tensor}': external data location '{location}' rejected ({reason})")]
+    InvalidExternalLocation {
+        /// Tensor name.
+        tensor: String,
+        /// Location string as it appeared in the model.
+        location: String,
+        /// Why the location was rejected.
+        reason: &'static str,
+    },
+
     /// A catch-all for miscellaneous reader errors.
     #[error("{0}")]
     Other(String),
@@ -121,31 +235,148 @@ pub fn external_entry<'a>(tensor: &'a TensorProto, key: &str) -> Option<&'a str>
 
 /// Convert raw little-endian bytes of a supported dtype into a `Vec<f32>`.
 ///
-/// Returns [`ReaderError::UnsupportedDtype`] if `data_type` is anything
-/// other than float32, float16, or bfloat16.
+/// This is the single dtype table shared by every `raw_data` / external-data
+/// decoding path in the crate. Integer dtypes are widened to `f32`, `BOOL`
+/// maps to `0.0` / `1.0`, and `FLOAT16` / `BFLOAT16` are converted through
+/// `half`.
+///
+/// Returns [`ReaderError::UnsupportedDtype`] for dtypes that have no `f32`
+/// representation here (`STRING`, complex, `FLOAT8*`, 4-bit families) and
+/// [`ReaderError::RaggedRawData`] when `bytes` is not a whole number of
+/// elements.
 pub fn bytes_to_f32(
     bytes: &[u8],
     data_type: i32,
     tensor_name: &str,
 ) -> Result<Vec<f32>, ReaderError> {
-    match data_type {
-        dtype_code::FLOAT32 => Ok(bytes
+    let elem_size = dtype_size_bytes(data_type).ok_or_else(|| ReaderError::UnsupportedDtype {
+        tensor: tensor_name.to_string(),
+        dtype: data_type,
+    })?;
+    if bytes.len() % elem_size != 0 {
+        return Err(ReaderError::RaggedRawData {
+            tensor: tensor_name.to_string(),
+            dtype: data_type,
+            len: bytes.len(),
+            elem_size,
+        });
+    }
+    let values: Vec<f32> = match data_type {
+        // Hot path first: float32 weights dominate real models.
+        dtype_code::FLOAT32 => bytes
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect()),
-        dtype_code::FLOAT16 => Ok(bytes
+            .collect(),
+        dtype_code::FLOAT16 => bytes
             .chunks_exact(2)
             .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect()),
-        dtype_code::BFLOAT16 => Ok(bytes
+            .collect(),
+        dtype_code::BFLOAT16 => bytes
             .chunks_exact(2)
             .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect()),
-        other => Err(ReaderError::UnsupportedDtype {
-            tensor: tensor_name.to_string(),
-            dtype: other,
-        }),
+            .collect(),
+        dtype_code::UINT8 => bytes.iter().map(|&b| f32::from(b)).collect(),
+        dtype_code::INT8 => bytes.iter().map(|&b| f32::from(b as i8)).collect(),
+        dtype_code::BOOL => bytes
+            .iter()
+            .map(|&b| if b != 0 { 1.0 } else { 0.0 })
+            .collect(),
+        dtype_code::UINT16 => bytes
+            .chunks_exact(2)
+            .map(|b| f32::from(u16::from_le_bytes([b[0], b[1]])))
+            .collect(),
+        dtype_code::INT16 => bytes
+            .chunks_exact(2)
+            .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])))
+            .collect(),
+        dtype_code::INT32 => bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32)
+            .collect(),
+        dtype_code::UINT32 => bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32)
+            .collect(),
+        dtype_code::INT64 => bytes
+            .chunks_exact(8)
+            .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+            .collect(),
+        dtype_code::UINT64 => bytes
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+            .collect(),
+        dtype_code::DOUBLE => bytes
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+            .collect(),
+        other => {
+            return Err(ReaderError::UnsupportedDtype {
+                tensor: tensor_name.to_string(),
+                dtype: other,
+            })
+        }
+    };
+    Ok(values)
+}
+
+/// Resolve an `external_data` `location` against the directory holding the
+/// model, refusing anything that would read outside it.
+///
+/// The ONNX spec requires `location` to be a relative path below the model
+/// directory. A model is untrusted input, so this rejects absolute paths,
+/// Windows path prefixes, and `..` traversal (in both separator flavours),
+/// then canonicalizes the result and verifies it is still inside the
+/// canonicalized model directory — which also defeats symlink escapes.
+pub fn resolve_external_path(
+    base_dir: &Path,
+    location: &str,
+    tensor_name: &str,
+) -> Result<PathBuf, ReaderError> {
+    let reject = |reason: &'static str| ReaderError::InvalidExternalLocation {
+        tensor: tensor_name.to_string(),
+        location: location.to_string(),
+        reason,
+    };
+
+    if location.is_empty() {
+        return Err(reject("empty location"));
     }
+    // Checked on the raw string so a Windows-style `..\\..\\x` is rejected on
+    // Unix too, where it would otherwise parse as a single normal component.
+    if location.starts_with('/') || location.starts_with('\\') {
+        return Err(reject("absolute path"));
+    }
+    if location.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(reject("parent-directory traversal"));
+    }
+
+    let relative = Path::new(location);
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => return Err(reject("parent-directory traversal")),
+            Component::RootDir | Component::Prefix(_) => return Err(reject("absolute path")),
+        }
+    }
+
+    let base = if base_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        base_dir
+    };
+    let base_canonical = base.canonicalize().map_err(|e| ReaderError::Io {
+        path: base.to_path_buf(),
+        source: e,
+    })?;
+    let joined = base_canonical.join(relative);
+    let resolved = joined.canonicalize().map_err(|e| ReaderError::Io {
+        path: joined.clone(),
+        source: e,
+    })?;
+    if !resolved.starts_with(&base_canonical) {
+        return Err(reject("resolves outside the model directory"));
+    }
+    Ok(resolved)
 }
 
 /// Read an integer attribute from the `i` field of an ONNX attribute list.
@@ -219,7 +450,7 @@ mod mmap_reader {
 
     use memmap2::Mmap;
 
-    use super::{external_entry, is_external, ReaderError};
+    use super::{external_entry, is_external, resolve_external_path, ReaderError};
     use crate::parser::parse_model;
     use crate::types::{ModelProto, TensorProto};
 
@@ -307,8 +538,9 @@ mod mmap_reader {
                 });
             }
 
-            // Ensure the sidecar is memory-mapped.
-            let sidecar_path = self.base_dir.join(location);
+            // Ensure the sidecar is memory-mapped. The location comes from an
+            // untrusted model, so it is sandboxed inside the model directory.
+            let sidecar_path = resolve_external_path(&self.base_dir, location, &tensor.name)?;
             self.ensure_sidecar_mapped(&sidecar_path)?;
 
             let mmap = self
@@ -403,14 +635,82 @@ mod tests {
 
     #[test]
     fn bytes_to_f32_unsupported_dtype_errors() {
-        let err = bytes_to_f32(&[0, 0, 0, 0], 7 /* int64 */, "t").expect_err("must err");
+        // int64 (7) is decodable now; STRING (8) has no f32 representation.
+        let err = bytes_to_f32(&[0, 0, 0, 0], dtype_code::STRING, "t").expect_err("must err");
         match err {
             ReaderError::UnsupportedDtype { tensor, dtype } => {
                 assert_eq!(tensor, "t");
-                assert_eq!(dtype, 7);
+                assert_eq!(dtype, dtype_code::STRING);
             }
             other => panic!("expected UnsupportedDtype, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bytes_to_f32_decodes_integer_dtypes() {
+        // int64 [-1, 2]
+        let raw: Vec<u8> = [-1i64, 2]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        assert_eq!(
+            bytes_to_f32(&raw, dtype_code::INT64, "t").expect("ok"),
+            vec![-1.0, 2.0]
+        );
+        // int8 0xFF => -1, uint8 0xFF => 255
+        assert_eq!(
+            bytes_to_f32(&[0xFF], dtype_code::INT8, "t").expect("ok"),
+            vec![-1.0]
+        );
+        assert_eq!(
+            bytes_to_f32(&[0xFF], dtype_code::UINT8, "t").expect("ok"),
+            vec![255.0]
+        );
+        // bool: any non-zero byte is true
+        assert_eq!(
+            bytes_to_f32(&[0, 1, 7], dtype_code::BOOL, "t").expect("ok"),
+            vec![0.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn bytes_to_f32_rejects_ragged_payload() {
+        // 6 bytes is not a whole number of float32 elements.
+        let err = bytes_to_f32(&[0u8; 6], dtype_code::FLOAT32, "t").expect_err("must err");
+        assert!(
+            matches!(err, ReaderError::RaggedRawData { elem_size: 4, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_external_path_rejects_escapes() {
+        let dir = std::env::temp_dir().join("oxionnx_reader_sandbox");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("w.bin"), [1u8, 2, 3]).expect("write");
+
+        // Legitimate relative location resolves inside the model directory.
+        let ok = resolve_external_path(&dir, "w.bin", "t").expect("relative location");
+        assert!(ok.ends_with("w.bin"));
+        assert!(resolve_external_path(&dir, "./w.bin", "t").is_ok());
+
+        for bad in [
+            "/etc/passwd",
+            "../../etc/passwd",
+            "..\\..\\secret",
+            "",
+            "\\x",
+        ] {
+            let err = resolve_external_path(&dir, bad, "t")
+                .err()
+                .unwrap_or_else(|| panic!("location {bad:?} must be rejected"));
+            assert!(
+                matches!(err, ReaderError::InvalidExternalLocation { .. }),
+                "location {bad:?}: got {err:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn attr(name: &str, value: AttributeValue) -> AttributeProto {

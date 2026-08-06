@@ -58,30 +58,30 @@ fn tanh_op_impl(x: &Tensor) -> Tensor {
 
 /// GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 pub fn gelu(x: &Tensor) -> Tensor {
-    gelu_impl(x)
-}
-
-#[cfg(feature = "simd")]
-fn gelu_impl(x: &Tensor) -> Tensor {
     let mut data = x.data.clone();
-    crate::simd_ops::simd_gelu(&mut data);
+    gelu_slice(&mut data);
     Tensor::new(data, x.shape.clone())
 }
 
+/// In-place tanh-approximation GELU over a raw slice. Every GeluOp execution
+/// path (`execute` / `execute_inplace` / `execute_into_slots`) must route
+/// through this single kernel: the "simd" feature would otherwise introduce
+/// cross-path ULP divergence between allocating and in-place variants.
+#[cfg(feature = "simd")]
+pub fn gelu_slice(data: &mut [f32]) {
+    crate::simd_ops::simd_gelu(data);
+}
+
+/// See the `simd` variant above — scalar fallback, same formula.
 #[cfg(not(feature = "simd"))]
-fn gelu_impl(x: &Tensor) -> Tensor {
+pub fn gelu_slice(data: &mut [f32]) {
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     const COEF: f32 = 0.044_715;
-    Tensor::new(
-        x.data
-            .iter()
-            .map(|&v| {
-                let inner = SQRT_2_OVER_PI * (v + COEF * v * v * v);
-                0.5 * v * (1.0 + inner.tanh())
-            })
-            .collect(),
-        x.shape.clone(),
-    )
+    for v in data.iter_mut() {
+        let x = *v;
+        let inner = SQRT_2_OVER_PI * (x + COEF * x * x * x);
+        *v = 0.5 * x * (1.0 + inner.tanh());
+    }
 }
 
 /// LeakyRelu: f(x) = x if x >= 0, alpha * x if x < 0

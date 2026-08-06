@@ -10,6 +10,17 @@ pub fn depth_to_space(x: &Tensor, blocksize: usize, mode: &str) -> Result<Tensor
     if x.ndim() != 4 {
         return Err("depth_to_space: input must be 4D [N,C,H,W]".into());
     }
+    // Must be checked before `c_total % (r * r)` below: `r = 0` makes that a
+    // modulo-by-zero, which is a hard Rust panic ("attempt to calculate the
+    // remainder with a divisor of zero"), not a typed error. A negative ONNX
+    // `blocksize` attribute cannot reach here as a negative value -- the
+    // caller (`registry/shape_ops/spatial_ops.rs`) converts it with `as
+    // usize` before calling in, which wraps a negative `i64` to a huge
+    // `usize` rather than to 0; that wraparound belongs at the `i64`
+    // boundary, not here (see `deferred` in this wave's report).
+    if blocksize == 0 {
+        return Err("depth_to_space: blocksize must be greater than 0".into());
+    }
     let (n, c_total, h, w) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
     let r = blocksize;
     if c_total % (r * r) != 0 {
@@ -52,6 +63,12 @@ pub fn depth_to_space(x: &Tensor, blocksize: usize, mode: &str) -> Result<Tensor
 pub fn space_to_depth(x: &Tensor, blocksize: usize) -> Result<Tensor, String> {
     if x.ndim() != 4 {
         return Err("space_to_depth: input must be 4D [N,C,H,W]".into());
+    }
+    // Same reasoning as `depth_to_space` above: `r = 0` makes `h % r` / `w %
+    // r` below a modulo-by-zero panic rather than a typed error, and must be
+    // rejected first.
+    if blocksize == 0 {
+        return Err("space_to_depth: blocksize must be greater than 0".into());
     }
     let (n, c, h, w) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
     let r = blocksize;

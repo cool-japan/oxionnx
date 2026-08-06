@@ -35,7 +35,12 @@ pub enum MlComputeUnits {
     All,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "visionos"
+))]
 impl MlComputeUnits {
     /// Project to the underlying `MLComputeUnits` constant.
     #[inline]
@@ -93,5 +98,152 @@ impl ComputePlanSummary {
         } else {
             (self.ane_ops as f64) / (n as f64)
         }
+    }
+
+    /// Merge `other`'s per-device counts into `self`, field-by-field.
+    ///
+    /// A pure, model-free accumulation primitive with no `objc2`/CoreML
+    /// dependency — the same routine
+    /// [`crate::MlPackageModel::compute_plan_summary`] uses to fold
+    /// every `MLProgram` function's classified operations into one
+    /// flat histogram, and
+    /// [`crate::MlPackageModel::compute_plan_breakdown`] uses to fold
+    /// same-named operations (e.g. three separate `"gather"` ops
+    /// scattered across the graph) into that operator's single
+    /// breakdown entry. Because both entry points build on this exact
+    /// merge, summing every entry of `compute_plan_breakdown`'s map
+    /// always reconciles with `compute_plan_summary`'s totals for the
+    /// same model.
+    #[inline]
+    pub fn merge(&mut self, other: &Self) {
+        self.ane_ops += other.ane_ops;
+        self.gpu_ops += other.gpu_ops;
+        self.cpu_ops += other.cpu_ops;
+        self.unknown_ops += other.unknown_ops;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `merge` must sum every field independently — no cross-field
+    /// bleed, no dropped counts.
+    #[test]
+    fn merge_sums_fields_from_both_operands() {
+        let mut a = ComputePlanSummary {
+            ane_ops: 3,
+            gpu_ops: 1,
+            cpu_ops: 0,
+            unknown_ops: 2,
+        };
+        let b = ComputePlanSummary {
+            ane_ops: 5,
+            gpu_ops: 0,
+            cpu_ops: 4,
+            unknown_ops: 1,
+        };
+        a.merge(&b);
+        assert_eq!(a.ane_ops, 8);
+        assert_eq!(a.gpu_ops, 1);
+        assert_eq!(a.cpu_ops, 4);
+        assert_eq!(a.unknown_ops, 3);
+    }
+
+    /// Merging in a `Default::default()` summary (the zero element)
+    /// must be a no-op — required for `HashMap::entry(...).or_default()`
+    /// accumulation (as `compute_plan_breakdown` uses) to behave
+    /// correctly for an operator name's first-seen occurrence.
+    #[test]
+    fn merge_with_default_is_identity() {
+        let before = ComputePlanSummary {
+            ane_ops: 7,
+            gpu_ops: 2,
+            cpu_ops: 1,
+            unknown_ops: 0,
+        };
+        let mut a = before;
+        a.merge(&ComputePlanSummary::default());
+        assert_eq!(a.ane_ops, before.ane_ops);
+        assert_eq!(a.gpu_ops, before.gpu_ops);
+        assert_eq!(a.cpu_ops, before.cpu_ops);
+        assert_eq!(a.unknown_ops, before.unknown_ops);
+    }
+
+    /// Mirrors how `accumulate_program_operations` (in
+    /// `package::macos_impl`) folds one single-field delta per
+    /// classified operation into a running total: merging N
+    /// single-op deltas must yield `total_ops() == N`, and the flat
+    /// total must equal the sum of the same deltas folded into a
+    /// per-operator-name breakdown map — the reconciliation
+    /// invariant `compute_plan_breakdown`'s model-driven test
+    /// exercises end-to-end.
+    #[test]
+    fn merging_single_op_deltas_reconciles_flat_and_keyed_totals() {
+        let classified_ops = [
+            (
+                "conv",
+                ComputePlanSummary {
+                    ane_ops: 1,
+                    ..ComputePlanSummary::default()
+                },
+            ),
+            (
+                "gather",
+                ComputePlanSummary {
+                    gpu_ops: 1,
+                    ..ComputePlanSummary::default()
+                },
+            ),
+            (
+                "gather",
+                ComputePlanSummary {
+                    cpu_ops: 1,
+                    ..ComputePlanSummary::default()
+                },
+            ),
+            (
+                "const",
+                ComputePlanSummary {
+                    unknown_ops: 1,
+                    ..ComputePlanSummary::default()
+                },
+            ),
+        ];
+
+        let mut flat = ComputePlanSummary::default();
+        let mut breakdown: std::collections::HashMap<&str, ComputePlanSummary> =
+            std::collections::HashMap::new();
+        for (name, delta) in &classified_ops {
+            flat.merge(delta);
+            breakdown.entry(name).or_default().merge(delta);
+        }
+
+        assert_eq!(flat.total_ops(), 4);
+        assert_eq!(flat.compute_ops(), 3);
+        assert_eq!(flat.ane_ops, 1);
+        assert_eq!(flat.gpu_ops, 1);
+        assert_eq!(flat.cpu_ops, 1);
+        assert_eq!(flat.unknown_ops, 1);
+
+        // "gather" appeared twice (once GPU, once CPU) and must have
+        // accumulated into a single entry, not overwritten itself.
+        let gather = breakdown.get("gather").copied().unwrap_or_default();
+        assert_eq!(gather.gpu_ops, 1);
+        assert_eq!(gather.cpu_ops, 1);
+        assert_eq!(gather.total_ops(), 2);
+
+        // Summing every breakdown entry must reconcile exactly with
+        // the flat total — the core invariant this whole feature
+        // exists to guarantee.
+        let mut reconciled = ComputePlanSummary::default();
+        for per_op in breakdown.values() {
+            reconciled.merge(per_op);
+        }
+        assert_eq!(reconciled.total_ops(), flat.total_ops());
+        assert_eq!(reconciled.ane_ops, flat.ane_ops);
+        assert_eq!(reconciled.gpu_ops, flat.gpu_ops);
+        assert_eq!(reconciled.cpu_ops, flat.cpu_ops);
+        assert_eq!(reconciled.unknown_ops, flat.unknown_ops);
     }
 }

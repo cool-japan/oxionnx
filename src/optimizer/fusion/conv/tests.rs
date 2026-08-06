@@ -36,12 +36,12 @@ fn test_fuse_conv_batchnorm() {
     weights.insert("bn_mean".to_string(), Tensor::new(vec![0.0], vec![1]));
     weights.insert("bn_var".to_string(), Tensor::new(vec![1.0], vec![1]));
 
-    let result = fuse_conv_batchnorm(nodes, &mut weights);
+    let result = fuse_conv_batchnorm(nodes, &mut weights, &["bn_out".to_string()]);
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::Conv));
     assert_eq!(result[0].outputs[0], "bn_out");
-    assert!(weights.contains_key("conv_fused_weight"));
-    assert!(weights.contains_key("conv_fused_bias"));
+    assert!(weights.contains_key("conv_out_fused_weight"));
+    assert!(weights.contains_key("conv_out_fused_bias"));
 }
 
 #[test]
@@ -66,15 +66,15 @@ fn test_fuse_conv_batchnorm_no_conv_bias() {
     weights.insert("bn_mean".to_string(), Tensor::new(vec![1.0], vec![1]));
     weights.insert("bn_var".to_string(), Tensor::new(vec![4.0], vec![1]));
 
-    let result = fuse_conv_batchnorm(nodes, &mut weights);
+    let result = fuse_conv_batchnorm(nodes, &mut weights, &["bn_out".to_string()]);
     assert_eq!(result.len(), 1);
 
-    let fused_w = weights.get("conv_fused_weight").expect("fused weight");
+    let fused_w = weights.get("conv_out_fused_weight").expect("fused weight");
     let inv_std = 1.0 / (4.0f32 + 1e-5).sqrt();
     let expected_w = 2.0 * 3.0 * inv_std;
     assert!((fused_w.data[0] - expected_w).abs() < 1e-5);
 
-    let fused_b = weights.get("conv_fused_bias").expect("fused bias");
+    let fused_b = weights.get("conv_out_fused_bias").expect("fused bias");
     let expected_b = (0.0 - 1.0) * 3.0 * inv_std + 0.5;
     assert!((fused_b.data[0] - expected_b).abs() < 1e-5);
 }
@@ -108,7 +108,7 @@ fn test_fuse_conv_batchnorm_multiple_consumers() {
     weights.insert("bn_mean".to_string(), Tensor::new(vec![0.0], vec![1]));
     weights.insert("bn_var".to_string(), Tensor::new(vec![1.0], vec![1]));
 
-    let result = fuse_conv_batchnorm(nodes, &mut weights);
+    let result = fuse_conv_batchnorm(nodes, &mut weights, &["bn_out".to_string()]);
     assert_eq!(result.len(), 3);
 }
 
@@ -118,7 +118,7 @@ fn test_fuse_conv_relu() {
     let relu = make_node(OpKind::Relu, "relu", vec!["conv_out"], vec!["relu_out"]);
 
     let nodes = vec![conv, relu];
-    let result = fuse_conv_relu(nodes);
+    let result = fuse_conv_relu(nodes, &HashMap::new(), &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::Conv));
@@ -134,7 +134,7 @@ fn test_fuse_conv_clip_as_relu() {
     clip.attrs.floats.insert("max".to_string(), f32::INFINITY);
 
     let nodes = vec![conv, clip];
-    let result = fuse_conv_relu(nodes);
+    let result = fuse_conv_relu(nodes, &HashMap::new(), &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::Conv));
@@ -150,7 +150,7 @@ fn test_fuse_conv_clip_general() {
     clip.attrs.floats.insert("max".to_string(), 6.0);
 
     let nodes = vec![conv, clip];
-    let result = fuse_conv_relu(nodes);
+    let result = fuse_conv_relu(nodes, &HashMap::new(), &[]);
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].attrs.s("activation"), "clip");
@@ -170,7 +170,7 @@ fn test_fuse_conv_relu_no_fusion_multiple_consumers() {
     );
 
     let nodes = vec![conv, relu, add];
-    let result = fuse_conv_relu(nodes);
+    let result = fuse_conv_relu(nodes, &HashMap::new(), &[]);
 
     assert_eq!(result.len(), 3);
 }
@@ -185,11 +185,11 @@ fn test_fuse_conv_clip_to_conv_relu6_basic() {
     clip.attrs.floats.insert("max".to_string(), 6.0);
 
     let nodes = vec![conv, clip];
-    let result = fuse_conv_clip_to_conv_relu6(nodes);
+    let result = fuse_conv_clip_to_conv_relu6(nodes, &HashMap::new(), &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::Conv));
-    assert_eq!(result[0].attrs.s("activation"), "relu6");
+    assert_eq!(result[0].attrs.s("activation"), "clip");
     assert_eq!(result[0].attrs.f("activation_min", -1.0), 0.0);
     assert_eq!(result[0].attrs.f("activation_max", -1.0), 6.0);
     assert_eq!(result[0].outputs, vec!["clip_out"]);
@@ -203,7 +203,7 @@ fn test_fuse_conv_clip_to_conv_relu6_wrong_range() {
     clip.attrs.floats.insert("max".to_string(), 1.0); // Not 6.0
 
     let nodes = vec![conv, clip];
-    let result = fuse_conv_clip_to_conv_relu6(nodes);
+    let result = fuse_conv_clip_to_conv_relu6(nodes, &HashMap::new(), &[]);
 
     // Not ReLU6 range, no fusion
     assert_eq!(result.len(), 2);
@@ -218,7 +218,7 @@ fn test_fuse_conv_clip_to_conv_relu6_not_conv() {
     clip.attrs.floats.insert("max".to_string(), 6.0);
 
     let nodes = vec![relu, clip];
-    let result = fuse_conv_clip_to_conv_relu6(nodes);
+    let result = fuse_conv_clip_to_conv_relu6(nodes, &HashMap::new(), &[]);
 
     assert_eq!(result.len(), 2);
 }
@@ -237,7 +237,7 @@ fn test_fuse_conv_clip_to_conv_relu6_multiple_consumers() {
     );
 
     let nodes = vec![conv, clip, add];
-    let result = fuse_conv_clip_to_conv_relu6(nodes);
+    let result = fuse_conv_clip_to_conv_relu6(nodes, &HashMap::new(), &[]);
 
     // conv_out has 2 consumers, no fusion
     assert_eq!(result.len(), 3);
@@ -284,11 +284,11 @@ fn test_fold_batch_norm_inference_basic() {
     let expected_factor = 2.0 * inv_std;
     let expected_shift = 0.5 - 1.0 * expected_factor;
 
-    let factor = weights.get("bn_bn_factor").expect("factor weight");
+    let factor = weights.get("bn_out_bn_factor").expect("factor weight");
     assert_eq!(factor.shape, vec![1, 1, 1, 1]);
     assert!((factor.data[0] - expected_factor).abs() < 1e-5);
 
-    let shift = weights.get("bn_bn_shift").expect("shift weight");
+    let shift = weights.get("bn_out_bn_shift").expect("shift weight");
     assert_eq!(shift.shape, vec![1, 1, 1, 1]);
     assert!((shift.data[0] - expected_shift).abs() < 1e-5);
 }
@@ -384,9 +384,9 @@ fn test_fold_batch_norm_inference_multi_channel() {
     assert!(matches!(result[0].op, OpKind::Mul));
     assert!(matches!(result[1].op, OpKind::Add));
 
-    let factor = weights.get("bn_bn_factor").expect("factor");
+    let factor = weights.get("bn_out_bn_factor").expect("factor");
     assert_eq!(factor.shape, vec![1, 3, 1, 1]);
-    let shift = weights.get("bn_bn_shift").expect("shift");
+    let shift = weights.get("bn_out_bn_shift").expect("shift");
     assert_eq!(shift.shape, vec![1, 3, 1, 1]);
 
     // Verify channel 0: scale=1.0, var=1.0, eps=0.001
@@ -470,9 +470,9 @@ fn test_fold_batch_norm_resnet_arcface_first_layer() {
 
     // Synthesized constants must broadcast against `[N, C, H, W]` under strict
     // NumPy alignment from the trailing dim — i.e. `[1, C, 1, 1]`.
-    let factor = weights.get("bn_bn_factor").expect("factor weight");
+    let factor = weights.get("bn_out_bn_factor").expect("factor weight");
     assert_eq!(factor.shape, vec![1, c, 1, 1]);
-    let shift = weights.get("bn_bn_shift").expect("shift weight");
+    let shift = weights.get("bn_out_bn_shift").expect("shift weight");
     assert_eq!(shift.shape, vec![1, c, 1, 1]);
 
     // Build a deterministic input tensor and run both paths.
@@ -529,7 +529,7 @@ fn test_fuse_conv_add_relu_basic() {
     let relu = make_node(OpKind::Relu, "relu", vec!["add_out"], vec!["relu_out"]);
 
     let nodes = vec![conv, add, relu];
-    let result = fuse_conv_add_relu(nodes);
+    let result = fuse_conv_add_relu(nodes, &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::ConvAddRelu));
@@ -550,7 +550,7 @@ fn test_fuse_conv_add_relu_reversed_add_inputs() {
     let relu = make_node(OpKind::Relu, "relu", vec!["add_out"], vec!["relu_out"]);
 
     let nodes = vec![conv, add, relu];
-    let result = fuse_conv_add_relu(nodes);
+    let result = fuse_conv_add_relu(nodes, &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::ConvAddRelu));
@@ -570,7 +570,7 @@ fn test_fuse_conv_add_relu_no_bias() {
     let relu = make_node(OpKind::Relu, "relu", vec!["add_out"], vec!["relu_out"]);
 
     let nodes = vec![conv, add, relu];
-    let result = fuse_conv_add_relu(nodes);
+    let result = fuse_conv_add_relu(nodes, &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::ConvAddRelu));
@@ -593,7 +593,7 @@ fn test_fuse_conv_add_relu_no_fusion_conv_multiple_consumers() {
     let extra = make_node(OpKind::Relu, "extra", vec!["conv_out"], vec!["extra_out"]);
 
     let nodes = vec![conv, add, relu, extra];
-    let result = fuse_conv_add_relu(nodes);
+    let result = fuse_conv_add_relu(nodes, &[]);
 
     assert_eq!(result.len(), 4);
     assert!(matches!(result[0].op, OpKind::Conv));
@@ -613,7 +613,7 @@ fn test_fuse_conv_add_relu_no_fusion_add_multiple_consumers() {
     let extra = make_node(OpKind::Sigmoid, "extra", vec!["add_out"], vec!["extra_out"]);
 
     let nodes = vec![conv, add, relu, extra];
-    let result = fuse_conv_add_relu(nodes);
+    let result = fuse_conv_add_relu(nodes, &[]);
 
     assert_eq!(result.len(), 4);
     assert!(matches!(result[0].op, OpKind::Conv));
@@ -632,7 +632,7 @@ fn test_fuse_conv_add_relu_no_fusion_not_relu() {
     let sigmoid = make_node(OpKind::Sigmoid, "sigmoid", vec!["add_out"], vec!["sig_out"]);
 
     let nodes = vec![conv, add, sigmoid];
-    let result = fuse_conv_add_relu(nodes);
+    let result = fuse_conv_add_relu(nodes, &[]);
 
     // No fusion: pattern requires Relu at the end
     assert_eq!(result.len(), 3);

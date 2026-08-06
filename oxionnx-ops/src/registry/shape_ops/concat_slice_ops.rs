@@ -3,6 +3,7 @@
 use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
 
 use crate::shape;
+use crate::shape::basic::normalize_axis;
 
 // ── Concat ───────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,40 @@ impl Operator for SliceOp {
 
 // ── Expand ───────────────────────────────────────────────────────────────────
 
+/// Read Expand's `shape` input as non-negative dimension sizes.
+///
+/// ONNX's `shape` input is a 1-D int64 tensor; unlike Reshape's `-1`/`0` sentinels, Expand
+/// defines no meaning for a negative entry. Casting one straight to `usize` (`v as usize`)
+/// wraps to a value near `usize::MAX`, which — since the corresponding input dimension is
+/// often `1` (an ordinary broadcast), so `Tensor::broadcast_shape` happily accepts the huge
+/// target — previously reached `vec![0.0f32; n]` and panicked with "capacity overflow".
+fn resolve_expand_shape(shape_tensor: &Tensor) -> Result<Vec<usize>, OnnxError> {
+    shape_tensor
+        .data
+        .iter()
+        .map(|&v| {
+            let iv = v as i64;
+            if iv < 0 {
+                Err(OnnxError::ShapeMismatch(format!(
+                    "Expand: shape entries must be non-negative, got {iv}"
+                )))
+            } else {
+                Ok(iv as usize)
+            }
+        })
+        .collect()
+}
+
+/// Compute the total element count of `shape`, rejecting a `usize` overflow instead of letting
+/// it silently wrap (debug builds would instead panic on the wrap) into a nonsensical
+/// allocation size.
+fn checked_numel(shape: &[usize], op: &str) -> Result<usize, OnnxError> {
+    shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| OnnxError::ShapeMismatch(format!("{op}: output element count overflows")))
+}
+
 pub struct ExpandOp;
 impl Operator for ExpandOp {
     fn op_type(&self) -> &str {
@@ -60,7 +95,9 @@ impl Operator for ExpandOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
-        let new_shape: Vec<usize> = ctx.input(1)?.data.iter().map(|&v| v as usize).collect();
+        let new_shape = resolve_expand_shape(ctx.input(1)?)?;
+        let out_shape = Tensor::broadcast_shape(&x.shape, &new_shape)?;
+        checked_numel(&out_shape, "Expand")?;
         Ok(vec![crate::indexing::expand(x, &new_shape)?])
     }
     fn supports_output_slots(&self) -> bool {
@@ -75,9 +112,9 @@ impl Operator for ExpandOp {
             return Ok(());
         }
         let x = ctx.input(0)?;
-        let shape_in: Vec<usize> = ctx.input(1)?.data.iter().map(|&v| v as usize).collect();
+        let shape_in = resolve_expand_shape(ctx.input(1)?)?;
         let out_shape = Tensor::broadcast_shape(&x.shape, &shape_in)?;
-        let n: usize = out_shape.iter().product();
+        let n: usize = checked_numel(&out_shape, "Expand")?;
 
         let ndim = out_shape.len();
         let pad = ndim - x.shape.len();
@@ -118,6 +155,12 @@ impl Operator for ExpandOp {
 // ── Split ────────────────────────────────────────────────────────────────────
 
 /// Build equal-sized split chunks for a given axis length and count.
+///
+/// Always returns exactly `n` entries (when `n > 0`), including trailing zero-size chunks: a
+/// Split node with `num_outputs` greater than what `axis_len` can fill evenly still declares
+/// `num_outputs` graph outputs, and every one of them must be bound to *some* tensor (a
+/// zero-size one is a valid, well-defined ONNX tensor) or the graph's later output names go
+/// unresolved.
 fn equal_split(axis_len: usize, n: usize) -> Vec<usize> {
     if n == 0 {
         return vec![];
@@ -128,7 +171,6 @@ fn equal_split(axis_len: usize, n: usize) -> Vec<usize> {
             let start = i * chunk;
             (start + chunk).min(axis_len).saturating_sub(start)
         })
-        .filter(|&s| s > 0)
         .collect()
 }
 
@@ -142,11 +184,10 @@ impl Operator for SplitOp {
         let attrs = ctx.attrs();
         let axis = attrs.i("axis", 0);
         let ndim = x.ndim();
-        let ax_u = if axis < 0 {
-            (axis + ndim as i64) as usize
-        } else {
-            axis as usize
-        };
+        // Bounds-checked up front: previously this indexed `x.shape[ax_u]` below with no range
+        // check (unlike `execute_into_slots`), so an out-of-range `axis` attribute panicked
+        // here instead of returning a typed error.
+        let ax_u = normalize_axis(axis, ndim).map_err(OnnxError::ShapeMismatch)?;
         let num_outputs = ctx.node.outputs.len().max(1);
         let split_attr = attrs.ints("split");
         let split_sizes: Vec<usize> = if let Some(t) = ctx.optional_input(1) {
@@ -178,16 +219,7 @@ impl Operator for SplitOp {
         let attrs = ctx.attrs();
         let axis = attrs.i("axis", 0);
         let ndim = x.ndim();
-        let ax_u = if axis < 0 {
-            (axis + ndim as i64) as usize
-        } else {
-            axis as usize
-        };
-        if ax_u >= ndim {
-            return Err(OnnxError::ShapeMismatch(format!(
-                "Split: axis {ax_u} out of range for {ndim}D tensor"
-            )));
-        }
+        let ax_u = normalize_axis(axis, ndim).map_err(OnnxError::ShapeMismatch)?;
         let num_outputs = slots.len().max(1);
         let split_attr = attrs.ints("split");
         let split_sizes: Vec<usize> = if let Some(t) = ctx.optional_input(1) {
@@ -219,8 +251,10 @@ impl Operator for SplitOp {
                 slots.len()
             )));
         }
-        let outer: usize = x.shape[..ax_u].iter().product::<usize>().max(1);
-        let inner: usize = x.shape[ax_u + 1..].iter().product::<usize>().max(1);
+        // Empty-slice products are already 1; clamping via `.max(1)` would corrupt a
+        // genuinely zero-size leading/trailing dim (see `shape::split`).
+        let outer: usize = x.shape[..ax_u].iter().product();
+        let inner: usize = x.shape[ax_u + 1..].iter().product();
         let mut start = 0usize;
         for (slot_i, &chunk) in split_sizes.iter().enumerate() {
             let n_out = outer * chunk * inner;

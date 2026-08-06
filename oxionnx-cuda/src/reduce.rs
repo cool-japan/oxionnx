@@ -1,31 +1,56 @@
 //! CUDA-accelerated ReduceSum / ReduceMax dispatch.
 //!
-//! The underlying PTX template performs a flat N-to-1 block reduction (3 kernel
-//! parameters: `input_ptr`, `output_ptr`, `n`).  We therefore only accelerate
-//! the case where `axis` is the *only* axis and the slice to reduce covers the
-//! entire tensor (i.e. `outer == 1 && inner == 1`).  All other configurations
-//! return `Ok(None)` and fall back to the CPU path.
+//! Delegates to [`oxicuda_blas::reduction::reduce_axis`], which views the
+//! tensor as `[outer, axis_len, inner]` around the reduced axis and launches
+//! one thread block per `(outer_idx, inner_idx)` output pair; each block
+//! accumulates `axis_len` elements with a strided per-thread loop
+//! (`k = tid, tid + block_size, tid + 2*block_size, ...`) followed by a
+//! shared-memory tree reduction. That loop is what makes this correct for
+//! *any* `axis_len` — not just axis lengths up to the block size — and for
+//! any `outer`/`inner` combination, not just the whole-tensor-reduction
+//! case the previous hand-rolled integration
+//! (`oxicuda_ptx::templates::reduction::ReductionTemplate`, a single-block
+//! kernel with exactly one element read per thread and no accumulation
+//! loop) was limited to.
 
-use std::sync::Arc;
-
-use oxicuda_driver::Module;
-use oxicuda_launch::{Dim3, Kernel, LaunchParams};
+use oxicuda_blas::reduction::{reduce_axis, ReductionOp};
 use oxicuda_memory::DeviceBuffer;
-use oxicuda_ptx::{
-    ir::PtxType,
-    templates::reduction::{ReductionOp, ReductionTemplate},
-};
 
 use crate::context::CudaContext;
 use crate::error::CudaDispatchError;
 
-const REDUCE_BLOCK_SIZE: u32 = 256;
+/// Decompose `shape` around `axis` into `(outer, axis_len, inner)`, and
+/// decide whether this is a configuration [`cuda_reduce`] will attempt (as
+/// opposed to declining to the CPU).
+///
+/// Pure and allocation-free, so the axis/shape bookkeeping is unit-testable
+/// without a CUDA device — unlike the GPU launch itself, which cannot be
+/// exercised on a host with no CUDA device.
+///
+/// Declines (`None`) when:
+/// - `axis` is out of range for `shape` (a malformed model).
+/// - The reduction would touch zero elements (`outer`, `axis_len`, or
+///   `inner` is `0`): a degenerate edge case left to the CPU kernel's
+///   identity-element handling rather than special-cased here.
+fn reduce_plan(shape: &[usize], axis: usize) -> Option<(usize, usize, usize)> {
+    if axis >= shape.len() {
+        return None;
+    }
+    let outer: usize = shape[..axis].iter().product();
+    let axis_len = shape[axis];
+    let inner: usize = shape[axis + 1..].iter().product();
+    if outer == 0 || axis_len == 0 || inner == 0 {
+        return None;
+    }
+    Some((outer, axis_len, inner))
+}
 
 /// GPU reduction for a single axis.
 ///
-/// Returns `Ok(None)` when the configuration is not handled by the flat
-/// reduction template (non-trivial outer or inner dimensions).  The caller
-/// should fall back to CPU in that case.
+/// `shape` is decomposed as `[outer, axis_len, inner]` around `axis` (see
+/// `reduce_plan` in this module). Returns `Ok(None)` — deferring to the
+/// CPU — when the plan declines, or when a dimension doesn't fit the
+/// kernel's `u32` launch parameters (the CPU path has no such limit).
 pub fn cuda_reduce(
     ctx: &CudaContext,
     data: &[f32],
@@ -33,18 +58,9 @@ pub fn cuda_reduce(
     axis: usize,
     op_name: &str,
 ) -> Result<Option<Vec<f32>>, CudaDispatchError> {
-    if axis >= shape.len() {
+    let Some((outer, axis_len, inner)) = reduce_plan(shape, axis) else {
         return Ok(None);
-    }
-
-    let outer: usize = shape[..axis].iter().product();
-    let inner: usize = shape[axis + 1..].iter().product();
-    let axis_len = shape[axis];
-
-    // Only handle the flat full-tensor case.
-    if outer != 1 || inner != 1 {
-        return Ok(None);
-    }
+    };
 
     let reduce_op = match op_name {
         "ReduceSum" => ReductionOp::Sum,
@@ -57,43 +73,120 @@ pub fn cuda_reduce(
         }
     };
 
-    let sm = ctx.dnn.sm_version();
-    let template = ReductionTemplate {
-        op: reduce_op,
-        precision: PtxType::F32,
-        target: sm,
-        block_size: REDUCE_BLOCK_SIZE,
+    let (Ok(outer_u32), Ok(axis_len_u32), Ok(inner_u32)) = (
+        u32::try_from(outer),
+        u32::try_from(axis_len),
+        u32::try_from(inner),
+    ) else {
+        // A dimension too large for a u32-indexed CUDA kernel launch.
+        return Ok(None);
     };
-    let kernel_name = template.kernel_name();
+    let Some(output_len) = outer.checked_mul(inner) else {
+        return Ok(None);
+    };
 
-    let ptx = template
-        .generate()
-        .map_err(|e| CudaDispatchError::Ptx(e.to_string()))?;
-
-    let module = Arc::new(Module::from_ptx(&ptx).map_err(CudaDispatchError::Driver)?);
-    let kernel = Kernel::from_module(module, &kernel_name).map_err(CudaDispatchError::Driver)?;
-
-    let n = axis_len;
-    let mut d_input: DeviceBuffer<f32> = DeviceBuffer::alloc(n)?;
+    let mut d_input: DeviceBuffer<f32> = DeviceBuffer::alloc(data.len())?;
     d_input.copy_from_host(data)?;
+    let mut d_output: DeviceBuffer<f32> = DeviceBuffer::zeroed(output_len)?;
 
-    // Output is a single scalar.
-    let d_output: DeviceBuffer<f32> = DeviceBuffer::zeroed(1)?;
+    reduce_axis(
+        ctx.dnn.blas(),
+        reduce_op,
+        outer_u32,
+        axis_len_u32,
+        inner_u32,
+        &d_input,
+        &mut d_output,
+    )
+    .map_err(|e| CudaDispatchError::Blas(e.to_string()))?;
 
-    // Launch a single block large enough to cover `n` elements.
-    let block = REDUCE_BLOCK_SIZE;
-    let grid: u32 = 1;
-    let params = LaunchParams::new(Dim3::from(grid), Dim3::from(block));
-
-    let stream = ctx.dnn.stream();
-    let args = (d_input.as_device_ptr(), d_output.as_device_ptr(), n as u32);
-    kernel
-        .launch(&params, stream, &args)
+    // `reduce_axis` launches on `handle.stream()` — the same stream `ctx.dnn`
+    // owns — without synchronizing internally; block until the kernel
+    // completes before reading results back to the host (mirrors
+    // `matmul::cuda_matmul`'s explicit synchronize-then-copy-back pattern).
+    ctx.dnn
+        .stream()
+        .synchronize()
         .map_err(CudaDispatchError::Driver)?;
 
-    stream.synchronize().map_err(CudaDispatchError::Driver)?;
-
-    let mut result = vec![0.0_f32; 1];
+    let mut result = vec![0.0_f32; output_len];
     d_output.copy_to_host(&mut result)?;
     Ok(Some(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── reduce_plan: pure decomposition/decline logic, no CUDA needed ──────
+
+    #[test]
+    fn plan_rejects_out_of_range_axis() {
+        assert_eq!(reduce_plan(&[2, 3], 5), None);
+        assert_eq!(reduce_plan(&[2, 3], 2), None);
+    }
+
+    #[test]
+    fn plan_decomposes_a_middle_axis() {
+        // [2, 3, 4], axis=1 -> outer=2 (dims before), axis_len=3, inner=4 (dims after).
+        assert_eq!(reduce_plan(&[2, 3, 4], 1), Some((2, 3, 4)));
+    }
+
+    #[test]
+    fn plan_decomposes_the_first_axis() {
+        // [2, 3, 4], axis=0 -> outer=1 (empty product), axis_len=2, inner=12.
+        assert_eq!(reduce_plan(&[2, 3, 4], 0), Some((1, 2, 12)));
+    }
+
+    #[test]
+    fn plan_decomposes_the_last_axis() {
+        // [2, 3, 4], axis=2 -> outer=6, axis_len=4, inner=1 (empty product).
+        assert_eq!(reduce_plan(&[2, 3, 4], 2), Some((6, 4, 1)));
+    }
+
+    /// The exact motivating case from the a8-1 finding: a 1-D tensor with
+    /// more than `REDUCE_BLOCK_SIZE` (256) elements. The previous
+    /// hand-rolled single-block-of-256 kernel silently truncated this to
+    /// elements `0..255`; the plan itself now has no such ceiling — the
+    /// truncation is gone at the decomposition level (the strided
+    /// accumulation loop inside `oxicuda_blas::reduction::reduce_axis`,
+    /// which cannot be exercised on this host, is what proves the *kernel*
+    /// side; this proves the *decision to attempt it at all* is no longer
+    /// gated on `axis_len <= 256`).
+    #[test]
+    fn plan_no_longer_caps_axis_len_at_the_block_size() {
+        let axis_len = 1024;
+        assert_eq!(reduce_plan(&[axis_len], 0), Some((1, axis_len, 1)));
+    }
+
+    /// Before this fix, `cuda_reduce` only ever attempted the
+    /// whole-tensor-reduction case (`outer == 1 && inner == 1`). The plan
+    /// now accepts general `outer`/`inner`, which is what lets CUDA claim
+    /// e.g. a per-channel reduction over an NCHW tensor.
+    #[test]
+    fn plan_no_longer_requires_a_trivial_outer_and_inner() {
+        assert_eq!(reduce_plan(&[5, 7, 9], 1), Some((5, 7, 9)));
+    }
+
+    #[test]
+    fn plan_declines_a_zero_length_axis() {
+        assert_eq!(reduce_plan(&[2, 0, 4], 1), None);
+    }
+
+    #[test]
+    fn plan_declines_when_another_dimension_is_zero() {
+        // outer becomes 0 even though the reduced axis itself is non-empty.
+        assert_eq!(reduce_plan(&[0, 3, 4], 1), None);
+        // inner becomes 0.
+        assert_eq!(reduce_plan(&[2, 3, 0], 1), None);
+    }
+
+    #[test]
+    fn cuda_context_construction_never_panics_even_though_unavailable_here() {
+        // No CUDA device exists on this host; this only asserts try_new()
+        // itself does not panic (cuda_reduce cannot be exercised without a
+        // live context, which is why the plan/decline logic above is
+        // factored out into a pure function instead).
+        let _ = CudaContext::try_new();
+    }
 }

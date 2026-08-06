@@ -8,11 +8,14 @@ mod linear;
 mod normalizer;
 mod post_transform;
 mod scaler;
+mod shape;
 mod string_normalizer;
 mod tfidf;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use shape::batch_dims;
 
 pub use label_encoder::label_encoder;
 pub use linear::{linear_classifier, linear_regressor};

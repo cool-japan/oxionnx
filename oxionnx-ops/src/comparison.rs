@@ -21,8 +21,10 @@ fn comparison_binary(
 }
 
 /// Element-wise equal: 1.0 where a == b, 0.0 otherwise.
+/// ONNX Equal is exact equality (no epsilon tolerance); this also gives the
+/// correct false-on-NaN behavior since `NaN == x` is always false.
 pub fn equal(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
-    comparison_binary(a, b, |x, y| (x - y).abs() < f32::EPSILON)
+    comparison_binary(a, b, |x, y| x == y)
 }
 
 /// Element-wise greater: 1.0 where a > b, 0.0 otherwise.
@@ -164,7 +166,11 @@ pub fn trilu(x: &Tensor, upper: bool, k: i64) -> Result<Tensor, String> {
     }
     let rows = x.shape[ndim - 2];
     let cols = x.shape[ndim - 1];
-    let batch: usize = x.shape[..ndim - 2].iter().product::<usize>().max(1);
+    // No `.max(1)`: an empty slice already multiplies to 1 (correct vacuous case). Clamping a
+    // genuine zero-size leading batch dim (e.g. shape [0,3,3]) up to 1 would make the loop
+    // below index into `data`/`x.data`, which are correctly zero-length for that shape — an
+    // out-of-bounds panic, not just a wrong shape.
+    let batch: usize = x.shape[..ndim - 2].iter().product::<usize>();
     let mat_size = rows * cols;
     let mut data = vec![0.0f32; x.data.len()];
 
@@ -395,11 +401,58 @@ mod tests {
         );
     }
 
+    /// [`.max(1)` zero-dim regression] A leading batch dim of size 0 used to be clamped from 0
+    /// up to 1 by a stray `.max(1)`, which then wrote into `data[offset + i*cols + j]` — `data`
+    /// is correctly zero-length for a [0,3,3] input, so that write panicked (index out of
+    /// bounds) instead of producing the correct empty result.
+    #[test]
+    fn test_trilu_zero_size_batch_dim_does_not_panic() {
+        let t = Tensor::new(Vec::new(), vec![0, 3, 3]); // 0 elements
+        let r = trilu(&t, true, 0).expect("trilu on 0-batch tensor failed");
+        assert_eq!(r.shape, vec![0, 3, 3]);
+        assert!(r.data.is_empty());
+    }
+
     #[test]
     fn test_comparison_broadcast() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         let b = Tensor::new(vec![2.0], vec![1]);
         let r = less(&a, &b).expect("less broadcast failed");
         assert_eq!(r.data, vec![1.0, 0.0, 0.0]);
+    }
+
+    /// [a0-20] Equal must be exact equality, not an epsilon-tolerant comparison.
+    /// Two values closer together than f32::EPSILON (the old threshold) must
+    /// still compare unequal unless they are bit-for-bit identical.
+    #[test]
+    fn test_equal_is_exact_not_epsilon() {
+        let a = Tensor::new(vec![0.0, 1.0, 1.0], vec![3]);
+        let b = Tensor::new(vec![1e-8, 1.0 + f32::EPSILON / 2.0, 1.0], vec![3]);
+        let r = equal(&a, &b).expect("equal failed");
+        // 0.0 vs 1e-8: distinct floats, must NOT compare equal even though
+        // their difference is far smaller than f32::EPSILON.
+        assert_eq!(r.data[0], 0.0);
+        // 1.0 vs 1.0 + EPSILON/2: rounds to a different (or same) representable
+        // float than 1.0 depending on rounding, but either way exact `==` (not
+        // "close enough") must govern -- verify against Rust's own `==`.
+        assert_eq!(
+            r.data[1],
+            if 1.0f32 == 1.0 + f32::EPSILON / 2.0 {
+                1.0
+            } else {
+                0.0
+            }
+        );
+        // Identical values still compare equal.
+        assert_eq!(r.data[2], 1.0);
+    }
+
+    /// Equal(NaN, NaN) must be false: NaN is never equal to anything, including itself.
+    #[test]
+    fn test_equal_nan_is_false() {
+        let a = Tensor::new(vec![f32::NAN], vec![1]);
+        let b = Tensor::new(vec![f32::NAN], vec![1]);
+        let r = equal(&a, &b).expect("equal failed");
+        assert_eq!(r.data[0], 0.0);
     }
 }

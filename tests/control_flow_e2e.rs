@@ -175,7 +175,20 @@ fn test_if_false_branch() {
 ///   iter=1: acc_out = 0.0 + 1.0 = 1.0;  iter_scan = 1.0
 ///   iter=2: acc_out = 1.0 + 2.0 = 3.0;  iter_scan = 2.0
 ///
-/// Expected: final_acc = 3.0, scan_out = [0.0, 1.0, 2.0] (shape [3])
+/// Expected: final_acc = 3.0, scan_out = [0.0, 1.0, 2.0]
+///
+/// Scan-output shape, per the ONNX `Loop` spec: a scan output is formed by
+/// *stacking* the per-iteration value along a NEW leading axis whose length is
+/// the number of executed iterations — `[iters] ++ per_iteration_shape` — not by
+/// concatenating along the value's own axis 0.  The flat data is unchanged
+/// either way, which is exactly why the old concatenating implementation went
+/// unnoticed.
+///
+/// `iter_num` is handed to the body as `Tensor::rank0(i)` — the Loop body
+/// signature declares `iteration_num` as a rank-0 scalar, and Wave-3 made the
+/// runtime emit one.  So `per_iteration_shape` is `[]` and three iterations
+/// stack to `[3]`.  (Before rank-0 support this was `Tensor::scalar(i)` with
+/// shape `[1]`, giving `[3, 1]` — one axis too many.)
 #[test]
 fn test_loop_accumulate() {
     // Body: inputs = [iter_num, cond_in, acc_in]
@@ -255,14 +268,19 @@ fn test_loop_accumulate() {
         "final_acc should be 3.0 after 3 accumulation iterations"
     );
 
-    // scan_out: iter indices [0.0, 1.0, 2.0] stacked -> shape [3]
-    // concatenate_tensors_axis0 on scalars produces shape [3]
+    // scan_out: iter indices [0.0, 1.0, 2.0], each a rank-0 per-iteration value,
+    // stacked along a new leading axis -> shape [3].
     assert_eq!(
         scan_out.data,
         vec![0.0_f32, 1.0, 2.0],
         "scan_out should collect iter indices [0,1,2]"
     );
-    assert_eq!(scan_out.shape, vec![3], "scan_out should have shape [3]");
+    assert_eq!(
+        scan_out.shape,
+        vec![3],
+        "ONNX Loop stacks scan outputs on a new leading axis: 3 iterations of a \
+         rank-0 body output (`iteration_num` is a declared scalar) give [3]"
+    );
 }
 
 // ── Test 4: Scan – map Relu over a sequence ───────────────────────────────────
@@ -652,7 +670,9 @@ fn test_if_subgraph_sequential_ops() {
 /// Body: acc_out = acc_in + one
 ///       cond_out = identity(cond_in)
 ///
-/// max_trips=5, init=0.0 → final=5.0; scan=[1,2,3,4,5]
+/// max_trips=5, init=0.0 → final=5.0; scan=[1,2,3,4,5] with shape [5, 1]
+/// (ONNX Loop stacks each `[1]`-shaped per-iteration value on a new leading
+/// axis — see `test_loop_accumulate` for the full derivation).
 #[test]
 fn test_loop_increment_with_outer_weight() {
     let body = Graph {
@@ -728,7 +748,8 @@ fn test_loop_increment_with_outer_weight() {
     );
     assert_eq!(
         scan_values.shape,
-        vec![5],
-        "scan_values should have shape [5] (5 scalar outputs concatenated)"
+        vec![5, 1],
+        "scan_values should have shape [5, 1]: 5 iterations of a [1]-shaped body \
+         output stacked on a new leading axis"
     );
 }

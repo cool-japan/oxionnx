@@ -5,7 +5,7 @@
 
 #[cfg(feature = "encryption")]
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, Generate, KeyInit},
     Aes256Gcm, Nonce,
 };
 use oxionnx_core::OnnxError;
@@ -13,8 +13,9 @@ use std::path::Path;
 
 /// Encrypt an ONNX model file and write to the output path.
 ///
-/// Uses AES-256-GCM with a random 12-byte nonce prepended to the ciphertext.
-/// Key must be exactly 32 bytes.
+/// Uses AES-256-GCM with a 12-byte nonce, freshly drawn from the OS CSPRNG for
+/// every call (see [`encrypt_bytes`] for why this matters), prepended to the
+/// ciphertext. Key must be exactly 32 bytes.
 #[cfg(feature = "encryption")]
 pub fn encrypt_model(
     input_path: &Path,
@@ -33,23 +34,29 @@ pub fn encrypt_model(
 }
 
 /// Encrypt raw bytes in memory, returning nonce || ciphertext (includes auth tag).
+///
+/// The 96-bit nonce is drawn fresh from the OS CSPRNG (via `getrandom`) for every
+/// call, using [`aead`](aes_gcm::aead)'s [`Generate::try_generate`]. AES-GCM's security guarantee
+/// collapses the moment a `(key, nonce)` pair repeats -- an attacker who observes two
+/// ciphertexts encrypted under the same key and nonce can XOR them to recover the
+/// plaintext XOR and forge authenticated ciphertexts (the GCM nonce-reuse "forbidden
+/// attack"). A 96-bit CSPRNG nonce keeps the collision probability for any realistic
+/// number of encryptions under the same key astronomically small (birthday bound on
+/// 2^96), unlike a nonce derived from wall-clock time, which can collide whenever two
+/// calls (e.g. concurrent callers, or platforms/containers with coarse clock
+/// resolution) land on the same timestamp tick and see same-length plaintext.
 #[cfg(feature = "encryption")]
 pub fn encrypt_bytes(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, OnnxError> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| OnnxError::Internal(format!("Failed to create cipher: {}", e)))?;
 
-    // Generate nonce from timestamp and data length for entropy.
-    // For production, callers should consider providing their own nonce source.
-    let mut nonce_bytes = [0u8; 12];
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    nonce_bytes[..8].copy_from_slice(&timestamp.to_le_bytes()[..8]);
-    let size_bytes = (plaintext.len() as u32).to_le_bytes();
-    nonce_bytes[8..12].copy_from_slice(&size_bytes);
+    // Cryptographically random nonce (OS CSPRNG via `getrandom`), never derived from
+    // wall-clock time or any other predictable/collidable source.
+    let nonce_bytes: [u8; 12] = Generate::try_generate()
+        .map_err(|e| OnnxError::Internal(format!("Failed to generate nonce: {}", e)))?;
 
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = <&Nonce<_>>::try_from(nonce_bytes.as_slice())
+        .map_err(|e| OnnxError::Internal(format!("Invalid nonce length: {}", e)))?;
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
@@ -78,7 +85,8 @@ pub fn decrypt_bytes(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, OnnxError> 
     }
 
     let (nonce_bytes, ciphertext) = data.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = <&Nonce<_>>::try_from(nonce_bytes)
+        .map_err(|e| OnnxError::Parse(format!("Invalid nonce length: {}", e)))?;
 
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| OnnxError::Internal(format!("Failed to create cipher: {}", e)))?;
@@ -109,6 +117,31 @@ mod tests {
         let decrypted = decrypt_bytes(&encrypted, &key).expect("decryption should succeed");
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// [a9-1] regression: the nonce used to be derived from `SystemTime::now()`
+    /// nanoseconds plus `plaintext.len()`, so repeated same-length encryptions could
+    /// reuse a nonce whenever timestamp ticks collided (plausible on platforms with
+    /// coarser-than-nanosecond clock resolution, or under fast back-to-back calls,
+    /// which is exactly what this tight loop exercises). AES-GCM's security
+    /// guarantee requires every `(key, nonce)` pair to be unique; with the fix (a
+    /// 96-bit nonce freshly drawn from the OS CSPRNG on every call), a collision
+    /// across a few hundred draws is astronomically unlikely (birthday bound on
+    /// 2^96), so this loop must never observe a repeated nonce.
+    #[test]
+    fn test_nonce_is_unique_across_same_length_encryptions() {
+        let key = [0x11u8; 32];
+        let plaintext = b"fixed-length plaintext used to isolate the nonce source";
+
+        let mut seen_nonces = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let encrypted = encrypt_bytes(plaintext, &key).expect("encryption should succeed");
+            let nonce = encrypted[..12].to_vec();
+            assert!(
+                seen_nonces.insert(nonce),
+                "nonce reuse detected across same-length encryptions under the same key"
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,8 @@ use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
 
 use crate::{rnn, rnn_typed};
 
+use super::lstm::rnn_extras;
+
 pub struct GRUOp;
 impl Operator for GRUOp {
     fn op_type(&self) -> &str {
@@ -34,7 +36,7 @@ impl Operator for GRUOp {
             Some(act_refs.as_slice())
         };
 
-        let (y, y_h) = rnn::gru(
+        let (y, y_h) = rnn::gru_ext(
             x,
             w,
             r,
@@ -45,6 +47,7 @@ impl Operator for GRUOp {
             direction,
             linear_before_reset,
             activations,
+            rnn_extras(attrs),
         )?;
 
         Ok(vec![y, y_h])
@@ -87,13 +90,33 @@ impl Operator for GRUOp {
         } else {
             Some(act_refs.as_slice())
         };
+        let extras = rnn_extras(attrs);
 
         // Compute output shapes before mutably borrowing slots.
-        let seq_len = x.shape[0];
-        let batch = x.shape[1];
+        // With layout=1 the model hands us X as [batch, seq, input_size].
+        if x.ndim() != 3 {
+            return Err(OnnxError::ShapeMismatch(format!(
+                "GRUOp: X must be 3D, got {:?}",
+                x.shape
+            )));
+        }
+        let (seq_len, batch) = if extras.layout == 1 {
+            (x.shape[1], x.shape[0])
+        } else {
+            (x.shape[0], x.shape[1])
+        };
         let num_dir: usize = if direction == "bidirectional" { 2 } else { 1 };
-        let y_shape = vec![seq_len, num_dir, batch, hidden_size];
-        let y_h_shape = vec![num_dir, batch, hidden_size];
+        let (y_shape, y_h_shape) = if extras.layout == 1 {
+            (
+                vec![batch, seq_len, num_dir, hidden_size],
+                vec![batch, num_dir, hidden_size],
+            )
+        } else {
+            (
+                vec![seq_len, num_dir, batch, hidden_size],
+                vec![num_dir, batch, hidden_size],
+            )
+        };
 
         // Resize and set shapes before the 2-way destructure.
         let y_len: usize = y_shape.iter().product();
@@ -115,22 +138,70 @@ impl Operator for GRUOp {
             ));
         };
 
-        rnn::gru_into(
-            x,
-            w,
-            r,
-            b,
-            sequence_lens,
-            initial_h,
-            hidden_size,
-            direction,
-            linear_before_reset,
-            activations,
-            rnn::GruOutputSlots {
-                y: &mut y_slot.data,
-                y_h: &mut y_h_slot.data,
-            },
-        )?;
+        // `rnn::gru_into_ext` — the true zero-copy, `RnnExtras`-aware kernel
+        // entry point that already exists in `rnn::gru` — is not reachable
+        // from here: it is `pub(crate)` inside a private submodule and is
+        // re-exported from `rnn/mod.rs` only as far as `gru_into` (extras
+        // defaulted); `rnn/mod.rs` belongs to a different file-ownership
+        // scope in this wave, so its re-export list cannot be extended here
+        // (flagged for the orchestrator as a one-line follow-up).
+        //
+        // With default extras (no clip / layout / activation_alpha /
+        // activation_beta — the overwhelmingly common case) this still runs
+        // the exact same zero-copy `gru_into` path, byte for byte. With any
+        // non-default extra — previously silently ignored on this slot path,
+        // unlike `LSTMOp` — correctness wins over the zero-copy property:
+        // compute via the extras-aware, allocating `rnn::gru_ext` and copy
+        // into the caller's slots (`resize` + `copy_from_slice`, never a
+        // fresh `Vec` swapped in, so the slot keeps its backing allocation
+        // across calls whenever the length does not change).
+        let extras_are_default = !extras.clip.is_finite()
+            && extras.layout == 0
+            && extras.activation_alpha.is_empty()
+            && extras.activation_beta.is_empty();
+
+        if extras_are_default {
+            rnn::gru_into(
+                x,
+                w,
+                r,
+                b,
+                sequence_lens,
+                initial_h,
+                hidden_size,
+                direction,
+                linear_before_reset,
+                activations,
+                rnn::GruOutputSlots {
+                    y: &mut y_slot.data,
+                    y_h: &mut y_h_slot.data,
+                },
+            )?;
+        } else {
+            let (y, y_h) = rnn::gru_ext(
+                x,
+                w,
+                r,
+                b,
+                sequence_lens,
+                initial_h,
+                hidden_size,
+                direction,
+                linear_before_reset,
+                activations,
+                extras,
+            )?;
+            if y_slot.data.len() != y.data.len() {
+                y_slot.data.resize(y.data.len(), 0.0f32);
+            }
+            y_slot.data.copy_from_slice(&y.data);
+            y_slot.shape.clone_from(&y.shape);
+            if y_h_slot.data.len() != y_h.data.len() {
+                y_h_slot.data.resize(y_h.data.len(), 0.0f32);
+            }
+            y_h_slot.data.copy_from_slice(&y_h.data);
+            y_h_slot.shape.clone_from(&y_h.shape);
+        }
 
         Ok(())
     }
@@ -179,6 +250,20 @@ impl Operator for GRUOp {
         } else {
             Some(act_refs.as_slice())
         };
+
+        // The half-precision kernels below do not carry `clip` / `layout` /
+        // `activation_alpha` / `activation_beta`. When any of them is set,
+        // route through the f32 path (which is where those attributes are
+        // honoured); `rnn_typed` is an f32 round-trip anyway, so no fidelity
+        // is lost. Mirrors LSTMOp's identical guard.
+        let extras = rnn_extras(attrs);
+        if extras.clip.is_finite()
+            || extras.layout != 0
+            || !extras.activation_alpha.is_empty()
+            || !extras.activation_beta.is_empty()
+        {
+            return oxionnx_core::default_typed_via_f32(self, ctx);
+        }
 
         // sequence_lens is I32; convert to f32 Tensor for the existing gru kernel.
         let sequence_lens_f32: Option<Tensor> =

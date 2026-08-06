@@ -3,7 +3,15 @@
 use crate::context::GpuContext;
 use wgpu::util::DeviceExt;
 
-use super::common::{read_back, SoftmaxParams, SOFTMAX_DIM_THRESHOLD};
+use super::common::{
+    checked_storage_bytes, plan_dispatch, read_back_and_recycle, ErrorScope, SoftmaxParams,
+    SOFTMAX_DIM_THRESHOLD,
+};
+
+// The kernel's own workgroup size (256, matching its `array<f32, 256>` shared
+// buffer) lives entirely in `SOFTMAX_SHADER`: the host no longer needs it,
+// because the dispatch is one *workgroup* per row rather than one thread, so
+// the grid is planned with a workgroup size of 1.
 
 // ========================================================================
 // Softmax
@@ -11,17 +19,45 @@ use super::common::{read_back, SoftmaxParams, SOFTMAX_DIM_THRESHOLD};
 
 /// GPU-accelerated softmax over the last dimension.
 ///
+/// [a7-18] One 256-thread workgroup per row, with shared-memory tree
+/// reductions for the row max and the row sum, fused into a single dispatch
+/// (see `SOFTMAX_SHADER` for the layout and the rationale).
+///
+/// # Numerics
+///
+/// The tree reduction changes the *order* in which a row's exponentials are
+/// summed relative to the old serial scan, so results can differ in the last
+/// ulp or two; pairwise summation is if anything more accurate than a left
+/// fold over 1000+ terms. The guarded tolerance is 1e-6 absolute against an
+/// f64 CPU reference (`tests/w2_gpu_perf.rs`), which the outputs — all in
+/// `[0, 1]` — clear comfortably. The max-subtraction that makes the
+/// exponentials safe is unchanged.
+///
+/// # Accepted shapes
+///
+/// Row counts that need a 2-D workgroup grid are now handled instead of
+/// declined, which widens the accepted range from `65_535 * 256` ≈ 16.8M rows
+/// to `65_535²` ≈ 4.29G rows (in practice bounded first by the `u32` element
+/// index in `checked_storage_bytes`).
+///
 /// Returns `None` if the last dimension is below the threshold (caller should use CPU).
 pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Vec<f32>> {
+    if ctx.is_degraded() {
+        return None;
+    }
     let last_dim = *shape.last()?;
     if last_dim < SOFTMAX_DIM_THRESHOLD {
         return None;
     }
-    let num_rows: usize = shape.iter().rev().skip(1).product();
+    let num_rows: usize = shape
+        .iter()
+        .rev()
+        .skip(1)
+        .try_fold(1usize, |a, &d| a.checked_mul(d))?;
     if num_rows == 0 {
         return None;
     }
-    let total = num_rows * last_dim;
+    let total = num_rows.checked_mul(last_dim)?;
     if data.len() < total {
         return None;
     }
@@ -29,13 +65,25 @@ pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Ve
     let device = &ctx.device;
     let queue = &ctx.queue;
 
+    let out_size = checked_storage_bytes(&ctx.limits, total)?;
+    if !ctx.limits.buffer_fits(out_size) {
+        return None;
+    }
+    // One workgroup per row. `plan_dispatch` with a workgroup size of 1 gives
+    // one grid slot per row and splits into a 2-D grid when the row count
+    // exceeds the device's per-dimension limit; the kernel rebuilds the row as
+    // `wid.y * wg_per_row + wid.x`. It still declines when even a 2-D grid
+    // cannot cover the rows, rather than silently skipping any.
+    let grid = plan_dispatch(&ctx.limits, u64::try_from(num_rows).ok()?, 1)?;
+
+    let scope = ErrorScope::begin(ctx);
+
     let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("softmax_in"),
         contents: bytemuck::cast_slice(&data[..total]),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let out_size = (total * std::mem::size_of::<f32>()) as u64;
     let output_buf = {
         let mut pool = ctx.pool.lock().ok()?;
         pool.get_buffer(
@@ -46,8 +94,10 @@ pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Ve
     };
 
     let params = SoftmaxParams {
-        num_rows: num_rows as u32,
-        row_len: last_dim as u32,
+        num_rows: u32::try_from(num_rows).ok()?,
+        row_len: u32::try_from(last_dim).ok()?,
+        wg_per_row: grid.x,
+        _pad: 0,
     };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("softmax_params"),
@@ -81,41 +131,27 @@ pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Ve
         ],
     });
 
-    let wg = (num_rows as u32).div_ceil(64);
-
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("softmax_enc"),
     });
 
-    // Pass 1: exp(x - max)
+    // Single fused dispatch: max reduction, exp, sum reduction, normalize.
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("softmax_p1"),
+            label: Some("softmax_pass"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&ctx.softmax_pass1_pipeline);
+        cpass.set_pipeline(&ctx.softmax_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch_workgroups(wg, 1, 1);
-    }
-    // Pass 2: normalize
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("softmax_p2"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&ctx.softmax_pass2_pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch_workgroups(wg, 1, 1);
+        cpass.dispatch_workgroups(grid.x, grid.y, 1);
     }
 
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    let result = read_back(device, &staging_buf, total);
+    if !scope.finish(ctx) {
+        return None;
+    }
 
-    // Return output buffer to pool.
-    let mut pool = ctx.pool.lock().ok()?;
-    pool.return_buffer(output_buf, out_size);
-
-    result
+    read_back_and_recycle(ctx, &staging_buf, total, output_buf)
 }

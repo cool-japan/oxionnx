@@ -3,14 +3,22 @@
 //! Each sub-module implements the `Operator` trait for a group of related ops.
 //! `default_registry()` creates a registry pre-populated with all supported ops.
 
+pub mod cast_like;
+pub mod center_crop_pad;
+pub mod col2im;
 pub mod conv_ops;
+pub mod det;
 pub mod indexing_ops;
+pub mod loss_ops;
 pub mod math_ops;
 pub mod misc_ops;
 pub mod ml_ops;
 pub mod nn_ops;
+pub mod quant_ops;
+pub mod random_ops;
 pub mod rnn_ops;
 pub mod shape_ops;
+pub mod vision_ops;
 
 use oxionnx_core::OperatorRegistry;
 
@@ -158,6 +166,7 @@ pub fn default_registry() -> OperatorRegistry {
     // ── RNN / Attention / Spatial ops ──────────────────────────────────────
     r.register(Box::new(rnn_ops::LSTMOp));
     r.register(Box::new(rnn_ops::GRUOp));
+    r.register(Box::new(rnn_ops::RNNOp));
     r.register(Box::new(rnn_ops::AttentionOp));
     r.register(Box::new(rnn_ops::MultiHeadAttentionOp));
     r.register(Box::new(rnn_ops::RotaryEmbeddingOp));
@@ -206,6 +215,42 @@ pub fn default_registry() -> OperatorRegistry {
     // Utility (J-phase additions)
     r.register(Box::new(nn_ops::HardmaxOp));
     r.register(Box::new(nn_ops::ShrinkOp));
+
+    // ── Quantized (int8/uint8) ops ─────────────────────────────────────────
+    // The operator set ONNX Runtime's static quantizer emits (QOperator
+    // format) plus the dynamic-quantization entry point. Until now the
+    // kernels existed but nothing mapped an op_type onto them, so every
+    // quantized .onnx file failed at load with UnsupportedOp.
+    r.register(Box::new(quant_ops::QLinearConvOp));
+    r.register(Box::new(quant_ops::QLinearMatMulOp));
+    r.register(Box::new(quant_ops::MatMulIntegerOp));
+    r.register(Box::new(quant_ops::ConvIntegerOp));
+    r.register(Box::new(quant_ops::DynamicQuantizeLinearOp));
+
+    // ── Classic CNN / vision ops ───────────────────────────────────────────
+    r.register(Box::new(vision_ops::LRNOp));
+    r.register(Box::new(vision_ops::LpPoolOp));
+    r.register(Box::new(vision_ops::GlobalLpPoolOp));
+    r.register(Box::new(vision_ops::MaxUnpoolOp));
+    r.register(Box::new(vision_ops::MaxRoiPoolOp));
+    r.register(Box::new(vision_ops::UpsampleOp));
+    r.register(Box::new(cast_like::CastLikeOp));
+
+    // ── W2 registry lane B additions ───────────────────────────────────────
+    // Linear algebra / tensor reconstruction / cropping.
+    r.register(Box::new(det::DetOp));
+    r.register(Box::new(col2im::Col2ImOp));
+    r.register(Box::new(center_crop_pad::CenterCropPadOp));
+    // Random generators + Multinomial (pure-Rust seeded PRNG; see
+    // `random_ops::rng` for the non-bitwise-ORT-compatibility note).
+    r.register(Box::new(random_ops::RandomNormalOp));
+    r.register(Box::new(random_ops::RandomUniformOp));
+    r.register(Box::new(random_ops::RandomNormalLikeOp));
+    r.register(Box::new(random_ops::RandomUniformLikeOp));
+    r.register(Box::new(random_ops::MultinomialOp));
+    // Loss ops.
+    r.register(Box::new(loss_ops::NegativeLogLikelihoodLossOp));
+    r.register(Box::new(loss_ops::SoftmaxCrossEntropyLossOp));
 
     // ── ML ops ──────────────────────────────────────────────────────────────
     r.register(Box::new(ml_ops::LinearClassifierOp));

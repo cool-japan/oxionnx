@@ -199,7 +199,7 @@ impl Operator for ConstantOfShapeOp {
             .attrs()
             .tensors
             .get("value")
-            .map(|t| t.data[0])
+            .and_then(|t| t.data.first().copied())
             .unwrap_or(0.0);
         Ok(vec![comparison::constant_of_shape(&target_shape, value)])
     }
@@ -220,9 +220,17 @@ impl Operator for ConstantOfShapeOp {
             .attrs()
             .tensors
             .get("value")
-            .map(|t| t.data[0])
+            .and_then(|t| t.data.first().copied())
             .unwrap_or(0.0_f32);
-        let n: usize = target_shape.iter().product::<usize>().max(1);
+        // No `.max(1)`: an empty `target_shape` (scalar output) already multiplies to 1
+        // (empty-product identity), so the clamp was never needed for that case. What it
+        // *did* do is corrupt a genuine zero-size dim -- e.g. shape input `[0, 3]` has
+        // product 0, and the correct output is a 0-element tensor of shape `[0, 3]`
+        // (matching `comparison::constant_of_shape`, which `execute` above calls and which
+        // has no such clamp). `.max(1)` forced `n = 1` there, leaving `slots[0]` with
+        // `shape == [0, 3]` but `data.len() == 1` -- a tensor that violates its own
+        // `data.len() == shape.product()` invariant instead of the correct empty result.
+        let n: usize = target_shape.iter().product::<usize>();
         if slots[0].data.len() != n {
             slots[0].data.resize(n, 0.0_f32);
         }
@@ -282,7 +290,13 @@ impl Operator for TriluOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let upper = ctx.attrs().i("upper", 1) != 0;
-        let k = ctx.optional_input(1).map(|t| t.data[0] as i64).unwrap_or(0);
+        // `.first()`, not `[0]`: a present-but-empty `k` input (malformed model) must
+        // fall back to the default rather than index an empty `data` slice.
+        let k = ctx
+            .optional_input(1)
+            .and_then(|t| t.data.first().copied())
+            .map(|v| v as i64)
+            .unwrap_or(0);
         Ok(vec![comparison::trilu(x, upper, k)?])
     }
     fn supports_output_slots(&self) -> bool {
@@ -388,13 +402,42 @@ impl Operator for CastOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let to = ctx.attrs().i("to", 1);
+        // Reject a `to` that is not a real `TensorProto.DataType` value up
+        // front, via the same `DType::from_onnx` mapping `execute_typed`
+        // below already uses. Without this, an unrecognized code (a typo, or
+        // simply a dtype outside the ONNX enum) fell through every explicit
+        // arm below into the `_` catch-all and silently became a no-op cast
+        // instead of a typed error.
+        if oxionnx_core::DType::from_onnx(to as i32).is_none() {
+            return Err(OnnxError::Unsupported(format!(
+                "Cast: unrecognized target dtype code {to}"
+            )));
+        }
+        // ONNX Cast to an integer type truncates toward zero (numpy `astype`
+        // semantics), not round-to-nearest, and out-of-range values saturate to
+        // the destination type's range. Rust's `as` float->int cast is exactly
+        // that (truncate + saturate, NaN -> 0) since Rust 1.45, so this mirrors
+        // `TypedTensor::cast` (registry/misc_ops.rs execute_typed below) element
+        // for element -- the two dispatch paths must agree on the same model.
+        //
+        // Every dtype the `to` check above accepts but that has no explicit
+        // arm here (F32, F16, F64, BF16) is already f32-shaped data in this
+        // dtype-erased representation, so `_ => x.data.clone()` is correct
+        // for them -- the catch-all now only ever sees recognized dtypes.
         let data: Vec<f32> = match to {
             9 => x
                 .data
                 .iter()
                 .map(|&v| if v != 0.0 { 1.0 } else { 0.0 })
-                .collect(),
-            6 | 7 | 12 | 13 => x.data.iter().map(|&v| v.round()).collect(),
+                .collect(), // BOOL
+            2 => x.data.iter().map(|&v| v as u8 as f32).collect(), // UINT8
+            3 => x.data.iter().map(|&v| v as i8 as f32).collect(), // INT8
+            4 => x.data.iter().map(|&v| v as u16 as f32).collect(), // UINT16
+            5 => x.data.iter().map(|&v| v as i16 as f32).collect(), // INT16
+            6 => x.data.iter().map(|&v| v as i32 as f32).collect(), // INT32
+            7 => x.data.iter().map(|&v| v as i64 as f32).collect(), // INT64
+            12 => x.data.iter().map(|&v| v as u32 as f32).collect(), // UINT32
+            13 => x.data.iter().map(|&v| v as u64 as f32).collect(), // UINT64
             _ => x.data.clone(),
         };
         Ok(vec![Tensor::new(data, x.shape.clone())])
@@ -422,8 +465,11 @@ impl Operator for CastOp {
     ) -> Result<Vec<oxionnx_core::TypedTensor>, oxionnx_core::OnnxError> {
         use oxionnx_core::OnnxError;
         let to_int = ctx.attrs().i("to", 1);
-        let target_dtype =
-            oxionnx_core::DType::from_onnx(to_int as i32).unwrap_or(oxionnx_core::DType::F32);
+        // Same validation as the `execute` (f32) path above: an unrecognized
+        // `to` must be a typed error, not a silent promotion to F32.
+        let target_dtype = oxionnx_core::DType::from_onnx(to_int as i32).ok_or_else(|| {
+            OnnxError::Unsupported(format!("Cast: unrecognized target dtype code {to_int}"))
+        })?;
         let input = ctx
             .input(0)
             .ok_or_else(|| OnnxError::TensorNotFound("Cast: missing input[0]".into()))?;
@@ -457,6 +503,25 @@ impl Operator for CastOp {
 
 // ── Shape ───────────────────────────────────────────────────────────────────
 
+/// Resolve Shape's opset-15 `start`/`end` attributes against the input rank,
+/// using Python-slice-style negative-index and out-of-range clamping:
+/// negative values count from the back (clamped at 0), positive values clamp
+/// at `rank`, and `end < start` collapses to an empty range rather than
+/// panicking on the subsequent `shape[start..end]` slice.
+fn shape_slice_bounds(rank: usize, attrs: &oxionnx_core::Attributes) -> (usize, usize) {
+    let rank_i = rank as i64;
+    let resolve = |v: i64| -> i64 {
+        if v < 0 {
+            (v + rank_i).max(0)
+        } else {
+            v.min(rank_i)
+        }
+    };
+    let start = resolve(attrs.i("start", 0)) as usize;
+    let end = resolve(attrs.i("end", rank_i)) as usize;
+    (start, end.max(start))
+}
+
 pub struct ShapeOp;
 impl Operator for ShapeOp {
     fn op_type(&self) -> &str {
@@ -464,7 +529,8 @@ impl Operator for ShapeOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
-        let shape_vals: Vec<f32> = x.shape.iter().map(|&d| d as f32).collect();
+        let (start, end) = shape_slice_bounds(x.shape.len(), ctx.attrs());
+        let shape_vals: Vec<f32> = x.shape[start..end].iter().map(|&d| d as f32).collect();
         let n = shape_vals.len();
         Ok(vec![Tensor::new(shape_vals, vec![n])])
     }
@@ -480,12 +546,13 @@ impl Operator for ShapeOp {
             return Ok(());
         }
         let x = ctx.input(0)?;
-        let ndim = x.ndim();
-        if slots[0].data.len() != ndim {
-            slots[0].data.resize(ndim, 0.0_f32);
+        let (start, end) = shape_slice_bounds(x.shape.len(), ctx.attrs());
+        let n = end - start;
+        if slots[0].data.len() != n {
+            slots[0].data.resize(n, 0.0_f32);
         }
-        slots[0].shape = vec![ndim];
-        for (d, &dim) in slots[0].data.iter_mut().zip(x.shape.iter()) {
+        slots[0].shape = vec![n];
+        for (d, &dim) in slots[0].data.iter_mut().zip(x.shape[start..end].iter()) {
             *d = dim as f32;
         }
         Ok(())
@@ -499,16 +566,20 @@ impl Operator for ConstantOp {
     fn op_type(&self) -> &str {
         "Constant"
     }
+    /// Opset-21 documents `value_float` / `value_int` as "the value for the sole element for
+    /// the scalar ... output tensor", so both produce a rank-0 output (the empty shape), as
+    /// does the no-attribute fallback that stands in for them. The `value` tensor attribute is
+    /// different: it carries its own shape, which is passed through untouched.
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let attrs = ctx.attrs();
         if let Some(t) = attrs.tensors.get("value") {
             Ok(vec![t.clone()])
         } else if let Some(&v) = attrs.floats.get("value_float") {
-            Ok(vec![Tensor::new(vec![v], vec![1])])
+            Ok(vec![Tensor::new(vec![v], Vec::new())])
         } else if let Some(&v) = attrs.ints.get("value_int") {
-            Ok(vec![Tensor::new(vec![v as f32], vec![1])])
+            Ok(vec![Tensor::new(vec![v as f32], Vec::new())])
         } else {
-            Ok(vec![Tensor::new(vec![0.0], vec![1])])
+            Ok(vec![Tensor::new(vec![0.0], Vec::new())])
         }
     }
     fn supports_output_slots(&self) -> bool {
@@ -534,19 +605,20 @@ impl Operator for ConstantOp {
             if slots[0].data.len() != 1 {
                 slots[0].data.resize(1, 0.0_f32);
             }
-            slots[0].shape = vec![1];
+            // Rank 0, matching `execute` above (all three scalar arms).
+            slots[0].shape = Vec::new();
             slots[0].data[0] = v;
         } else if let Some(&v) = attrs.ints.get("value_int") {
             if slots[0].data.len() != 1 {
                 slots[0].data.resize(1, 0.0_f32);
             }
-            slots[0].shape = vec![1];
+            slots[0].shape = Vec::new();
             slots[0].data[0] = v as f32;
         } else {
             if slots[0].data.len() != 1 {
                 slots[0].data.resize(1, 0.0_f32);
             }
-            slots[0].shape = vec![1];
+            slots[0].shape = Vec::new();
             slots[0].data[0] = 0.0_f32;
         }
         Ok(())
@@ -584,10 +656,36 @@ impl Operator for EinsumOp {
         let out = &mut slots[0];
         if out.data.len() == result.data.len() && out.shape == result.shape {
             out.data.copy_from_slice(&result.data);
+            Ok(())
         } else {
-            *out = result;
+            // Every caller of `execute_into_slots` (`Session::dispatch_node`,
+            // `src/session/run/dispatch.rs`, and the parallel scheduler's
+            // `claim_cpu_fast_paths`, `src/session/run/parallel.rs`) reaches
+            // this only via `acquire_output_slots`, which returns `Some`
+            // (and therefore pre-sizes `out` from `resolved_shapes`) only
+            // when shape inference already produced a shape for this node's
+            // output. For `Einsum` that shape comes from
+            // `infer_einsum_shape` (`src/optimizer/shape_inference_ext/advanced.rs`),
+            // so landing here means that prediction disagreed with what the
+            // executor actually computed -- a shape-inference bug, not a
+            // recoverable runtime condition. Reallocating (`*out = result`)
+            // used to paper over exactly that: a stale/incorrect inference
+            // self-healed silently at the cost of the allocation the slot
+            // path exists to avoid, and the underlying bug went undetected
+            // until a dedicated end-to-end regression test caught it (see
+            // the doc comment on `infer_einsum_shape`). A typed error
+            // surfaces that class of bug immediately instead of masking it
+            // again.
+            Err(OnnxError::Internal(format!(
+                "EinsumOp: pre-allocated output slot (shape {:?}, {} elements) disagrees \
+                 with the computed result (shape {:?}, {} elements) -- Einsum shape \
+                 inference disagrees with the executor",
+                out.shape,
+                out.data.len(),
+                result.shape,
+                result.data.len()
+            )))
         }
-        Ok(())
     }
 }
 
@@ -656,8 +754,12 @@ impl Operator for BitwiseNotOp {
             slots[0].data.resize(n, 0.0_f32);
         }
         slots[0].shape.clone_from(&input.shape);
+        // Value-preserving i64 round-trip (not u32): a two's-complement NOT of
+        // a small value like 0 must come back as -1, which f32 represents
+        // exactly, rather than as 4294967295 (u32::MAX), which f32 cannot. See
+        // `crate::bitwise::bitwise_not`, which this mirrors.
         for (dst, &x) in slots[0].data.iter_mut().zip(input.data.iter()) {
-            *dst = (!(x as u32)) as f32;
+            *dst = (!(x as i64)) as f32;
         }
         Ok(())
     }
@@ -670,10 +772,13 @@ impl Operator for SizeOp {
     fn op_type(&self) -> &str {
         "Size"
     }
+    /// Opset-21 `Size` "outputs an int64 scalar that equals the total number of elements of
+    /// the input tensor", so the output is rank 0 (the empty shape) for every input rank —
+    /// not the rank-1 `[1]` this used to emit.
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
         let n = x.numel();
-        Ok(vec![Tensor::new(vec![n as f32], vec![1])])
+        Ok(vec![Tensor::new(vec![n as f32], Vec::new())])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -690,7 +795,8 @@ impl Operator for SizeOp {
         if slots[0].data.len() != 1 {
             slots[0].data.resize(1, 0.0_f32);
         }
-        slots[0].shape = vec![1];
+        // Rank 0, matching `execute` above.
+        slots[0].shape = Vec::new();
         slots[0].data[0] = n as f32;
         Ok(())
     }
@@ -706,14 +812,21 @@ impl Operator for NonMaxSuppressionOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let boxes = ctx.input(0)?;
         let scores = ctx.input(1)?;
+        // `.first()`, not `[0]`, on all three: a present-but-empty scalar input
+        // (malformed model) must fall back to the default rather than index an
+        // empty `data` slice.
         let max_out = ctx
             .optional_input(2)
-            .map(|t| t.data[0] as usize)
+            .and_then(|t| t.data.first().copied())
+            .map(|v| v as usize)
             .unwrap_or(0);
-        let iou_thresh = ctx.optional_input(3).map(|t| t.data[0]).unwrap_or(0.0);
+        let iou_thresh = ctx
+            .optional_input(3)
+            .and_then(|t| t.data.first().copied())
+            .unwrap_or(0.0);
         let score_thresh = ctx
             .optional_input(4)
-            .map(|t| t.data[0])
+            .and_then(|t| t.data.first().copied())
             .unwrap_or(f32::NEG_INFINITY);
         let center_point_box = ctx.attrs().i("center_point_box", 0);
         Ok(vec![crate::nms::non_max_suppression(

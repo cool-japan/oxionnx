@@ -43,14 +43,19 @@ fn test_scatter_nd() -> Result<(), OnnxError> {
 
 #[test]
 fn test_quantize_dequantize_roundtrip() -> Result<(), OnnxError> {
+    // y_zero_point omitted -> ONNX spec default output dtype is *uint8*
+    // (range [0, 255], zero_point 0), not int8. Reference values
+    // cross-checked with `numpy.round` (ties-to-even) at f32 precision:
+    // 0/0.01=0, 1/0.01=100, -1/0.01=-100 (clamped up to the uint8 floor of
+    // 0, not left at -100), 2/0.01=200 (uint8 allows up to 255, so this is
+    // NOT clamped to 127 the way a hardcoded-int8 range would).
     let x = Tensor::new(vec![0.0, 1.0, -1.0, 2.0], vec![4]);
     let scale = Tensor::new(vec![0.01], vec![1]);
     let q = quantize_linear(&x, &scale, None)?;
-    // 0/0.01=0, 1/0.01=100, -1/0.01=-100, 2/0.01=127 (clamped)
     assert_eq!(q.data[0], 0.0);
     assert_eq!(q.data[1], 100.0);
-    assert_eq!(q.data[2], -100.0);
-    assert_eq!(q.data[3], 127.0);
+    assert_eq!(q.data[2], 0.0);
+    assert_eq!(q.data[3], 200.0);
     let dq = dequantize_linear(&q, &scale, None)?;
     assert!((dq.data[1] - 1.0).abs() < 1e-5);
     Ok(())

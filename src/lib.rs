@@ -90,6 +90,7 @@ pub mod mmap {
 }
 pub mod opset_coverage;
 pub mod session;
+pub mod streaming;
 pub mod tolerance;
 pub mod typed_session;
 pub mod tensor {
@@ -115,7 +116,12 @@ pub use oxionnx_core::Tensor;
 pub use oxionnx_core::{DType, NodeInfo, TensorInfo, TensorStorage, TypedTensor};
 #[cfg(feature = "gpu")]
 pub use session::GpuExecutionProvider;
-pub use session::{ModelInfo, ModelMetadata, NodeProfile, OptLevel, Session, SessionBuilder};
+pub use session::{
+    block_on, CancellationToken, ModelInfo, ModelMetadata, NodeProfile, OptLevel, RunFuture,
+    RunHandle, Session, SessionBuilder, SessionCacheHeader, SESSION_CACHE_FORMAT_VERSION,
+    SESSION_CACHE_MAGIC,
+};
+pub use streaming::{GenerationConfig, KvCacheBinding, StreamStep, TokenStream};
 pub use tolerance::{compare_tensors, tensors_close, ToleranceReport};
 pub use typed_session::{Shape, TypedSession};
 

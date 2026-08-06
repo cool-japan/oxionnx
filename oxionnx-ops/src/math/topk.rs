@@ -15,7 +15,10 @@ pub(crate) fn top_k_output_shape(x: &Tensor, k: usize, axis: i64) -> (Vec<usize>
     if ax < ndim {
         s[ax] = k;
     }
-    let len = s.iter().product::<usize>().max(1);
+    // No `.max(1)`: an empty slice already multiplies to 1, so this only ever matters when `s`
+    // holds a genuine zero-size dim elsewhere, which must produce `len == 0` (the caller sizes
+    // its output buffer from this), not a phantom size-1 buffer.
+    let len = s.iter().product::<usize>();
     (s, len)
 }
 
@@ -39,8 +42,11 @@ pub(crate) fn top_k_into(
         return Err(format!("top_k: axis {ax} out of range for {ndim}D tensor"));
     }
     let k = k.min(x.shape[ax]);
-    let outer: usize = x.shape[..ax].iter().product::<usize>().max(1);
-    let inner: usize = x.shape[ax + 1..].iter().product::<usize>().max(1);
+    // No `.max(1)`: must stay consistent with `top_k_output_shape`'s (also un-clamped) `len`,
+    // which sizes `values_out`/`indices_out` — clamping a genuine zero-size outer/inner dim to 1
+    // here would walk `x.data`/`values_out`/`indices_out` past their real (zero) length.
+    let outer: usize = x.shape[..ax].iter().product::<usize>();
+    let inner: usize = x.shape[ax + 1..].iter().product::<usize>();
     let axis_len = x.shape[ax];
     for o in 0..outer {
         for i in 0..inner {
@@ -99,8 +105,11 @@ pub fn top_k(
     let mut values = vec![0.0f32; out_n];
     let mut indices = vec![0.0f32; out_n];
 
-    let outer: usize = x.shape[..ax].iter().product::<usize>().max(1);
-    let inner: usize = x.shape[ax + 1..].iter().product::<usize>().max(1);
+    // No `.max(1)`: `out_n` above is already correctly 0 for a genuine zero-size outer/inner
+    // dim (it is a plain, un-clamped `.product()`), so `values`/`indices` are zero-length in
+    // that case — clamping `outer`/`inner` to 1 would make the loop below index past them.
+    let outer: usize = x.shape[..ax].iter().product::<usize>();
+    let inner: usize = x.shape[ax + 1..].iter().product::<usize>();
     let axis_len = x.shape[ax];
 
     for o in 0..outer {
@@ -136,4 +145,51 @@ pub fn top_k(
         Tensor::new(values, out_shape.clone()),
         Tensor::new(indices, out_shape),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_k_into_matches_top_k() {
+        let x = Tensor::new(vec![3.0, 1.0, 2.0], vec![3]);
+        let (values, indices) = top_k(&x, 2, 0, true, true).expect("top_k failed");
+        assert_eq!(values.data, vec![3.0, 2.0]);
+        assert_eq!(indices.data, vec![0.0, 2.0]);
+
+        let (_, out_len) = top_k_output_shape(&x, 2, 0);
+        let mut values_out = vec![0.0f32; out_len];
+        let mut indices_out = vec![0.0f32; out_len];
+        let shape = top_k_into(&x, 2, 0, true, true, &mut values_out, &mut indices_out)
+            .expect("top_k_into failed");
+        assert_eq!(shape, values.shape);
+        assert_eq!(values_out, values.data);
+        assert_eq!(indices_out, indices.data);
+    }
+
+    /// [`.max(1)` zero-dim regression] `x` has shape `[2,0,3]`: axis 0 (size 2) is reduced, but
+    /// the middle dim is genuinely 0, so `inner = product(shape[1..]) = product([0,3]) = 0`.
+    /// `outer`/`inner` used to be clamped from a genuine 0 up to 1 by a stray `.max(1)` (in both
+    /// `top_k` and `top_k_into`), which then indexed `x.data`/`values`/`indices` — all correctly
+    /// zero-length for this shape — out of bounds. Must instead produce an empty result.
+    #[test]
+    fn top_k_zero_size_middle_dim_does_not_panic() {
+        let x = Tensor::new(Vec::new(), vec![2, 0, 3]); // 0 elements
+        let (values, indices) = top_k(&x, 1, 0, true, true).expect("top_k failed");
+        assert_eq!(values.shape, vec![1, 0, 3]);
+        assert!(values.data.is_empty());
+        assert_eq!(indices.shape, vec![1, 0, 3]);
+        assert!(indices.data.is_empty());
+
+        // `top_k_into` / `top_k_output_shape` must agree with `top_k` and not panic either.
+        let (shape, out_len) = top_k_output_shape(&x, 1, 0);
+        assert_eq!(shape, vec![1, 0, 3]);
+        assert_eq!(out_len, 0);
+        let mut values_out: Vec<f32> = Vec::new();
+        let mut indices_out: Vec<f32> = Vec::new();
+        let into_shape = top_k_into(&x, 1, 0, true, true, &mut values_out, &mut indices_out)
+            .expect("top_k_into failed");
+        assert_eq!(into_shape, vec![1, 0, 3]);
+    }
 }

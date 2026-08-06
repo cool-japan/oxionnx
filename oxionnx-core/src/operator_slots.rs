@@ -1,5 +1,10 @@
 //! Default output-slot writing: executes the operator and copies results into pre-allocated slots.
 
+// `alloc::format!`: `alloc` is always linked by the crate root (see
+// lib.rs), and this is the exact same macro as `std::format!`, so it
+// resolves identically whether or not the `std` feature is enabled.
+use alloc::format;
+
 use crate::operator::{OpContext, Operator};
 use crate::tensor::Tensor;
 use crate::OnnxError;

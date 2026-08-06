@@ -3,6 +3,14 @@
 //! folding, LayerNorm pattern, consecutive Transpose/Reshape cancellation,
 //! MatMul+Transpose fusion, Add+MatMul→Gemm fusion, Conv+Add+Relu (ResNet),
 //! Gather+Gather composition, Dropout elimination, Transpose+Reshape simplification.
+//!
+//! All of them are wired into [`crate::optimizer::optimize_with_level`] at
+//! `PassLevel::Extended` and above, except `fuse_conv_add_relu`, which emits the
+//! optimizer-only `ConvAddRelu` op and therefore runs only when the active
+//! `OperatorRegistry` provides a kernel for it.
+//!
+//! Every pass takes the graph's `output_names` and refuses to remove, rename or
+//! re-parent a tensor the model declares as an output.
 
 mod conv;
 mod matmul;

@@ -1,9 +1,18 @@
-//! DirectML compute kernels.
+//! Per-op kernels: `Tensor` in, [`crate::plan`] validation, `Backend` dispatch,
+//! `Tensor` out.
 //!
-//! Each sub-module owns the GPU-side implementation for a family of ONNX ops.
-//! All kernels return `Err(DirectMLError::DispatchFailed(_))` in this scaffold
-//! wave; the dispatch layer converts those errors to `Ok(None)` so inference
-//! falls back to CPU transparently.
+//! **Platform-neutral.**  These modules contain no `#[cfg]` and no FFI: they build a
+//! plan, hand it plus the raw f32 slices to whichever [`crate::backend::Backend`] the
+//! context resolved to, and wrap the returned buffer back into a `Tensor`.  On Linux
+//! the backend is the declining stub, so the entire `Ok(Some)` / `Ok(None)` / `Err`
+//! routing contract is exercisable in CI without a GPU.
+//!
+//! The kernels never compute a dimension themselves — everything shape-derived comes
+//! pre-validated and pre-range-checked off a [`crate::plan::MatMulPlan`] or
+//! [`crate::plan::ElementwisePlan`].
 
-pub mod elementwise;
-pub mod matmul;
+pub(crate) mod conv;
+pub(crate) mod elementwise;
+pub(crate) mod matmul;
+pub(crate) mod reduce;
+pub(crate) mod softmax;

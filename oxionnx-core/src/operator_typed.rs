@@ -1,5 +1,10 @@
 //! Default typed dispatch: converts TypedTensor inputs to f32, runs execute, wraps outputs.
 
+// `alloc::vec::Vec`: `alloc` is always linked by the crate root (see
+// lib.rs), and this is the exact same type as `std::vec::Vec`, so it
+// resolves identically whether or not the `std` feature is enabled.
+use alloc::vec::Vec;
+
 use crate::dtype::{TensorStorage, TypedTensor};
 use crate::operator::{OpContext, Operator, TypedOpContext};
 use crate::tensor::Tensor;

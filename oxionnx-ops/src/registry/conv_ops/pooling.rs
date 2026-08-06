@@ -1,8 +1,87 @@
 //! Pooling operator implementations: MaxPool, AveragePool, GlobalAveragePool, GlobalMaxPool.
+//!
+//! `MaxPool` and `AveragePool` are rank-generic — 1D (audio), 2D (vision) and
+//! 3D (video / volumetric) all resolve `kernel_shape`, `strides`, `pads`,
+//! `auto_pad`, `dilations` and `ceil_mode` through [`crate::conv::spatial`]
+//! and run the single shared kernel in [`crate::conv`]; there is no
+//! rank-2-only code path left.
 
-use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
+use oxionnx_core::{Attributes, OnnxError, OpContext, Operator, Tensor};
 
 use crate::conv;
+use crate::conv::spatial::{
+    parse_auto_pad, read_kernel_shape, read_pads, read_positive_spatial, resolve_pads, spatial_rank,
+};
+
+// ── Shared pooling geometry ─────────────────────────────────────────────────
+
+/// Resolve the full N-D pooling geometry of a `MaxPool` / `AveragePool` node.
+///
+/// Reads and validates every spatial attribute the ONNX spec defines for the
+/// two pooling operators — `kernel_shape`, `strides`, `pads`, `auto_pad`,
+/// `dilations` and `ceil_mode` — and computes the resulting output extent with
+/// the same formula the engine's shape-inference pass uses, so the planner and
+/// the kernel can never disagree.
+fn pool_geometry(
+    attrs: &Attributes,
+    input_shape: &[usize],
+    op: &str,
+) -> Result<conv::PoolGeometry, OnnxError> {
+    let rank = spatial_rank(input_shape, op, "input")?;
+    // `kernel_shape` is required for both pooling operators and must cover
+    // every spatial axis of the input.
+    let kernel = read_kernel_shape(attrs.ints("kernel_shape"), rank, op)?;
+    let strides = read_positive_spatial(attrs.ints("strides"), rank, 1, "strides", op)?;
+    let dilations = read_positive_spatial(attrs.ints("dilations"), rank, 1, "dilations", op)?;
+    let explicit = read_pads(attrs.ints("pads"), rank, op)?;
+    let auto_pad = parse_auto_pad(attrs.s("auto_pad"), op)?;
+    let ceil_mode = attrs.i("ceil_mode", 0) != 0;
+
+    let input_spatial = &input_shape[2..];
+    let pads = resolve_pads(
+        auto_pad,
+        input_spatial,
+        &kernel,
+        &strides,
+        &dilations,
+        &explicit,
+    );
+    conv::PoolGeometry::resolve(
+        op,
+        input_spatial,
+        kernel,
+        strides,
+        pads,
+        dilations,
+        ceil_mode,
+    )
+}
+
+/// Read and validate the MaxPool `storage_order` attribute.
+///
+/// Returns `true` for column-major (`storage_order == 1`), which only affects
+/// how the optional `Indices` output encodes an n-tuple index into one
+/// integer. ONNX defines that encoding for the 2D case (and it is trivially
+/// the same as row-major for 1D), so a column-major request at spatial rank
+/// ≥ 3 is a typed [`OnnxError::Unsupported`] rather than an invented
+/// generalisation no reference implementation would agree with.
+fn read_storage_order(attrs: &Attributes, rank: usize) -> Result<bool, OnnxError> {
+    match attrs.i("storage_order", 0) {
+        0 => Ok(false),
+        1 => {
+            if rank > 2 {
+                return Err(OnnxError::Unsupported(format!(
+                    "MaxPool: storage_order=1 (column major) is only defined for 1D/2D pooling, \
+                     got spatial rank {rank}"
+                )));
+            }
+            Ok(true)
+        }
+        other => Err(OnnxError::ShapeMismatch(format!(
+            "MaxPool: storage_order must be 0 (row major) or 1 (column major), got {other}"
+        ))),
+    }
+}
 
 // ── MaxPool ─────────────────────────────────────────────────────────────────
 
@@ -14,21 +93,32 @@ impl Operator for MaxPoolOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let input = ctx.input(0)?;
         let attrs = ctx.attrs();
-        let ks_v = attrs.ints("kernel_shape");
-        let kernel_shape = [ks_v[0] as usize, ks_v[1] as usize];
-        let strides_v = attrs.ints("strides");
-        let strides = [
-            strides_v.first().copied().unwrap_or(1) as usize,
-            strides_v.get(1).copied().unwrap_or(1) as usize,
-        ];
-        let pads_v = attrs.ints("pads");
-        let pads = [
-            pads_v.first().copied().unwrap_or(0) as usize,
-            pads_v.get(1).copied().unwrap_or(0) as usize,
-            pads_v.get(2).copied().unwrap_or(0) as usize,
-            pads_v.get(3).copied().unwrap_or(0) as usize,
-        ];
-        Ok(vec![conv::max_pool2d(input, kernel_shape, strides, pads)])
+        let geo = pool_geometry(attrs, &input.shape, "MaxPool")?;
+        let column_major = read_storage_order(attrs, geo.rank())?;
+        let want_indices = ctx.node.outputs.get(1).is_some_and(|name| !name.is_empty());
+
+        let out_shape = geo.out_shape(&input.shape);
+        let total: usize = out_shape.iter().product();
+        let mut values = vec![f32::NEG_INFINITY; total];
+        let mut indices = if want_indices {
+            vec![0.0_f32; total]
+        } else {
+            Vec::new()
+        };
+        conv::max_pool_into(
+            &input.data,
+            &input.shape,
+            &geo,
+            &mut values,
+            &mut indices,
+            column_major,
+        );
+
+        let mut results = vec![Tensor::new(values, out_shape.clone())];
+        if want_indices {
+            results.push(Tensor::new(indices, out_shape));
+        }
+        Ok(results)
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -38,70 +128,49 @@ impl Operator for MaxPoolOp {
         ctx: &OpContext<'_>,
         slots: &mut [Tensor],
     ) -> Result<(), OnnxError> {
-        if slots.len() != 1 {
+        if slots.is_empty() || slots.len() > 2 {
             return Err(OnnxError::Internal(format!(
-                "MaxPoolOp: expected 1 output slot, got {}",
+                "MaxPoolOp: expected 1 or 2 output slots, got {}",
                 slots.len()
             )));
         }
         let input = ctx.input(0)?;
         let attrs = ctx.attrs();
-        let ks_v = attrs.ints("kernel_shape");
-        let kh = ks_v
-            .first()
-            .copied()
-            .ok_or_else(|| OnnxError::Internal("MaxPoolOp: kernel_shape missing".into()))?
-            as usize;
-        let kw =
-            ks_v.get(1).copied().ok_or_else(|| {
-                OnnxError::Internal("MaxPoolOp: kernel_shape requires 2 dims".into())
-            })? as usize;
-        let strides_v = attrs.ints("strides");
-        let s_h = strides_v.first().copied().unwrap_or(1) as usize;
-        let s_w = strides_v.get(1).copied().unwrap_or(1) as usize;
-        let pads_v = attrs.ints("pads");
-        let p_top = pads_v.first().copied().unwrap_or(0) as usize;
-        let p_left = pads_v.get(1).copied().unwrap_or(0) as usize;
-        let p_bottom = pads_v.get(2).copied().unwrap_or(0) as usize;
-        let p_right = pads_v.get(3).copied().unwrap_or(0) as usize;
+        let geo = pool_geometry(attrs, &input.shape, "MaxPool")?;
+        let column_major = read_storage_order(attrs, geo.rank())?;
+        let want_indices =
+            slots.len() > 1 && ctx.node.outputs.get(1).is_some_and(|name| !name.is_empty());
 
-        let n = input.shape[0];
-        let c = input.shape[1];
-        let h = input.shape[2];
-        let w = input.shape[3];
-        let oh = (h + p_top + p_bottom - kh) / s_h + 1;
-        let ow = (w + p_left + p_right - kw) / s_w + 1;
-        let out_shape = vec![n, c, oh, ow];
-        let total: usize = n * c * oh * ow;
+        let out_shape = geo.out_shape(&input.shape);
+        let total: usize = out_shape.iter().product();
 
-        if slots[0].data.len() != total {
-            slots[0].data.resize(total, f32::NEG_INFINITY);
+        let (head, tail) = slots.split_at_mut(1);
+        let values = &mut head[0];
+        if values.data.len() != total {
+            values.data.resize(total, f32::NEG_INFINITY);
         }
-        slots[0].shape = out_shape;
+        values.shape.clone_from(&out_shape);
 
-        for batch in 0..n {
-            for ch in 0..c {
-                for oy in 0..oh {
-                    for ox in 0..ow {
-                        let mut max_val = f32::NEG_INFINITY;
-                        for ky in 0..kh {
-                            for kx in 0..kw {
-                                let iy = (oy * s_h + ky) as isize - p_top as isize;
-                                let ix = (ox * s_w + kx) as isize - p_left as isize;
-                                if iy >= 0 && iy < h as isize && ix >= 0 && ix < w as isize {
-                                    let idx =
-                                        ((batch * c + ch) * h + iy as usize) * w + ix as usize;
-                                    if input.data[idx] > max_val {
-                                        max_val = input.data[idx];
-                                    }
-                                }
-                            }
-                        }
-                        slots[0].data[((batch * c + ch) * oh + oy) * ow + ox] = max_val;
-                    }
+        let mut no_indices: [f32; 0] = [];
+        let indices: &mut [f32] = match tail.first_mut() {
+            Some(slot) if want_indices => {
+                if slot.data.len() != total {
+                    slot.data.resize(total, 0.0_f32);
                 }
+                slot.shape.clone_from(&out_shape);
+                slot.data.as_mut_slice()
             }
-        }
+            _ => &mut no_indices,
+        };
+
+        conv::max_pool_into(
+            &input.data,
+            &input.shape,
+            &geo,
+            &mut values.data,
+            indices,
+            column_major,
+        );
         Ok(())
     }
 }
@@ -116,28 +185,20 @@ impl Operator for AveragePoolOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let input = ctx.input(0)?;
         let attrs = ctx.attrs();
-        let ks_v = attrs.ints("kernel_shape");
-        let kernel_shape = [ks_v[0] as usize, ks_v[1] as usize];
-        let strides_v = attrs.ints("strides");
-        let strides = [
-            strides_v.first().copied().unwrap_or(1) as usize,
-            strides_v.get(1).copied().unwrap_or(1) as usize,
-        ];
-        let pads_v = attrs.ints("pads");
-        let pads = [
-            pads_v.first().copied().unwrap_or(0) as usize,
-            pads_v.get(1).copied().unwrap_or(0) as usize,
-            pads_v.get(2).copied().unwrap_or(0) as usize,
-            pads_v.get(3).copied().unwrap_or(0) as usize,
-        ];
+        let geo = pool_geometry(attrs, &input.shape, "AveragePool")?;
         let count_include_pad = attrs.i("count_include_pad", 0) != 0;
-        Ok(vec![conv::avg_pool2d(
-            input,
-            kernel_shape,
-            strides,
-            pads,
+
+        let out_shape = geo.out_shape(&input.shape);
+        let total: usize = out_shape.iter().product();
+        let mut values = vec![0.0_f32; total];
+        conv::avg_pool_into(
+            &input.data,
+            &input.shape,
+            &geo,
             count_include_pad,
-        )])
+            &mut values,
+        );
+        Ok(vec![Tensor::new(values, out_shape)])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -155,69 +216,22 @@ impl Operator for AveragePoolOp {
         }
         let input = ctx.input(0)?;
         let attrs = ctx.attrs();
-        let ks_v = attrs.ints("kernel_shape");
-        let kh = ks_v
-            .first()
-            .copied()
-            .ok_or_else(|| OnnxError::Internal("AveragePoolOp: kernel_shape missing".into()))?
-            as usize;
-        let kw = ks_v.get(1).copied().ok_or_else(|| {
-            OnnxError::Internal("AveragePoolOp: kernel_shape requires 2 dims".into())
-        })? as usize;
-        let strides_v = attrs.ints("strides");
-        let s_h = strides_v.first().copied().unwrap_or(1) as usize;
-        let s_w = strides_v.get(1).copied().unwrap_or(1) as usize;
-        let pads_v = attrs.ints("pads");
-        let p_top = pads_v.first().copied().unwrap_or(0) as usize;
-        let p_left = pads_v.get(1).copied().unwrap_or(0) as usize;
-        let p_bottom = pads_v.get(2).copied().unwrap_or(0) as usize;
-        let p_right = pads_v.get(3).copied().unwrap_or(0) as usize;
+        let geo = pool_geometry(attrs, &input.shape, "AveragePool")?;
         let count_include_pad = attrs.i("count_include_pad", 0) != 0;
 
-        let n = input.shape[0];
-        let c = input.shape[1];
-        let h = input.shape[2];
-        let w = input.shape[3];
-        let oh = (h + p_top + p_bottom - kh) / s_h + 1;
-        let ow = (w + p_left + p_right - kw) / s_w + 1;
-        let out_shape = vec![n, c, oh, ow];
-        let total: usize = n * c * oh * ow;
-
+        let out_shape = geo.out_shape(&input.shape);
+        let total: usize = out_shape.iter().product();
         if slots[0].data.len() != total {
             slots[0].data.resize(total, 0.0_f32);
         }
-        slots[0].shape = out_shape;
-
-        for batch in 0..n {
-            for ch in 0..c {
-                for oy in 0..oh {
-                    for ox in 0..ow {
-                        let mut sum = 0.0_f32;
-                        let mut count = 0_usize;
-                        for ky in 0..kh {
-                            for kx in 0..kw {
-                                let iy = (oy * s_h + ky) as isize - p_top as isize;
-                                let ix = (ox * s_w + kx) as isize - p_left as isize;
-                                if iy >= 0 && iy < h as isize && ix >= 0 && ix < w as isize {
-                                    let idx =
-                                        ((batch * c + ch) * h + iy as usize) * w + ix as usize;
-                                    sum += input.data[idx];
-                                    count += 1;
-                                } else if count_include_pad {
-                                    count += 1;
-                                }
-                            }
-                        }
-                        let divisor = if count_include_pad { kh * kw } else { count };
-                        slots[0].data[((batch * c + ch) * oh + oy) * ow + ox] = if divisor > 0 {
-                            sum / divisor as f32
-                        } else {
-                            0.0
-                        };
-                    }
-                }
-            }
-        }
+        slots[0].shape.clone_from(&out_shape);
+        conv::avg_pool_into(
+            &input.data,
+            &input.shape,
+            &geo,
+            count_include_pad,
+            &mut slots[0].data,
+        );
         Ok(())
     }
 }

@@ -388,7 +388,6 @@ pub(crate) fn fast_log_scalar(x: f32) -> f32 {
             + f * (-0.499_999_4 + f * (0.333_319_8 + f * (-0.249_989_5 + f * 0.150_198_6))));
     (exponent as f32) * std::f32::consts::LN_2 + ln_m
 }
-#[allow(dead_code)]
 fn scalar_binary(a: &[f32], b: &[f32], out: &mut [f32], op: Op) {
     match op {
         Op::Add => {
@@ -414,7 +413,6 @@ fn scalar_binary(a: &[f32], b: &[f32], out: &mut [f32], op: Op) {
         _ => {}
     }
 }
-#[allow(dead_code)]
 fn scalar_unary(data: &mut [f32], op: Op) {
     match op {
         Op::Relu => {

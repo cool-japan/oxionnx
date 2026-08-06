@@ -202,7 +202,14 @@ fn test_gru_linear_before_reset() {
     .expect("GRU lbr=true");
 
     assert_eq!(y1.shape, y2.shape);
-    // With zero init, rt * 0 = 0 → same
+    // This fixture is degenerate on purpose: W and R are uniform, so every
+    // reset gate `rt[k]` takes the same value, and Rbh is zero. Under those two
+    // conditions the two ONNX candidate equations coincide:
+    //   lbr=0: Σ_k Rh[j][k]·rt[k]·h[k] = rt·(Rh·h)[j]
+    //   lbr=1: rt·((Rh·h)[j] + Rbh)    = rt·(Rh·h)[j]
+    // (It is *not* true in general — see
+    // `tests/w1_rnn_attention.rs::gru_linear_before_reset_zero_matches_onnx_equation`,
+    // which uses a non-uniform R and gets measurably different results.)
     let diff: f32 = y1
         .data
         .iter()
@@ -211,6 +218,6 @@ fn test_gru_linear_before_reset() {
         .sum();
     assert!(
         diff < 1e-5,
-        "with zero init, lbr shouldn't matter, diff={diff}"
+        "uniform W/R with Rbh=0 makes lbr=0 and lbr=1 coincide, diff={diff}"
     );
 }

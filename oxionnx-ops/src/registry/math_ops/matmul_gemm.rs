@@ -61,14 +61,17 @@ impl Operator for MatMulOp {
             .ok_or_else(|| OnnxError::TensorNotFound("MatMul: missing input[1]".into()))?;
 
         match (&a.storage, &b.storage) {
-            // ── F32: delegate to the high-performance matrixmultiply path ──
-            (TensorStorage::F32(_), TensorStorage::F32(_)) => {
-                let a_t = oxionnx_core::Tensor::new(a.storage.to_f32_vec(), a.shape.clone());
-                let b_t = oxionnx_core::Tensor::new(b.storage.to_f32_vec(), b.shape.clone());
-                let result = math::matmul(&a_t, &b_t).map_err(OnnxError::ShapeMismatch)?;
+            // ── F32: borrow both operands directly and call the shared
+            // sgemm-backed kernel — no clone of either operand (in
+            // particular no clone of B, which is normally the layer
+            // weight; see `crate::math_typed::matmul_f32`'s doc comment). ──
+            (TensorStorage::F32(a_data), TensorStorage::F32(b_data)) => {
+                let (out_data, out_shape) =
+                    crate::math_typed::matmul_f32(a_data, &a.shape, b_data, &b.shape)
+                        .map_err(OnnxError::ShapeMismatch)?;
                 Ok(vec![TypedTensor::new(
-                    TensorStorage::F32(result.data),
-                    result.shape,
+                    TensorStorage::F32(out_data),
+                    out_shape,
                 )])
             }
 
@@ -191,6 +194,26 @@ impl Operator for GemmOp {
             .ok_or_else(|| OnnxError::TensorNotFound("Gemm: missing input B".into()))?;
         let c_opt = ctx.input(2);
 
+        // Gemm's A and B are strictly 2D per the ONNX spec. The optimizer's
+        // fusion passes only ever emit rank-2 Gemm nodes, but a hand-authored
+        // model can still supply a lower/higher-rank tensor here; the M/K/N
+        // computation below indexes `a_shape[0]`/`a_shape[1]` (and the same for
+        // B) unconditionally, which would otherwise panic on a rank-0 or
+        // rank-1 input before any dtype dispatch even runs (including the F32
+        // arm, which would otherwise reach the safe `math::gemm` path too late).
+        if a.shape.len() != 2 {
+            return Err(OnnxError::ShapeMismatch(format!(
+                "Gemm: A must be 2D, got shape {:?}",
+                a.shape
+            )));
+        }
+        if b.shape.len() != 2 {
+            return Err(OnnxError::ShapeMismatch(format!(
+                "Gemm: B must be 2D, got shape {:?}",
+                b.shape
+            )));
+        }
+
         let alpha = ctx.attrs().f("alpha", 1.0_f32);
         let beta = ctx.attrs().f("beta", 1.0_f32);
         let trans_a = ctx.attrs().i("transA", 0) != 0;
@@ -216,23 +239,50 @@ impl Operator for GemmOp {
         let out_len = m * n;
 
         match (&a.storage, &b.storage) {
-            // ── F32: explicit path using math::gemm ──
+            // ── F32: borrow A/B directly (no clone — B is normally the
+            // layer weight) and call the shared sgemm-backed kernel. C is
+            // borrowed too when it is already F32; any other dtype is
+            // numerically converted (matching the pre-optimisation
+            // behaviour, which supported a mixed-dtype C via
+            // `to_f32_vec()`), but that conversion is at most O(M*N), never
+            // the O(M*K)/O(K*N) operand clone this path exists to avoid. ──
             (TensorStorage::F32(a_data), TensorStorage::F32(b_data)) => {
-                let a_t = oxionnx_core::Tensor::new(a_data.clone(), a_shape.clone());
-                let b_t = oxionnx_core::Tensor::new(b_data.clone(), b_shape.clone());
-                let c_f32 = c_opt
-                    .map(|ct| oxionnx_core::Tensor::new(ct.storage.to_f32_vec(), ct.shape.clone()));
-                let result = math::gemm(&a_t, &b_t, c_f32.as_ref(), alpha, beta, trans_a, trans_b)
-                    .map_err(OnnxError::ShapeMismatch)?;
-                Ok(vec![TypedTensor::new(
-                    TensorStorage::F32(result.data),
-                    result.shape,
-                )])
+                let mut out = vec![0.0f32; out_len];
+                match c_opt.map(|ct| (&ct.storage, ct.shape.as_slice())) {
+                    None => {
+                        crate::math_typed::gemm_f32(a_data, b_data, &gd, &gp, None, &mut out);
+                    }
+                    Some((TensorStorage::F32(cd), cs)) => {
+                        crate::math_typed::gemm_f32(
+                            a_data,
+                            b_data,
+                            &gd,
+                            &gp,
+                            Some((cd.as_slice(), cs)),
+                            &mut out,
+                        );
+                    }
+                    Some((other, cs)) => {
+                        let c_f32 = other.to_f32_vec();
+                        crate::math_typed::gemm_f32(
+                            a_data,
+                            b_data,
+                            &gd,
+                            &gp,
+                            Some((c_f32.as_slice(), cs)),
+                            &mut out,
+                        );
+                    }
+                }
+                Ok(vec![TypedTensor::new(TensorStorage::F32(out), out_shape)])
             }
 
             // ── I8 × I8 → I32 ──
             (TensorStorage::I8(a_data), TensorStorage::I8(b_data)) => {
                 let c = if let Some(ct) = c_opt {
+                    if !crate::math_typed::gemm_bias_shape_supported(&ct.shape, m, n) {
+                        return oxionnx_core::default_typed_via_f32(self, ctx);
+                    }
                     match &ct.storage {
                         TensorStorage::I32(cd) => Some((cd.as_slice(), ct.shape.as_slice())),
                         _ => return oxionnx_core::default_typed_via_f32(self, ctx),
@@ -248,6 +298,9 @@ impl Operator for GemmOp {
             // ── I32 × I32 → I32 ──
             (TensorStorage::I32(a_data), TensorStorage::I32(b_data)) => {
                 let c = if let Some(ct) = c_opt {
+                    if !crate::math_typed::gemm_bias_shape_supported(&ct.shape, m, n) {
+                        return oxionnx_core::default_typed_via_f32(self, ctx);
+                    }
                     match &ct.storage {
                         TensorStorage::I32(cd) => Some((cd.as_slice(), ct.shape.as_slice())),
                         _ => return oxionnx_core::default_typed_via_f32(self, ctx),
@@ -263,6 +316,9 @@ impl Operator for GemmOp {
             // ── F16 × F16 → F16 ──
             (TensorStorage::F16(a_data), TensorStorage::F16(b_data)) => {
                 let c = if let Some(ct) = c_opt {
+                    if !crate::math_typed::gemm_bias_shape_supported(&ct.shape, m, n) {
+                        return oxionnx_core::default_typed_via_f32(self, ctx);
+                    }
                     match &ct.storage {
                         TensorStorage::F16(cd) => Some((cd.as_slice(), ct.shape.as_slice())),
                         _ => return oxionnx_core::default_typed_via_f32(self, ctx),
@@ -278,6 +334,9 @@ impl Operator for GemmOp {
             // ── BF16 × BF16 → BF16 ──
             (TensorStorage::BF16(a_data), TensorStorage::BF16(b_data)) => {
                 let c = if let Some(ct) = c_opt {
+                    if !crate::math_typed::gemm_bias_shape_supported(&ct.shape, m, n) {
+                        return oxionnx_core::default_typed_via_f32(self, ctx);
+                    }
                     match &ct.storage {
                         TensorStorage::BF16(cd) => Some((cd.as_slice(), ct.shape.as_slice())),
                         _ => return oxionnx_core::default_typed_via_f32(self, ctx),

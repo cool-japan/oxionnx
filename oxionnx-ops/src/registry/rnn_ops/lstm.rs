@@ -1,8 +1,34 @@
 //! LSTM operator implementation.
 
-use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
+use oxionnx_core::{Attributes, OnnxError, OpContext, Operator, Tensor};
 
 use crate::{rnn, rnn_typed};
+
+/// Read the optional ONNX RNN attributes (`clip`, `layout`, `activation_alpha`,
+/// `activation_beta`) that the plain kernel entry points leave at their defaults.
+///
+/// `clip` must be strictly positive to have any meaning; a missing, non-positive
+/// or non-finite value disables clipping, matching ONNX Runtime.
+pub(super) fn rnn_extras(attrs: &Attributes) -> rnn::RnnExtras<'_> {
+    let clip = attrs
+        .floats
+        .get("clip")
+        .copied()
+        .filter(|c| c.is_finite() && *c > 0.0)
+        .unwrap_or(f32::INFINITY);
+    rnn::RnnExtras {
+        clip,
+        layout: attrs.i("layout", 0),
+        activation_alpha: attrs
+            .float_lists
+            .get("activation_alpha")
+            .map_or(&[][..], |v| v.as_slice()),
+        activation_beta: attrs
+            .float_lists
+            .get("activation_beta")
+            .map_or(&[][..], |v| v.as_slice()),
+    }
+}
 
 pub struct LSTMOp;
 impl Operator for LSTMOp {
@@ -35,7 +61,7 @@ impl Operator for LSTMOp {
             Some(act_refs.as_slice())
         };
 
-        let (y, y_h, y_c) = rnn::lstm(
+        let (y, y_h, y_c) = rnn::lstm_ext(
             x,
             w,
             r,
@@ -47,6 +73,7 @@ impl Operator for LSTMOp {
             hidden_size,
             direction,
             activations,
+            rnn_extras(attrs),
         )?;
 
         Ok(vec![y, y_h, y_c])
@@ -91,13 +118,35 @@ impl Operator for LSTMOp {
             Some(act_refs.as_slice())
         };
 
+        let extras = rnn_extras(attrs);
+
         // Compute output shapes before mutably borrowing slots.
-        let seq_len = x.shape[0];
-        let batch = x.shape[1];
+        // With layout=1 the model hands us X as [batch, seq, input_size].
+        if x.ndim() != 3 {
+            return Err(OnnxError::ShapeMismatch(format!(
+                "LSTMOp: X must be 3D, got {:?}",
+                x.shape
+            )));
+        }
+        let (seq_len, batch) = if extras.layout == 1 {
+            (x.shape[1], x.shape[0])
+        } else {
+            (x.shape[0], x.shape[1])
+        };
         let num_dir: usize = if direction == "bidirectional" { 2 } else { 1 };
-        let y_shape = vec![seq_len, num_dir, batch, hidden_size];
-        let y_h_shape = vec![num_dir, batch, hidden_size];
-        let y_c_shape = vec![num_dir, batch, hidden_size];
+        let (y_shape, state_shape) = if extras.layout == 1 {
+            (
+                vec![batch, seq_len, num_dir, hidden_size],
+                vec![batch, num_dir, hidden_size],
+            )
+        } else {
+            (
+                vec![seq_len, num_dir, batch, hidden_size],
+                vec![num_dir, batch, hidden_size],
+            )
+        };
+        let y_h_shape = state_shape.clone();
+        let y_c_shape = state_shape;
 
         // Resize and set shapes before the 3-way destructure (avoids aliasing).
         let y_len: usize = y_shape.iter().product();
@@ -123,7 +172,7 @@ impl Operator for LSTMOp {
             ));
         };
 
-        rnn::lstm_into(
+        rnn::lstm_into_ext(
             x,
             w,
             r,
@@ -135,6 +184,7 @@ impl Operator for LSTMOp {
             hidden_size,
             direction,
             activations,
+            extras,
             rnn::LstmOutputSlots {
                 y: &mut y_slot.data,
                 y_h: &mut y_h_slot.data,
@@ -190,6 +240,19 @@ impl Operator for LSTMOp {
         } else {
             Some(act_refs.as_slice())
         };
+
+        // The half-precision kernels below do not carry `clip` / `layout` /
+        // `activation_alpha` / `activation_beta`. When any of them is set, route
+        // through the f32 path (which is where those attributes are honoured);
+        // `rnn_typed` is an f32 round-trip anyway, so no fidelity is lost.
+        let extras = rnn_extras(attrs);
+        if extras.clip.is_finite()
+            || extras.layout != 0
+            || !extras.activation_alpha.is_empty()
+            || !extras.activation_beta.is_empty()
+        {
+            return oxionnx_core::default_typed_via_f32(self, ctx);
+        }
 
         // sequence_lens is I32 regardless of the main dtype — convert to f32 Tensor
         // (the existing lstm kernel reads it as f32 and truncates to usize internally).

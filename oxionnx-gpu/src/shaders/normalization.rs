@@ -4,17 +4,22 @@ use crate::context::GpuContext;
 use wgpu::util::DeviceExt;
 
 use super::common::{
-    read_back, BatchNormParams, LayerNormParams, BATCH_NORM_GPU_THRESHOLD, LAYER_NORM_GPU_THRESHOLD,
+    checked_storage_bytes, plan_dispatch, read_back_and_recycle, BatchNormParams, ErrorScope,
+    LayerNormParams, BATCH_NORM_GPU_THRESHOLD, LAYER_NORM_GPU_THRESHOLD, WG_SIZE,
 };
 
 // ========================================================================
 // LayerNorm
 // ========================================================================
 
-/// GPU-accelerated LayerNormalization.
+/// GPU-accelerated LayerNormalization over the last axis (ONNX `axis = -1`).
 ///
-/// Normalizes the last `norm_size` elements of each instance, applying scale and bias.
-/// `shape` must have at least 2 dimensions; the last dimension is the normalized axis.
+/// `scale` and `bias` must have exactly `shape.last()` elements — that is the
+/// shape ONNX requires for `axis = -1`, and a mismatch means the node uses some
+/// other axis, in which case this declines so the CPU operator (which honours
+/// `axis`) handles it. Use [`gpu_layer_norm_axis`] to normalize over an
+/// explicit axis.
+///
 /// Returns `None` if the problem is below the GPU threshold or if GPU is unavailable.
 pub fn gpu_layer_norm(
     ctx: &GpuContext,
@@ -24,27 +29,74 @@ pub fn gpu_layer_norm(
     bias: &[f32],
     eps: f32,
 ) -> Option<Vec<f32>> {
-    if shape.is_empty() {
+    gpu_layer_norm_axis(ctx, input, shape, scale, bias, eps, -1)
+}
+
+/// GPU-accelerated LayerNormalization over `product(shape[axis..])`.
+///
+/// `axis` follows ONNX conventions: negative values count from the end, and the
+/// normalized region is the suffix of the shape starting at `axis` (matching the
+/// CPU `LayerNormOp`). `scale` and `bias` must have exactly that many elements.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_layer_norm_axis(
+    ctx: &GpuContext,
+    input: &[f32],
+    shape: &[usize],
+    scale: &[f32],
+    bias: &[f32],
+    eps: f32,
+    axis: i64,
+) -> Option<Vec<f32>> {
+    if shape.is_empty() || ctx.is_degraded() {
         return None;
     }
-    let n_elements = *shape.last()?;
-    if n_elements == 0 {
+    let rank = i64::try_from(shape.len()).ok()?;
+    let axis = if axis < 0 {
+        axis.checked_add(rank)?
+    } else {
+        axis
+    };
+    if axis < 0 || axis >= rank {
         return None;
     }
-    let batch_count = input.len() / n_elements;
-    if batch_count == 0 || input.len() != batch_count * n_elements {
+    let axis = usize::try_from(axis).ok()?;
+
+    // Normalized region = product(shape[axis..]); instances = product(shape[..axis]).
+    let n_elements: usize = shape[axis..]
+        .iter()
+        .try_fold(1usize, |a, &d| a.checked_mul(d))?;
+    let batch_count: usize = shape[..axis]
+        .iter()
+        .try_fold(1usize, |a, &d| a.checked_mul(d))?;
+    if n_elements == 0 || batch_count == 0 {
         return None;
     }
-    if scale.len() < n_elements || bias.len() < n_elements {
+    let total = batch_count.checked_mul(n_elements)?;
+    if input.len() != total {
         return None;
     }
-    if input.len() < LAYER_NORM_GPU_THRESHOLD {
+    // ONNX requires scale/bias to have exactly the normalized shape. Accepting
+    // a longer slice would silently normalize the wrong region.
+    if scale.len() != n_elements || bias.len() != n_elements {
+        return None;
+    }
+    if total < LAYER_NORM_GPU_THRESHOLD {
         return None;
     }
 
     let device = &ctx.device;
     let queue = &ctx.queue;
-    let total = batch_count * n_elements;
+
+    let out_size = checked_storage_bytes(&ctx.limits, total)?;
+    checked_storage_bytes(&ctx.limits, n_elements)?;
+    if !ctx.limits.buffer_fits(out_size) {
+        return None;
+    }
+    // One workgroup per normalization instance, split across a 2-D grid when
+    // there are more instances than the device allows along one dimension.
+    let grid = plan_dispatch(&ctx.limits, batch_count as u64, 1)?;
+
+    let scope = ErrorScope::begin(ctx);
 
     let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ln_input"),
@@ -62,7 +114,6 @@ pub fn gpu_layer_norm(
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let out_size = (total * std::mem::size_of::<f32>()) as u64;
     let output_buf = {
         let mut pool = ctx.pool.lock().ok()?;
         pool.get_buffer(
@@ -73,10 +124,10 @@ pub fn gpu_layer_norm(
     };
 
     let params = LayerNormParams {
-        n_elements: n_elements as u32,
-        batch_count: batch_count as u32,
+        n_elements: u32::try_from(n_elements).ok()?,
+        batch_count: u32::try_from(batch_count).ok()?,
         eps,
-        _pad: 0,
+        wg_per_row: grid.x,
     };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ln_params"),
@@ -118,9 +169,6 @@ pub fn gpu_layer_norm(
         ],
     });
 
-    // One workgroup per normalization instance
-    let wg = batch_count as u32;
-
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("ln_enc"),
     });
@@ -131,17 +179,16 @@ pub fn gpu_layer_norm(
         });
         cpass.set_pipeline(&ctx.layer_norm_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch_workgroups(wg, 1, 1);
+        cpass.dispatch_workgroups(grid.x, grid.y, 1);
     }
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    let result = read_back(device, &staging_buf, total);
+    if !scope.finish(ctx) {
+        return None;
+    }
 
-    let mut pool = ctx.pool.lock().ok()?;
-    pool.return_buffer(output_buf, out_size);
-
-    result
+    read_back_and_recycle(ctx, &staging_buf, total, output_buf)
 }
 
 // ========================================================================
@@ -163,16 +210,17 @@ pub fn gpu_batch_norm(
     var: &[f32],
     eps: f32,
 ) -> Option<Vec<f32>> {
-    if shape.len() < 2 {
+    if shape.len() < 2 || ctx.is_degraded() {
         return None;
     }
     let channels = shape[1];
-    if channels == 0 {
+    if channels == 0 || shape.contains(&0) {
         return None;
     }
-    let spatial_size: usize = shape[2..].iter().product();
-    let spatial_size = if spatial_size == 0 { 1 } else { spatial_size };
-    let total: usize = shape.iter().product();
+    let spatial_size: usize = shape[2..]
+        .iter()
+        .try_fold(1usize, |a, &d| a.checked_mul(d))?;
+    let total: usize = shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d))?;
     if total == 0 || input.len() < total {
         return None;
     }
@@ -189,6 +237,15 @@ pub fn gpu_batch_norm(
 
     let device = &ctx.device;
     let queue = &ctx.queue;
+
+    let out_size = checked_storage_bytes(&ctx.limits, total)?;
+    checked_storage_bytes(&ctx.limits, channels)?;
+    if !ctx.limits.buffer_fits(out_size) {
+        return None;
+    }
+    let grid = plan_dispatch(&ctx.limits, total as u64, WG_SIZE)?;
+
+    let scope = ErrorScope::begin(ctx);
 
     let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("bn_input"),
@@ -216,7 +273,6 @@ pub fn gpu_batch_norm(
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let out_size = (total * std::mem::size_of::<f32>()) as u64;
     let output_buf = {
         let mut pool = ctx.pool.lock().ok()?;
         pool.get_buffer(
@@ -227,10 +283,14 @@ pub fn gpu_batch_norm(
     };
 
     let params = BatchNormParams {
-        total_elements: total as u32,
-        channels: channels as u32,
-        spatial_size: spatial_size as u32,
+        total_elements: u32::try_from(total).ok()?,
+        channels: u32::try_from(channels).ok()?,
+        spatial_size: u32::try_from(spatial_size).ok()?,
         eps,
+        row_threads: grid.threads_per_row,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("bn_params"),
@@ -280,8 +340,6 @@ pub fn gpu_batch_norm(
         ],
     });
 
-    let wg = (total as u32).div_ceil(256);
-
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("bn_enc"),
     });
@@ -292,15 +350,14 @@ pub fn gpu_batch_norm(
         });
         cpass.set_pipeline(&ctx.batch_norm_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch_workgroups(wg, 1, 1);
+        cpass.dispatch_workgroups(grid.x, grid.y, 1);
     }
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    let result = read_back(device, &staging_buf, total);
+    if !scope.finish(ctx) {
+        return None;
+    }
 
-    let mut pool = ctx.pool.lock().ok()?;
-    pool.return_buffer(output_buf, out_size);
-
-    result
+    read_back_and_recycle(ctx, &staging_buf, total, output_buf)
 }

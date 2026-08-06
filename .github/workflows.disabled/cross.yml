@@ -90,3 +90,47 @@ jobs:
             size=$(du -h "$lib" | cut -f1)
             echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
           done
+
+  # Linux -> Windows cross-clippy gate for the DirectML execution provider.
+  #
+  # oxionnx-directml's Win32/D3D12/DirectML FFI is #[cfg(target_os = "windows")] and
+  # cannot be built, linted, or tested without a Windows machine (the `directml` job in
+  # ci.yml covers real windows-latest build+test coverage). But `--target
+  # x86_64-pc-windows-gnu` makes `cfg(target_os = "windows")` true for the *target*
+  # while the job still runs on this Linux host, so `cargo clippy` type-checks and
+  # lints every Windows-only line -- catching dead code, wrong FFI signatures, and lint
+  # violations -- without needing a Windows runner at all. This is the cheap, fast gate
+  # that caught real bugs during development of oxionnx-directml.
+  cross-clippy-windows:
+    name: Cross-Clippy (x86_64-pc-windows-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The `oxionnx-directml` gate below needs only the Rust target: its Win32/D3D12/
+      # DirectML FFI is pure-Rust `windows`-crate bindings with no C build step (that gate
+      # passes with the target alone). The mingw-w64 cross-linker is required solely by the
+      # *root* `oxionnx` gate -- `--all-targets` compiles the Criterion benches, and
+      # Criterion's `alloca` dev-dependency runs a C build script that must link for
+      # x86_64-pc-windows-gnu. Installed once here; only the second clippy step uses it.
+      - name: Install mingw-w64 cross-linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Clippy oxionnx-directml (Windows target)
+        run: cargo clippy --target x86_64-pc-windows-gnu -p oxionnx-directml --all-targets -- -D warnings
+      # Load-bearing: this step is what actually catches a `Session: Sync` regression.
+      # `Session` only gains a real `oxionnx_directml::DirectMLContext` field under
+      # `--features directml`, and that context only holds real, non-Send/non-Sync COM
+      # device handles once `cfg(target_os = "windows")` is true. On a native
+      # Linux/macOS clippy run, `Session` stays trivially `Send + Sync` no matter what
+      # is wrong with `DirectMLContext`, because the Windows-shaped fields never come
+      # into existence. Only cross-compiling `-p oxionnx --features directml` to a
+      # Windows target puts the real COM-bearing shape in front of the
+      # `assert_send_sync::<Session>()` const-check in src/session/mod.rs, so this is
+      # the only job in this repo that can catch that class of bug before a human on
+      # real Windows hardware would.
+      - name: Clippy oxionnx (Windows target, directml feature)
+        run: cargo clippy --target x86_64-pc-windows-gnu -p oxionnx --features directml --all-targets -- -D warnings

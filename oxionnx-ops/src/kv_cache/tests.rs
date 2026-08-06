@@ -461,6 +461,233 @@ fn test_cached_flash_attention_error() {
         "error should mention 4D requirement: {err_msg}"
     );
 }
+// ── In-place append (capacity buffer) regression tests ──────────────────────
+//
+// `update` writes new tokens into spare capacity and evicts by advancing a
+// start offset, instead of concatenating (and then cloning) the whole cache
+// per token. These tests pin the observable behaviour of that buffer: token
+// ordering across every growth/compaction path, per-(batch, head) interleaving
+// after a re-layout, and the fact that a rejected update leaves the cache
+// untouched.
+
+/// A 4D `[batch, heads, 1, dim]` token whose every element encodes
+/// `(b, h, token, d)` uniquely, so a mis-shuffled buffer is unmistakable.
+fn coded_token(batch: usize, heads: usize, head_dim: usize, token: usize) -> Tensor {
+    let mut data = vec![0.0f32; batch * heads * head_dim];
+    for b in 0..batch {
+        for h in 0..heads {
+            for d in 0..head_dim {
+                data[(b * heads + h) * head_dim + d] =
+                    (b * 1_000_000 + h * 10_000 + token * 10 + d) as f32;
+            }
+        }
+    }
+    Tensor::new(data, vec![batch, heads, 1, head_dim])
+}
+
+/// Expected element for `(b, h, token, d)` in a gathered cache.
+fn coded_value(b: usize, h: usize, token: usize, d: usize) -> f32 {
+    (b * 1_000_000 + h * 10_000 + token * 10 + d) as f32
+}
+
+#[test]
+fn test_append_in_place_preserves_order_through_growth() {
+    let (batch, heads, head_dim, steps) = (2usize, 3usize, 4usize, 40usize);
+    let mut cache = KvCache::new(1);
+    for token in 0..steps {
+        let k = coded_token(batch, heads, head_dim, token);
+        let (full_k, full_v) = cache.update(0, &k, &k).unwrap();
+        assert_eq!(full_k.shape, vec![batch, heads, token + 1, head_dim]);
+        assert_eq!(full_v.shape, full_k.shape);
+        assert_eq!(cache.seq_len(0), token + 1);
+        let seq = token + 1;
+        for b in 0..batch {
+            for h in 0..heads {
+                for t in 0..seq {
+                    for d in 0..head_dim {
+                        let idx = ((b * heads + h) * seq + t) * head_dim + d;
+                        assert_eq!(
+                            full_k.data[idx],
+                            coded_value(b, h, t, d),
+                            "step {token}: b={b} h={h} t={t} d={d}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_ring_buffer_keeps_last_entries_through_compaction() {
+    // max_len 3 with 40 single-token steps forces the capacity buffer to run
+    // out of tail room repeatedly and compact.
+    let (batch, heads, head_dim, max_len) = (2usize, 2usize, 3usize, 3usize);
+    let mut cache = KvCache::with_max_seq_len(1, max_len);
+    for token in 0..40usize {
+        let k = coded_token(batch, heads, head_dim, token);
+        let (full_k, _) = cache.update(0, &k, &k).unwrap();
+        let expected_full = (token + 1).min(max_len + 1);
+        assert_eq!(full_k.shape[2], expected_full, "step {token} full seq");
+        // The returned tensor is past + new (untrimmed): its last row is the
+        // token just written, its first row is `token + 1 - expected_full`.
+        let first = token + 1 - expected_full;
+        for b in 0..batch {
+            for h in 0..heads {
+                for t in 0..expected_full {
+                    for d in 0..head_dim {
+                        let idx = ((b * heads + h) * expected_full + t) * head_dim + d;
+                        assert_eq!(
+                            full_k.data[idx],
+                            coded_value(b, h, first + t, d),
+                            "step {token}: b={b} h={h} t={t} d={d}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(cache.seq_len(0), (token + 1).min(max_len));
+    }
+}
+
+#[test]
+fn test_prefill_then_multi_token_decode_ordering() {
+    let (batch, heads, head_dim) = (1usize, 2usize, 2usize);
+    let mut cache = KvCache::new(1);
+    // Prefill 5 tokens in one shot.
+    let mut prefill = vec![0.0f32; batch * heads * 5 * head_dim];
+    for b in 0..batch {
+        for h in 0..heads {
+            for t in 0..5 {
+                for d in 0..head_dim {
+                    prefill[((b * heads + h) * 5 + t) * head_dim + d] = coded_value(b, h, t, d);
+                }
+            }
+        }
+    }
+    let prefill = Tensor::new(prefill, vec![batch, heads, 5, head_dim]);
+    let (fk, _) = cache.update(0, &prefill, &prefill).unwrap();
+    assert_eq!(fk.shape, vec![batch, heads, 5, head_dim]);
+    assert_eq!(cache.seq_len(0), 5);
+    // Then decode two tokens at a time.
+    for chunk in 0..3usize {
+        let t0 = 5 + chunk * 2;
+        let mut data = vec![0.0f32; batch * heads * 2 * head_dim];
+        for b in 0..batch {
+            for h in 0..heads {
+                for j in 0..2 {
+                    for d in 0..head_dim {
+                        data[((b * heads + h) * 2 + j) * head_dim + d] =
+                            coded_value(b, h, t0 + j, d);
+                    }
+                }
+            }
+        }
+        let new = Tensor::new(data, vec![batch, heads, 2, head_dim]);
+        let (fk, _) = cache.update(0, &new, &new).unwrap();
+        let seq = t0 + 2;
+        assert_eq!(fk.shape, vec![batch, heads, seq, head_dim]);
+        for b in 0..batch {
+            for h in 0..heads {
+                for t in 0..seq {
+                    for d in 0..head_dim {
+                        let idx = ((b * heads + h) * seq + t) * head_dim + d;
+                        assert_eq!(fk.data[idx], coded_value(b, h, t, d), "t={t} d={d}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_ring_chunk_larger_than_max_keeps_tail() {
+    let mut cache = KvCache::with_max_seq_len(1, 3);
+    let data: Vec<f32> = (0..5).map(|i| i as f32).collect();
+    let big = Tensor::new(data, vec![1, 1, 5, 1]);
+    let (fk, _) = cache.update(0, &big, &big).unwrap();
+    assert_eq!(fk.shape, vec![1, 1, 5, 1]);
+    assert_eq!(fk.data, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(cache.seq_len(0), 3);
+    // The cache retained the *last* three (2, 3, 4); appending 5 shows it.
+    let nxt = Tensor::new(vec![5.0], vec![1, 1, 1, 1]);
+    let (fk2, _) = cache.update(0, &nxt, &nxt).unwrap();
+    assert_eq!(fk2.shape, vec![1, 1, 4, 1]);
+    assert_eq!(fk2.data, vec![2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(cache.seq_len(0), 3);
+}
+
+#[test]
+fn test_rejected_update_leaves_cache_intact() {
+    let mut cache = KvCache::new(1);
+    let k1 = Tensor::new(vec![1.0, 2.0], vec![1, 2, 1, 1]);
+    cache.update(0, &k1, &k1).unwrap();
+
+    // Wrong head count, wrong head_dim, wrong batch, empty seq, wrong rank.
+    let bad_heads = Tensor::new(vec![9.0; 3], vec![1, 3, 1, 1]);
+    assert!(cache.update(0, &bad_heads, &bad_heads).is_err());
+    let bad_dim = Tensor::new(vec![9.0; 4], vec![1, 2, 1, 2]);
+    assert!(cache.update(0, &bad_dim, &bad_dim).is_err());
+    let bad_batch = Tensor::new(vec![9.0; 4], vec![2, 2, 1, 1]);
+    assert!(cache.update(0, &bad_batch, &bad_batch).is_err());
+    let empty = Tensor::new(vec![], vec![1, 2, 0, 1]);
+    assert!(cache.update(0, &empty, &empty).is_err());
+    let bad_rank = Tensor::new(vec![9.0; 2], vec![2, 1]);
+    assert!(cache.update(0, &bad_rank, &bad_rank).is_err());
+
+    // Cache is untouched and still usable.
+    assert_eq!(cache.seq_len(0), 1);
+    let k2 = Tensor::new(vec![3.0, 4.0], vec![1, 2, 1, 1]);
+    let (fk, _) = cache.update(0, &k2, &k2).unwrap();
+    assert_eq!(fk.shape, vec![1, 2, 2, 1]);
+    assert_eq!(fk.data, vec![1.0, 3.0, 2.0, 4.0]);
+    assert_eq!(cache.seq_len(0), 2);
+}
+
+/// A value tensor that fails validation must not leave the *key* half appended
+/// — both halves are validated before either is mutated.
+#[test]
+fn test_value_shape_error_does_not_append_key() {
+    let mut cache = KvCache::new(1);
+    let k = Tensor::new(vec![1.0, 2.0], vec![1, 2, 1, 1]);
+    cache.update(0, &k, &k).unwrap();
+    let good_key = Tensor::new(vec![3.0, 4.0], vec![1, 2, 1, 1]);
+    let bad_value = Tensor::new(vec![9.0; 4], vec![1, 2, 1, 2]);
+    assert!(cache.update(0, &good_key, &bad_value).is_err());
+    assert_eq!(cache.seq_len(0), 1, "key must not have been appended");
+    let (fk, _) = cache.update(0, &good_key, &good_key).unwrap();
+    assert_eq!(fk.data, vec![1.0, 3.0, 2.0, 4.0]);
+}
+
+#[test]
+fn test_clear_allows_new_shape() {
+    let mut cache = KvCache::new(1);
+    let k = Tensor::new(vec![1.0, 2.0], vec![1, 2, 1, 1]);
+    cache.update(0, &k, &k).unwrap();
+    cache.clear();
+    assert_eq!(cache.seq_len(0), 0);
+    // Different head count / head_dim is fine after a clear.
+    let k2 = Tensor::new(vec![5.0; 12], vec![1, 3, 1, 4]);
+    let (fk, _) = cache.update(0, &k2, &k2).unwrap();
+    assert_eq!(fk.shape, vec![1, 3, 1, 4]);
+    assert_eq!(cache.seq_len(0), 1);
+}
+
+#[test]
+fn test_zero_sized_dims_do_not_panic() {
+    let mut cache = KvCache::new(1);
+    // batch = 0 → no elements, but a legal shape.
+    let empty_batch = Tensor::new(vec![], vec![0, 2, 1, 4]);
+    let (fk, _) = cache.update(0, &empty_batch, &empty_batch).unwrap();
+    assert_eq!(fk.shape, vec![0, 2, 1, 4]);
+    assert_eq!(cache.seq_len(0), 1);
+    // head_dim = 0.
+    let mut cache2 = KvCache::new(1);
+    let zero_dim = Tensor::new(vec![], vec![1, 2, 1, 0]);
+    let (fk2, _) = cache2.update(0, &zero_dim, &zero_dim).unwrap();
+    assert_eq!(fk2.shape, vec![1, 2, 1, 0]);
+}
+
 /// Extract token at position `t` from a 4D tensor [batch=1, heads, seq, dim].
 fn extract_token(tensor: &Tensor, t: usize) -> Tensor {
     let batch = tensor.shape[0];

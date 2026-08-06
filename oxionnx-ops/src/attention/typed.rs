@@ -80,33 +80,16 @@ fn softmax_f32(data: &mut [f32], inner: usize) {
     }
 }
 
-/// Naive [m, k] @ [k, n] → [m, n] in f32.
+/// `[m, k] @ [k, n] → [m, n]` in f32 (sgemm-backed; see [`super::gemm`]).
+#[inline]
 fn mm_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; m * n];
-    for i in 0..m {
-        for p in 0..k {
-            let av = a[i * k + p];
-            for j in 0..n {
-                out[i * n + j] += av * b[p * n + j];
-            }
-        }
-    }
-    out
+    super::gemm::matmul_nn(a, b, m, k, n)
 }
 
-/// Naive [m, k] @ [n, k]^T → [m, n] in f32.
+/// `[m, k] @ [n, k]^T → [m, n]` in f32 (sgemm-backed; see [`super::gemm`]).
+#[inline]
 fn mm_a_bt_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut s = 0.0f32;
-            for p in 0..k {
-                s += a[i * k + p] * b[j * k + p];
-            }
-            out[i * n + j] = s;
-        }
-    }
-    out
+    super::gemm::matmul_nt(a, b, m, k, n)
 }
 
 // ── SDPA inner kernel (operates fully in f32) ────────────────────────────────
@@ -116,6 +99,21 @@ fn mm_a_bt_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 /// All three input matrices are provided as f32 slices (already decoded from their
 /// native dtype by the caller).  Output is written into `out_f32` (pre-allocated,
 /// length = batch_total × seq_q × head_dim).
+///
+/// `mask`'s shape is *not* passed in — only a flat buffer plus an
+/// `is_broadcast` flag. The sole caller, `registry/rnn_ops/attention.rs::
+/// typed_mask_is_supported`, only lets a mask reach this kernel when its
+/// trailing two dims are exactly `[seq_q, seq_kv]` and the product of its
+/// leading dims is either `1` (broadcast over every flat batch/head index,
+/// `is_broadcast = true`) or exactly `batch_total` (one exact `[seq_q,
+/// seq_kv]` slice per flat batch index, laid out in the same order this
+/// loop walks `b`); anything a flat stride cannot express (e.g. a `[B, 1,
+/// S_q, S_k]` padding mask broadcasting only over heads) is declined to the
+/// f32 path before it ever gets here. A real per-dimension broadcast plan
+/// (the `MaskPlan` in `attention::core`) would need that shape threaded
+/// through this function's `pub(crate)` callers and their sole call site in
+/// the unowned `registry/rnn_ops/attention.rs` — deferred; see the stitch
+/// report.
 fn sdpa_f32_kernel(
     q_f32: &[f32],
     k_f32: &[f32],
@@ -136,7 +134,23 @@ fn sdpa_f32_kernel(
     let k_stride = seq_kv * head_dim;
     let v_stride = seq_kv * head_dim;
     let out_stride = seq_q * head_dim;
-    let mask_stride_per_batch = seq_q * seq_kv;
+    let mask_slice_len = seq_q * seq_kv;
+
+    // Validate the caller's contract *once* rather than per-element: if the
+    // buffer is ever shorter than the access pattern it claims to support
+    // (which, per the invariant above, should never happen), drop the mask
+    // for the whole call instead of the previous per-element `if m_idx <
+    // mask_data.len()` guard, which could silently apply only *part* of a
+    // too-short mask to a row — a worse, harder-to-notice failure mode than
+    // "unmasked" and not something a bounds check should paper over.
+    let mask = mask.filter(|&(data, is_broadcast)| {
+        let needed = if is_broadcast {
+            mask_slice_len
+        } else {
+            batch_total.saturating_mul(mask_slice_len)
+        };
+        data.len() >= needed
+    });
 
     for b in 0..batch_total {
         let q_off = b * q_stride;
@@ -153,18 +167,16 @@ fn sdpa_f32_kernel(
             *s *= scale;
         }
 
-        // Add mask (f32 additive) — handle broadcast.
+        // Add mask (f32 additive): one exact `mask_slice_len`-wide slice,
+        // reused for every `b` when broadcasting, otherwise selected by `b`
+        // — see the invariant `mask` was filtered against above. Bounds are
+        // already guaranteed by that filter, so this is a direct zip, not a
+        // per-element guard.
         if let Some((mask_data, is_broadcast)) = mask {
-            let m_off = if is_broadcast {
-                0
-            } else {
-                b * mask_stride_per_batch
-            };
-            for (i, sc) in scores.iter_mut().enumerate() {
-                let m_idx = m_off + i;
-                if m_idx < mask_data.len() {
-                    *sc += mask_data[m_idx];
-                }
+            let m_off = if is_broadcast { 0 } else { b * mask_slice_len };
+            let m_slice = &mask_data[m_off..m_off + mask_slice_len];
+            for (sc, &m) in scores.iter_mut().zip(m_slice) {
+                *sc += m;
             }
         }
 

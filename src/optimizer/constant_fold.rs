@@ -8,15 +8,25 @@ use std::collections::{HashMap, HashSet};
 /// Constant folding: evaluate nodes whose inputs are all known constants
 /// (present in `weights`). Store results back in `weights` and remove the node.
 /// Iterates until no more nodes can be folded.
+///
+/// Two classes of node are never folded:
+/// * ops that depend on runtime state or a random source — folding one of those
+///   freezes a single sample into the weights for the life of the session;
+/// * any node producing a declared graph output — the folded value lands in
+///   `weights`, which `SessionRunState::take_outputs` does not consult, so the
+///   model would silently return one output fewer.
 pub fn constant_fold(
     mut nodes: Vec<Node>,
     weights: &mut HashMap<String, Tensor>,
     registry: &OperatorRegistry,
+    output_names: &[String],
 ) -> Vec<Node> {
     // Ops that depend on runtime state or have side effects — skip these.
     let skip_ops: HashSet<&str> = [
         "Shape",
         "Dropout",
+        "Bernoulli",
+        "Multinomial",
         "RandomNormal",
         "RandomUniform",
         "RandomNormalLike",
@@ -25,6 +35,8 @@ pub fn constant_fold(
     .iter()
     .copied()
     .collect();
+
+    let graph_outputs: HashSet<&str> = output_names.iter().map(String::as_str).collect();
 
     loop {
         let mut folded_any = false;
@@ -38,6 +50,15 @@ pub fn constant_fold(
             }
             let op_name = node.op.as_str();
             if skip_ops.contains(op_name) {
+                keep.push(node);
+                continue;
+            }
+            // Never fold away a node that produces a graph output.
+            if node
+                .outputs
+                .iter()
+                .any(|out| graph_outputs.contains(out.as_str()))
+            {
                 keep.push(node);
                 continue;
             }
@@ -131,7 +152,7 @@ mod tests {
         weights.insert("b".to_string(), Tensor::new(vec![4.0, 5.0, 6.0], vec![3]));
 
         let registry = oxionnx_ops::default_registry();
-        let result = constant_fold(vec![add_node], &mut weights, &registry);
+        let result = constant_fold(vec![add_node], &mut weights, &registry, &[]);
 
         assert!(
             result.is_empty(),
@@ -153,7 +174,7 @@ mod tests {
         weights.insert("c".to_string(), Tensor::new(vec![4.0, 5.0], vec![2]));
 
         let registry = oxionnx_ops::default_registry();
-        let result = constant_fold(vec![add_runtime, add_const], &mut weights, &registry);
+        let result = constant_fold(vec![add_runtime, add_const], &mut weights, &registry, &[]);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "add_rt");
@@ -169,7 +190,7 @@ mod tests {
         weights.insert("b".to_string(), Tensor::new(vec![2.0], vec![1]));
 
         let registry = OperatorRegistry::new(); // empty registry
-        let result = constant_fold(vec![add_node], &mut weights, &registry);
+        let result = constant_fold(vec![add_node], &mut weights, &registry, &[]);
 
         assert_eq!(result.len(), 1);
         assert!(!weights.contains_key("sum"));
@@ -186,7 +207,7 @@ mod tests {
         weights.insert("d".to_string(), Tensor::new(vec![10.0], vec![1]));
 
         let registry = oxionnx_ops::default_registry();
-        let result = constant_fold(vec![add1, add2], &mut weights, &registry);
+        let result = constant_fold(vec![add1, add2], &mut weights, &registry, &[]);
 
         assert!(result.is_empty());
         let e = weights.get("e").expect("e in weights");

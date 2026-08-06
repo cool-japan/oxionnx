@@ -77,11 +77,11 @@ pub fn non_max_suppression(
     let num_boxes = boxes.shape[1];
     let num_classes = scores.shape[1];
 
-    let max_out = if max_output_per_class == 0 {
-        num_boxes
-    } else {
-        max_output_per_class
-    };
+    // ONNX spec: max_output_boxes_per_class defaults to 0, and 0 means "select
+    // no boxes" for that class -- it is NOT a sentinel for "unlimited". The
+    // caller (registry/misc_ops.rs) already passes 0 when the optional input
+    // is absent, matching the spec default, so we must honor it literally.
+    let max_out = max_output_per_class;
 
     let mut selected: Vec<[f32; 3]> = Vec::new();
 
@@ -197,6 +197,29 @@ mod tests {
         let out =
             non_max_suppression(&boxes, &scores, 1, 0.5, 0.0, 0).expect("nms max output failed");
         assert_eq!(out.shape[0], 1); // max 1 per class
+    }
+
+    #[test]
+    fn test_nms_max_output_per_class_zero_selects_nothing() {
+        // ONNX spec: max_output_boxes_per_class default (and explicit) value
+        // of 0 means "select zero boxes for this class", not "unlimited".
+        // registry/misc_ops.rs passes 0 when the optional input is absent,
+        // so this exercises the exact default-omitted-input scenario.
+        let boxes = Tensor::new(
+            vec![
+                0.0, 0.0, 1.0, 1.0, 5.0, 5.0, 6.0, 6.0, 10.0, 10.0, 11.0, 11.0,
+            ],
+            vec![1, 3, 4],
+        );
+        let scores = Tensor::new(vec![0.9, 0.8, 0.7], vec![1, 1, 3]);
+        let out =
+            non_max_suppression(&boxes, &scores, 0, 0.5, 0.0, 0).expect("nms max_output=0 failed");
+        assert_eq!(
+            out.shape,
+            vec![0, 3],
+            "max_output_per_class=0 must select zero boxes"
+        );
+        assert!(out.data.is_empty());
     }
 
     #[test]

@@ -173,21 +173,25 @@ fn test_streaming_parse_simple() {
                     assert_eq!(tensor.shape, vec![2, 3]);
                     assert_eq!(tensor.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
                 }
-                ParseEvent::GraphInput(name) => {
-                    assert!(!name.is_empty());
+                ParseEvent::GraphInput(vi) => {
+                    assert!(!vi.name.is_empty());
                 }
-                ParseEvent::GraphOutput(name) => {
-                    assert_eq!(name, "y");
+                ParseEvent::GraphOutput(vi) => {
+                    assert_eq!(vi.name, "y");
                 }
-                ParseEvent::End => {}
+                ParseEvent::GraphName(_)
+                | ParseEvent::OpsetImport { .. }
+                | ParseEvent::ValueInfo(_)
+                | ParseEvent::LocalFunction(_)
+                | ParseEvent::End => {}
             }
             events.push(format!("{event:?}"));
             Ok(())
         })
         .expect("parse should succeed");
 
-    // ModelHeader, Node, Weight, 2x GraphInput, 1x GraphOutput, End
-    assert_eq!(events.len(), 7, "got {events:#?}");
+    // ModelHeader, OpsetImport, Node, Weight, 2x GraphInput, 1x GraphOutput, End
+    assert_eq!(events.len(), 8, "got {events:#?}");
 }
 
 #[test]
@@ -228,10 +232,16 @@ fn test_parse_event_callback_order() {
         .parse(|event| {
             let label = match &event {
                 ParseEvent::ModelHeader { .. } => "ModelHeader".to_string(),
+                ParseEvent::OpsetImport { domain, version } => {
+                    format!("OpsetImport({domain},{version})")
+                }
+                ParseEvent::GraphName(n) => format!("GraphName({n})"),
                 ParseEvent::Node(n) => format!("Node({})", n.op_type),
                 ParseEvent::Weight { name, .. } => format!("Weight({name})"),
-                ParseEvent::GraphInput(n) => format!("GraphInput({n})"),
-                ParseEvent::GraphOutput(n) => format!("GraphOutput({n})"),
+                ParseEvent::GraphInput(vi) => format!("GraphInput({})", vi.name),
+                ParseEvent::GraphOutput(vi) => format!("GraphOutput({})", vi.name),
+                ParseEvent::ValueInfo(vi) => format!("ValueInfo({})", vi.name),
+                ParseEvent::LocalFunction(f) => format!("LocalFunction({})", f.name),
                 ParseEvent::End => "End".to_string(),
             };
             event_types.push(label);
@@ -308,7 +318,13 @@ fn test_streaming_vs_batch() {
         .graph
         .initializers
         .iter()
-        .map(|tp| (tp.name.clone(), tp.to_tensor()))
+        .map(|tp| {
+            (
+                tp.name.clone(),
+                tp.try_to_tensor()
+                    .expect("well-formed fixture tensor must decode"),
+            )
+        })
         .collect();
 
     assert_eq!(
@@ -336,4 +352,52 @@ fn test_streaming_vs_batch() {
     // Compare inputs/outputs
     assert_eq!(batch_model.graph.inputs, stream_graph.inputs);
     assert_eq!(batch_model.graph.outputs, stream_graph.outputs);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// [stitch S1-2] streaming initializer decode must be fallible
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn streaming_parse_reports_malformed_initializer_not_a_placeholder() {
+    // dims=[2,3] declares 6 elements but only 2 floats are provided: a real
+    // producer never emits this, but a hostile/corrupt file can. The eager
+    // `load()` path already turns this into a load error (a2-5/a2-10); the
+    // streaming path must match instead of silently emitting a zero-filled
+    // placeholder tensor.
+    let bad_weight = build_tensor_proto("bad", &[2, 3], /* data_type = */ 1, &[1.0, 2.0]);
+    let model = build_model(7, 13, &[], &[bad_weight], &["bad"], &["bad"]);
+
+    let mut parser = StreamingParser::new(Cursor::new(model.clone()));
+    let err = parser
+        .parse(|_event| Ok(()))
+        .expect_err("malformed initializer must fail streaming parse");
+    assert!(
+        err.contains("bad") && err.contains("expected 6") && err.contains("found 2"),
+        "error should name the tensor and the expected/found element counts: {err}"
+    );
+
+    // The convenience wrapper must surface the same failure, not swallow it.
+    let err = parse_streaming(Cursor::new(model))
+        .expect_err("parse_streaming must propagate the same decode failure");
+    assert!(err.contains("bad"), "got: {err}");
+}
+
+#[test]
+fn streaming_weight_filter_still_fails_on_a_malformed_initializer_it_would_reject() {
+    // Documents a deliberate behaviour change: `parse_graph_streaming` now
+    // decodes each initializer (fallibly) *before* emitting `ParseEvent::Weight`,
+    // and `parse_with_weight_filter`'s closure only runs once that event is
+    // received — so a malformed initializer fails the whole load even if the
+    // filter would have rejected it and never materialized it. This matches
+    // the eager path (which validates every initializer up front, regardless
+    // of what a caller ultimately wants) rather than silently tolerating
+    // corrupt data in parts of the file the caller was trying to skip.
+    let good = build_tensor_proto("keep_me", &[2], 1, &[1.0, 2.0]);
+    let bad = build_tensor_proto("skip_me", &[2, 3], 1, &[1.0, 2.0]);
+    let model = build_model(7, 13, &[], &[good, bad], &["keep_me", "skip_me"], &[]);
+
+    let err = parse_with_weight_filter(Cursor::new(model), |name, _shape| name == "keep_me")
+        .expect_err("a malformed initializer fails the load even when filtered out");
+    assert!(err.contains("skip_me"), "got: {err}");
 }

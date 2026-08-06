@@ -19,7 +19,7 @@ pub use parser::parse_model;
 pub use reader::OnnxReader;
 pub use reader::{
     attr_float, attr_int, attr_ints, attr_string, attr_type, bytes_to_f32, dtype_code,
-    external_entry, is_external, ReaderError,
+    dtype_size_bytes, external_entry, is_external, resolve_external_path, ReaderError,
 };
 pub use schema::{default_schemas, validate_schemas, OpSchema, SchemaViolation};
 pub use streaming_parser::{

@@ -1,7 +1,75 @@
 //! Attention variants: multi-query, grouped-query, and ALiBi attention.
 
-use super::core::{mm, mm_a_bt, softmax_last_dim};
+use super::core::softmax_last_dim;
+#[cfg(not(target_arch = "wasm32"))]
+use super::gemm::should_parallelize;
+use super::gemm::{matmul_nn_into, matmul_nt_into};
 use oxionnx_core::{OnnxError, Tensor};
+
+// ── Shared per-head driver ───────────────────────────────────────────────────
+
+/// Shapes describing one `(batch × head)` attention loop.
+struct HeadLoop {
+    batch: usize,
+    num_heads: usize,
+    seq_q: usize,
+    seq_k: usize,
+    d_v: usize,
+    /// Multiply-accumulates per head — the parallelism threshold input.
+    macs_per_head: usize,
+}
+
+/// Run `head_fn` once per `(batch, head)` pair, writing that pair's
+/// `seq_q × d_v` output chunk.
+///
+/// Every pair is independent, so this hands the loop to rayon when the problem
+/// is large enough to amortise task dispatch. `head_fn` receives a reusable
+/// per-worker `seq_q × seq_k` score scratch buffer, so the score matrix is
+/// allocated once per worker instead of once per head.
+///
+/// `head_fn` must be side-effect free apart from the two buffers it is handed —
+/// it is called from multiple threads with different `(b, h)` values.
+fn for_each_head<F>(loop_dims: &HeadLoop, output: &mut [f32], head_fn: F)
+where
+    F: Fn(usize, usize, &mut [f32], &mut [f32]) + Sync + Send,
+{
+    let HeadLoop {
+        batch,
+        num_heads,
+        seq_q,
+        seq_k,
+        d_v,
+        macs_per_head,
+    } = *loop_dims;
+    let unit = seq_q * d_v;
+    if unit == 0 || batch * num_heads == 0 {
+        return;
+    }
+    let scratch_len = seq_q * seq_k;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if should_parallelize(batch * num_heads, macs_per_head) {
+        use rayon::prelude::*;
+        output[..batch * num_heads * unit]
+            .par_chunks_mut(unit)
+            .enumerate()
+            .for_each_init(
+                || vec![0.0f32; scratch_len],
+                |scores, (bh, out_slice)| {
+                    head_fn(bh / num_heads, bh % num_heads, scores, out_slice);
+                },
+            );
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = macs_per_head;
+
+    let mut scores = vec![0.0f32; scratch_len];
+    for bh in 0..batch * num_heads {
+        let out_slice = &mut output[bh * unit..(bh + 1) * unit];
+        head_fn(bh / num_heads, bh % num_heads, &mut scores, out_slice);
+    }
+}
 
 // ── Multi-Query Attention ────────────────────────────────────────────────────
 
@@ -114,40 +182,44 @@ pub fn grouped_query_attention(
     let k_head_stride = seq_k * head_dim;
     let v_head_stride = seq_k * d_v;
     let mut output = vec![0.0f32; batch * num_heads * seq_q * d_v];
-    for b in 0..batch {
-        for h in 0..num_heads {
-            let kv_h = h / heads_per_group;
-            let q_off = b * num_heads * q_head_stride + h * q_head_stride;
-            let k_off = b * num_kv_heads * k_head_stride + kv_h * k_head_stride;
-            let v_off = b * num_kv_heads * v_head_stride + kv_h * v_head_stride;
-            let o_off = b * num_heads * seq_q * d_v + h * seq_q * d_v;
-            let q_slice = &q.data[q_off..q_off + q_head_stride];
-            let k_slice = &k.data[k_off..k_off + k_head_stride];
-            let mut scores = mm_a_bt(q_slice, k_slice, seq_q, head_dim, seq_k);
-            for s in scores.iter_mut() {
-                *s *= scale_val;
-            }
-            if let Some(md) = mask_data {
-                let m_batch_off = if mask_batch_stride == 0 {
-                    0
-                } else {
-                    b * mask_batch_stride
-                };
-                for i in 0..seq_q {
-                    for j in 0..seq_k {
-                        let m_idx = m_batch_off + i * seq_k + j;
-                        if m_idx < md.len() {
-                            scores[i * seq_k + j] += md[m_idx];
-                        }
+    let loop_dims = HeadLoop {
+        batch,
+        num_heads,
+        seq_q,
+        seq_k,
+        d_v,
+        macs_per_head: seq_q * seq_k * (head_dim + d_v),
+    };
+    for_each_head(&loop_dims, &mut output, |b, h, scores, out_slice| {
+        let kv_h = h / heads_per_group;
+        let q_off = b * num_heads * q_head_stride + h * q_head_stride;
+        let k_off = b * num_kv_heads * k_head_stride + kv_h * k_head_stride;
+        let v_off = b * num_kv_heads * v_head_stride + kv_h * v_head_stride;
+        let q_slice = &q.data[q_off..q_off + q_head_stride];
+        let k_slice = &k.data[k_off..k_off + k_head_stride];
+        matmul_nt_into(q_slice, k_slice, seq_q, head_dim, seq_k, scores);
+        for s in scores.iter_mut() {
+            *s *= scale_val;
+        }
+        if let Some(md) = mask_data {
+            let m_batch_off = if mask_batch_stride == 0 {
+                0
+            } else {
+                b * mask_batch_stride
+            };
+            for i in 0..seq_q {
+                for j in 0..seq_k {
+                    let m_idx = m_batch_off + i * seq_k + j;
+                    if m_idx < md.len() {
+                        scores[i * seq_k + j] += md[m_idx];
                     }
                 }
             }
-            softmax_last_dim(&mut scores, seq_k);
-            let v_slice = &v.data[v_off..v_off + v_head_stride];
-            let attn_out = mm(&scores, v_slice, seq_q, seq_k, d_v);
-            output[o_off..o_off + seq_q * d_v].copy_from_slice(&attn_out);
         }
-    }
+        softmax_last_dim(scores, seq_k);
+        let v_slice = &v.data[v_off..v_off + v_head_stride];
+        matmul_nn_into(scores, v_slice, seq_q, seq_k, d_v, out_slice);
+    });
     Ok(Tensor::new(output, vec![batch, num_heads, seq_q, d_v]))
 }
 
@@ -221,46 +293,49 @@ pub fn alibi_attention(
     let k_head_stride = seq_k * head_dim;
     let v_head_stride = seq_k * d_v;
     let mut output = vec![0.0f32; batch * num_heads * seq_q * d_v];
-    for b in 0..batch {
-        #[allow(clippy::needless_range_loop)]
-        for h in 0..num_heads {
-            let q_off = b * num_heads * q_head_stride + h * q_head_stride;
-            let k_off = b * num_heads * k_head_stride + h * k_head_stride;
-            let v_off = b * num_heads * v_head_stride + h * v_head_stride;
-            let o_off = b * num_heads * seq_q * d_v + h * seq_q * d_v;
-            let q_slice = &q.data[q_off..q_off + q_head_stride];
-            let k_slice = &k.data[k_off..k_off + k_head_stride];
-            let mut scores = mm_a_bt(q_slice, k_slice, seq_q, head_dim, seq_k);
-            for s in scores.iter_mut() {
-                *s *= scale_val;
+    let loop_dims = HeadLoop {
+        batch,
+        num_heads,
+        seq_q,
+        seq_k,
+        d_v,
+        macs_per_head: seq_q * seq_k * (head_dim + d_v),
+    };
+    for_each_head(&loop_dims, &mut output, |b, h, scores, out_slice| {
+        let q_off = b * num_heads * q_head_stride + h * q_head_stride;
+        let k_off = b * num_heads * k_head_stride + h * k_head_stride;
+        let v_off = b * num_heads * v_head_stride + h * v_head_stride;
+        let q_slice = &q.data[q_off..q_off + q_head_stride];
+        let k_slice = &k.data[k_off..k_off + k_head_stride];
+        matmul_nt_into(q_slice, k_slice, seq_q, head_dim, seq_k, scores);
+        for s in scores.iter_mut() {
+            *s *= scale_val;
+        }
+        let slope = slopes[h];
+        for i in 0..seq_q {
+            for j in 0..seq_k {
+                let dist = i.abs_diff(j);
+                scores[i * seq_k + j] -= slope * dist as f32;
             }
-            let slope = slopes[h];
+        }
+        if let Some(md) = mask_data {
+            let m_batch_off = if mask_batch_stride == 0 {
+                0
+            } else {
+                b * mask_batch_stride
+            };
             for i in 0..seq_q {
                 for j in 0..seq_k {
-                    let dist = i.abs_diff(j);
-                    scores[i * seq_k + j] -= slope * dist as f32;
-                }
-            }
-            if let Some(md) = mask_data {
-                let m_batch_off = if mask_batch_stride == 0 {
-                    0
-                } else {
-                    b * mask_batch_stride
-                };
-                for i in 0..seq_q {
-                    for j in 0..seq_k {
-                        let m_idx = m_batch_off + i * seq_k + j;
-                        if m_idx < md.len() {
-                            scores[i * seq_k + j] += md[m_idx];
-                        }
+                    let m_idx = m_batch_off + i * seq_k + j;
+                    if m_idx < md.len() {
+                        scores[i * seq_k + j] += md[m_idx];
                     }
                 }
             }
-            softmax_last_dim(&mut scores, seq_k);
-            let v_slice = &v.data[v_off..v_off + v_head_stride];
-            let attn_out = mm(&scores, v_slice, seq_q, seq_k, d_v);
-            output[o_off..o_off + seq_q * d_v].copy_from_slice(&attn_out);
         }
-    }
+        softmax_last_dim(scores, seq_k);
+        let v_slice = &v.data[v_off..v_off + v_head_stride];
+        matmul_nn_into(scores, v_slice, seq_q, seq_k, d_v, out_slice);
+    });
     Ok(Tensor::new(output, vec![batch, num_heads, seq_q, d_v]))
 }

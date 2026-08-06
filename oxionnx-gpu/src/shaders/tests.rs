@@ -26,7 +26,7 @@ fn test_gpu_buffer_pool_basic() {
     assert_eq!(pool.available_count(), 0);
 
     // Return it.
-    pool.return_buffer(buf, 1024);
+    pool.return_buffer(buf);
     assert_eq!(pool.available_count(), 1);
 
     // Clear.
@@ -46,7 +46,7 @@ fn test_gpu_buffer_pool_reuse() {
 
     // Get and return a 1024-byte buffer.
     let buf = pool.get_buffer(&ctx.device, 1024, usage);
-    pool.return_buffer(buf, 1024);
+    pool.return_buffer(buf);
     assert_eq!(pool.available_count(), 1);
 
     // Request 1024 again — should reuse (count stays 0 after get).
@@ -61,9 +61,9 @@ fn test_gpu_buffer_pool_reuse() {
     let b1 = pool.get_buffer(&ctx.device, 512, usage);
     let b2 = pool.get_buffer(&ctx.device, 2048, usage);
     let b3 = pool.get_buffer(&ctx.device, 4096, usage);
-    pool.return_buffer(b1, 512);
-    pool.return_buffer(b2, 2048);
-    pool.return_buffer(b3, 4096);
+    pool.return_buffer(b1);
+    pool.return_buffer(b2);
+    pool.return_buffer(b3);
     assert_eq!(pool.available_count(), 3);
 }
 

@@ -16,16 +16,63 @@ categories = ["science", "hardware-support"]
 [dependencies]
 oxionnx-core = { workspace = true }
 thiserror = { workspace = true }
+# The declined-vs-failed contract is only worth anything if a FAILURE is *audible*.  The
+# router falls back to the CPU on a GPU failure — so inference stays correct — but it says
+# so at `error!` every time, because "your GPU provider has been dead since process start"
+# must not be a fact the user has to guess at.  Without a log sink there is no signal at
+# all, which is precisely the bug this wave exists to fix.  `tracing` is what the rest of
+# the workspace already uses, and it costs nothing when no subscriber is attached.
+tracing = { workspace = true }
 
+# Win32 system DLLs reached through the `windows` crate are FFI to the *operating
+# system*, not a C/C++ build dependency — exactly like `oxionnx-coreml`'s `objc2`.
+# Nothing here invokes a C compiler; the crate stays pure Rust.
+#
+# Every feature name below was verified against
+# `~/.cargo/registry/src/index.crates.io-*/windows-0.62.2/Cargo.toml`.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = [
+windows = { workspace = true, features = [
+    # HANDLE, CloseHandle, HRESULT, WAIT_OBJECT_0.
     "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D12",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
+    # SECURITY_ATTRIBUTES.  `CreateEventW`'s first parameter is
+    # `Option<*const SECURITY_ATTRIBUTES>`, so the entire function is gated behind
+    # this feature.  Without it, `Win32::System::Threading::CreateEventW` does not
+    # exist and this crate does not compile for Windows *at all* — which was the
+    # state of the tree before this wave, because nobody had ever cross-compiled it.
+    "Win32_Security",
+    # CreateEventW, WaitForSingleObject, INFINITE.
     "Win32_System_Threading",
+    # LoadLibraryW / GetProcAddress, used to resolve `DMLCreateDevice` at run time.
+    # It must NOT be statically linked: `windows_core::link!` expands to a
+    # `raw-dylib` import that the loader resolves at *process start*, so a static
+    # import would make the host process fail to launch when `DirectML.dll` is
+    # absent — and the HLSL fallback, which exists precisely for that case, would
+    # be unreachable.
+    "Win32_System_LibraryLoader",
+    # D3D_FEATURE_LEVEL_*, ID3DBlob.
+    "Win32_Graphics_Direct3D",
+    # D3DCompile (d3dcompiler_47.dll / FXC) — the HLSL fallback's shader compiler.
+    "Win32_Graphics_Direct3D_Fxc",
+    # ID3D12Device, ID3D12CommandQueue, ID3D12Resource, barriers, PSOs, heaps.
+    "Win32_Graphics_Direct3D12",
+    # CreateDXGIFactory2, IDXGIAdapter1, DXGI_ADAPTER_DESC1.
+    "Win32_Graphics_Dxgi",
+    # DXGI_FORMAT — embedded in D3D12_RESOURCE_DESC.
+    "Win32_Graphics_Dxgi_Common",
+    # IDMLDevice, IDMLCompiledOperator, IDMLBindingTable, every DML_*_DESC.
+    "Win32_AI_MachineLearning_DirectML",
 ] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# TEST-ONLY, and it must stay that way.  `tests/reference_vs_ops.rs` cross-validates
+# `crate::reference`'s CPU oracle against the battle-tested kernels the router falls
+# back to, so that "the oracle is right" is an assertion and not a hope.  A *normal*
+# dependency on `oxionnx-ops` would be wrong twice over: it would invert the layering
+# (an execution provider must not depend on the CPU operator library it exists to
+# bypass), and it would let someone quietly use `oxionnx-ops` as the dispatch fallback
+# instead of returning `Ok(None)` and letting the session runner do it.
+oxionnx-ops = { path = "../oxionnx-ops" }
 
 [features]
 default = []

@@ -3,23 +3,66 @@
 use crate::context::GpuContext;
 use wgpu::util::DeviceExt;
 
-use super::common::{read_back, ReduceParams, REDUCE_GPU_THRESHOLD};
+use super::common::{
+    checked_storage_bytes, plan_dispatch, read_back_and_recycle, DispatchGrid, ErrorScope,
+    ReduceParams, REDUCE_GPU_THRESHOLD, WG_SIZE,
+};
 
 // ========================================================================
 // Reduction ops
 // ========================================================================
 
 /// Internal helper to compute (outer_size, axis_len, inner_size) from shape + axis.
+///
+/// Returns `None` for a shape with a zero-length dimension: the reduced axis
+/// would make the kernels read out of range (`reduce_max`/`reduce_min` seed the
+/// accumulator from `input[in_base]`) and divide by zero (`reduce_mean`). The
+/// CPU operators implement the ONNX identity rules for empty reductions, so
+/// declining routes those cases to the correct implementation.
 pub(super) fn reduction_dims(shape: &[usize], axis: usize) -> Option<(usize, usize, usize)> {
-    if axis >= shape.len() {
+    if axis >= shape.len() || shape.contains(&0) {
         return None;
     }
-    let outer: usize = shape[..axis].iter().product();
+    // Products of empty slices are 1, so no zero-coercion is needed once every
+    // dimension is known to be non-zero.
+    let outer: usize = shape[..axis]
+        .iter()
+        .try_fold(1usize, |a, &d| a.checked_mul(d))?;
     let axis_len = shape[axis];
-    let inner: usize = shape[axis + 1..].iter().product();
-    let outer = if outer == 0 { 1 } else { outer };
-    let inner = if inner == 0 { 1 } else { inner };
+    let inner: usize = shape[axis + 1..]
+        .iter()
+        .try_fold(1usize, |a, &d| a.checked_mul(d))?;
     Some((outer, axis_len, inner))
+}
+
+/// Shared front-half of both reduction dispatchers: validate the shape, check
+/// the device limits and plan the grid.
+fn reduce_plan(
+    ctx: &GpuContext,
+    data: &[f32],
+    axis: usize,
+    shape: &[usize],
+) -> Option<(usize, usize, usize, usize, u64, DispatchGrid)> {
+    if ctx.is_degraded() {
+        return None;
+    }
+    let (outer, axis_len, inner) = reduction_dims(shape, axis)?;
+    let out_count = outer.checked_mul(inner)?;
+    if out_count < REDUCE_GPU_THRESHOLD {
+        return None;
+    }
+    let total_in = out_count.checked_mul(axis_len)?;
+    if data.len() < total_in {
+        return None;
+    }
+    // Both the input and the output are bound as storage buffers.
+    let out_size = checked_storage_bytes(&ctx.limits, out_count)?;
+    checked_storage_bytes(&ctx.limits, total_in)?;
+    if !ctx.limits.buffer_fits(out_size) {
+        return None;
+    }
+    let grid = plan_dispatch(&ctx.limits, out_count as u64, WG_SIZE)?;
+    Some((outer, axis_len, inner, out_count, out_size, grid))
 }
 
 /// Internal helper for reduction GPU dispatch.
@@ -30,18 +73,13 @@ pub(super) fn gpu_reduce_dispatch(
     shape: &[usize],
     pipeline: &wgpu::ComputePipeline,
 ) -> Option<Vec<f32>> {
-    let (outer, axis_len, inner) = reduction_dims(shape, axis)?;
-    let out_count = outer * inner;
-    if out_count < REDUCE_GPU_THRESHOLD {
-        return None;
-    }
-    let total_in = outer * axis_len * inner;
-    if data.len() < total_in {
-        return None;
-    }
+    let (outer, axis_len, inner, out_count, out_size, grid) = reduce_plan(ctx, data, axis, shape)?;
+    let total_in = out_count * axis_len;
 
     let device = &ctx.device;
     let queue = &ctx.queue;
+
+    let scope = ErrorScope::begin(ctx);
 
     let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("reduce_in"),
@@ -49,7 +87,6 @@ pub(super) fn gpu_reduce_dispatch(
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let out_size = (out_count * std::mem::size_of::<f32>()) as u64;
     let output_buf = {
         let mut pool = ctx.pool.lock().ok()?;
         pool.get_buffer(
@@ -63,7 +100,7 @@ pub(super) fn gpu_reduce_dispatch(
         outer_size: outer as u32,
         axis_len: axis_len as u32,
         inner_size: inner as u32,
-        _pad: 0,
+        row_threads: grid.threads_per_row,
     };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("reduce_params"),
@@ -97,8 +134,6 @@ pub(super) fn gpu_reduce_dispatch(
         ],
     });
 
-    let wg = (out_count as u32).div_ceil(256);
-
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("reduce_enc"),
     });
@@ -109,17 +144,16 @@ pub(super) fn gpu_reduce_dispatch(
         });
         cpass.set_pipeline(pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch_workgroups(wg, 1, 1);
+        cpass.dispatch_workgroups(grid.x, grid.y, 1);
     }
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    let result = read_back(device, &staging_buf, out_count);
+    if !scope.finish(ctx) {
+        return None;
+    }
 
-    let mut pool = ctx.pool.lock().ok()?;
-    pool.return_buffer(output_buf, out_size);
-
-    result
+    read_back_and_recycle(ctx, &staging_buf, out_count, output_buf)
 }
 
 /// GPU-accelerated parallel reduction (sum) along an axis.
@@ -185,6 +219,12 @@ pub fn gpu_reduce_mean(
     // For multi-axis: reduce axes one at a time (largest first to keep indices valid)
     let mut sorted_axes: Vec<usize> = axes.to_vec();
     sorted_axes.sort_unstable();
+    // A repeated axis is invalid per the ONNX spec; reducing it twice would
+    // silently hit a *different* (shifted) axis on the second pass, so decline
+    // and let the CPU operator report the malformed attribute.
+    if sorted_axes.windows(2).any(|w| w[0] == w[1]) {
+        return None;
+    }
     sorted_axes.reverse();
 
     let mut current_data = data.to_vec();
@@ -213,18 +253,13 @@ fn gpu_reduce_mean_single(
     axis: usize,
     shape: &[usize],
 ) -> Option<Vec<f32>> {
-    let (outer, axis_len, inner) = reduction_dims(shape, axis)?;
-    let out_count = outer * inner;
-    if out_count < REDUCE_GPU_THRESHOLD {
-        return None;
-    }
-    let total_in = outer * axis_len * inner;
-    if data.len() < total_in {
-        return None;
-    }
+    let (outer, axis_len, inner, out_count, out_size, grid) = reduce_plan(ctx, data, axis, shape)?;
+    let total_in = out_count * axis_len;
 
     let device = &ctx.device;
     let queue = &ctx.queue;
+
+    let scope = ErrorScope::begin(ctx);
 
     let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("reduce_mean_in"),
@@ -232,7 +267,6 @@ fn gpu_reduce_mean_single(
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let out_size = (out_count * std::mem::size_of::<f32>()) as u64;
     let output_buf = {
         let mut pool = ctx.pool.lock().ok()?;
         pool.get_buffer(
@@ -246,7 +280,7 @@ fn gpu_reduce_mean_single(
         outer_size: outer as u32,
         axis_len: axis_len as u32,
         inner_size: inner as u32,
-        _pad: 0,
+        row_threads: grid.threads_per_row,
     };
     let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("reduce_mean_params"),
@@ -280,8 +314,6 @@ fn gpu_reduce_mean_single(
         ],
     });
 
-    let wg = (out_count as u32).div_ceil(256);
-
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("reduce_mean_enc"),
     });
@@ -292,15 +324,14 @@ fn gpu_reduce_mean_single(
         });
         cpass.set_pipeline(&ctx.reduce_mean_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch_workgroups(wg, 1, 1);
+        cpass.dispatch_workgroups(grid.x, grid.y, 1);
     }
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    let result = read_back(device, &staging_buf, out_count);
+    if !scope.finish(ctx) {
+        return None;
+    }
 
-    let mut pool = ctx.pool.lock().ok()?;
-    pool.return_buffer(output_buf, out_size);
-
-    result
+    read_back_and_recycle(ctx, &staging_buf, out_count, output_buf)
 }

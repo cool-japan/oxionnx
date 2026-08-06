@@ -45,19 +45,44 @@ fn test_op_placement_auto_threshold() {
         gpu_threshold_bytes: 1024,
     };
 
-    // Below threshold → CPU
+    // Below threshold → CPU, regardless of which accelerators are compiled in.
+    // `Auto`'s threshold binds *every* provider equally — CUDA and DirectML
+    // included, not just the wgpu path.
     let below = decide_placement(&OpKind::MatMul, 512, &placement);
     assert_eq!(below, ProviderKind::Cpu);
 
-    // At threshold → GPU-capable op should request GPU (returns Cpu without feature)
+    // At/above threshold → the highest-priority *compiled-in* accelerator that
+    // actually implements MatMul, per the mandated `Cuda > DirectMl > Gpu`
+    // priority order. MatMul has a kernel in all three backends, so exactly
+    // one of the branches below survives per feature combination.
     let at = decide_placement(&OpKind::MatMul, 1024, &placement);
-    // Without the gpu feature, result is Cpu; with gpu feature, result is Gpu
-    #[cfg(feature = "gpu")]
-    assert_eq!(at, ProviderKind::Gpu);
-    #[cfg(not(feature = "gpu"))]
-    assert_eq!(at, ProviderKind::Cpu);
+    #[cfg(feature = "cuda")]
+    assert_eq!(
+        at,
+        ProviderKind::Cuda,
+        "cuda outranks directml and gpu whenever it is compiled in"
+    );
+    #[cfg(all(not(feature = "cuda"), feature = "directml"))]
+    assert_eq!(
+        at,
+        ProviderKind::DirectMl,
+        "directml outranks gpu when cuda is not compiled in"
+    );
+    #[cfg(all(not(feature = "cuda"), not(feature = "directml"), feature = "gpu"))]
+    assert_eq!(
+        at,
+        ProviderKind::Gpu,
+        "gpu is the lowest-priority accelerator, selected only when cuda and directml are absent"
+    );
+    #[cfg(not(any(feature = "cuda", feature = "directml", feature = "gpu")))]
+    assert_eq!(
+        at,
+        ProviderKind::Cpu,
+        "with no accelerator compiled in, Auto can only ever offer Cpu"
+    );
 
-    // Non-GPU-capable op above threshold → still CPU
+    // Non-GPU-capable op above threshold → still CPU: no backend, of any
+    // kind, implements Reshape as an accelerated kernel.
     let reshape = decide_placement(&OpKind::Reshape, 2048, &placement);
     assert_eq!(reshape, ProviderKind::Cpu);
 }
@@ -77,14 +102,17 @@ fn test_op_placement_manual() {
     }
     let placement = OpPlacement::Manual(map);
 
-    let matmul_result = decide_placement(&OpKind::MatMul, 0, &placement);
+    // 65_536 bytes is well above `MIN_GPU_DISPATCH_BYTES` (4096), so the
+    // accelerator pin is honoured rather than overridden by the hard size
+    // floor that `Manual` now enforces on every accelerator pin.
+    let matmul_result = decide_placement(&OpKind::MatMul, 65_536, &placement);
     #[cfg(feature = "gpu")]
     assert_eq!(matmul_result, ProviderKind::Gpu);
     #[cfg(not(feature = "gpu"))]
     assert_eq!(matmul_result, ProviderKind::Cpu);
 
-    // Unmapped op defaults to Cpu
-    let reshape_result = decide_placement(&OpKind::Reshape, 0, &placement);
+    // Unmapped op defaults to Cpu regardless of size.
+    let reshape_result = decide_placement(&OpKind::Reshape, 65_536, &placement);
     assert_eq!(reshape_result, ProviderKind::Cpu);
 }
 
@@ -100,7 +128,15 @@ fn test_decide_placement_default() {
 fn test_is_gpu_capable_matmul() {
     use crate::execution_providers::is_gpu_capable;
     assert!(is_gpu_capable(&OpKind::MatMul));
-    assert!(is_gpu_capable(&OpKind::Gemm));
+    // [a7-19] `is_gpu_capable` is now derived from `GPU_DISPATCH_OPS`, the
+    // exact set of ops `try_gpu_dispatch` has a real match arm for. `Gemm`
+    // has no arm (it falls through to the `_ => Ok(None)` catch-all), so
+    // asserting it GPU-capable encoded the old, three-way-disagreeing
+    // behaviour where `is_gpu_capable` claimed ops the dispatcher would
+    // immediately bounce back to CPU. See
+    // `execution_providers::is_gpu_capable_matches_try_gpu_dispatch_arms`
+    // for the exhaustive version of this check.
+    assert!(!is_gpu_capable(&OpKind::Gemm));
     assert!(is_gpu_capable(&OpKind::Conv));
     assert!(is_gpu_capable(&OpKind::Softmax));
     assert!(is_gpu_capable(&OpKind::Relu));

@@ -7,6 +7,7 @@ pub mod cse;
 pub mod dead_code;
 pub mod fusion;
 pub mod graph_diff;
+pub(crate) mod graph_utils;
 pub mod shape_inference;
 pub(crate) mod shape_inference_ext;
 pub mod symbolic_shape;
@@ -16,10 +17,36 @@ use crate::tensor::Tensor;
 use oxionnx_core::OperatorRegistry;
 use std::collections::HashMap;
 
-/// Apply all optimization passes to the graph.
-/// Modifies weights in place (for fusion passes that fold parameters).
+/// Which optimisation passes [`optimize_with_level`] runs.
 ///
-/// Pass order:
+/// Mirrors the session-level `OptLevel`, and each variant runs exactly what its
+/// documentation says — selecting a lower level is the supported way to opt out
+/// of a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassLevel {
+    /// Dead-node elimination only.
+    Basic,
+    /// Dead-node elimination + operator fusions.
+    Extended,
+    /// Shape materialisation, constant folding, dead-node elimination, CSE and
+    /// every fusion.
+    All,
+}
+
+/// Apply the full optimization pipeline ([`PassLevel::All`]) to the graph.
+/// Modifies weights in place (for fusion passes that fold parameters).
+pub fn optimize(
+    nodes: Vec<Node>,
+    weights: &mut HashMap<String, Tensor>,
+    output_names: &[String],
+    registry: &OperatorRegistry,
+) -> Vec<Node> {
+    optimize_with_level(nodes, weights, output_names, registry, PassLevel::All)
+}
+
+/// Apply the optimization passes selected by `level`.
+///
+/// Pass order at [`PassLevel::All`]:
 ///  1. **Shape inference** — infer tensor shapes from weights and propagate
 ///     through the graph.  For every `Shape` node whose input has a known
 ///     shape, the output is materialised as a constant weight so that
@@ -27,45 +54,110 @@ use std::collections::HashMap;
 ///  2. **Constant folding** — evaluate nodes whose inputs are all constants.
 ///  3. **Dead-node elimination** — remove nodes not reachable from outputs.
 ///  4. **CSE** — merge duplicate sub-expressions.
-///  5. **Fusion passes** — MatMul+Add, Conv+BN, Conv+Relu, Conv+ReLU6,
-///     SiLU fusion, Div+Sqrt→Rsqrt, standalone BN folding, LayerNorm,
-///     transpose cancellation.
-pub fn optimize(
+///  5. **Fusion passes** — inference Dropout removal, MatMul+Add, Conv+BN,
+///     Conv+Relu, Conv+ReLU6, SiLU, Div+Sqrt→Rsqrt, standalone BN folding,
+///     LayerNorm, Transpose/Reshape cancellation, MatMul+Transpose,
+///     Add+MatMul→Gemm, Gather composition, Conv+Add+Relu.
+///
+/// [`PassLevel::Extended`] runs step 3 and step 5; [`PassLevel::Basic`] runs
+/// step 3 only.  Every pass keeps the declared `output_names` produced.
+pub fn optimize_with_level(
     nodes: Vec<Node>,
     weights: &mut HashMap<String, Tensor>,
     output_names: &[String],
     registry: &OperatorRegistry,
+    level: PassLevel,
 ) -> Vec<Node> {
-    // Phase 1: Shape inference.
     // Even without runtime input shapes we can propagate shapes that originate
     // from constant weights. This lets us materialise Shape op outputs so that
     // constant folding can evaluate their consumers.
-    let input_shapes: HashMap<String, Vec<usize>> = HashMap::new();
-    let known_shapes = shape_inference::infer_shapes(&nodes, weights, &input_shapes);
-    materialize_shape_ops(&nodes, weights, &known_shapes);
+    optimize_with_input_shapes(
+        nodes,
+        weights,
+        output_names,
+        registry,
+        level,
+        &HashMap::new(),
+    )
+}
 
-    // Phase 2–N: existing optimisation pipeline.
-    let nodes = constant_fold::constant_fold(nodes, weights, registry);
+/// [`optimize_with_level`], seeded with the graph's declared **input** shapes.
+///
+/// Several passes are gated on a provably rank-2 activation (`MatMul + Add →
+/// Gemm`, `Add + MatMul → Gemm`, `MatMul + Transpose → Gemm`) and others size
+/// synthesised constants from the inferred shapes (`fold_batch_norm_inference`,
+/// `simplify_transpose_reshape`, `cancel_consecutive_reshape`). Run with an
+/// empty seed, shape inference never learns the rank of a graph *input*, so on
+/// a real model those passes almost never fire — coverage traded away for
+/// soundness when the rank gates were added.
+///
+/// # Only fully static inputs may be seeded
+///
+/// `input_shapes` must contain **concrete** dimensions only. Substituting a
+/// placeholder for a symbolic axis (`"batch"`) would not merely lose coverage:
+/// the shape-consuming passes above would then size real synthesised constants
+/// from a fabricated dimension. `Session::build_from_graph` therefore seeds an
+/// input only when *every* one of its dims is statically known.
+pub fn optimize_with_input_shapes(
+    nodes: Vec<Node>,
+    weights: &mut HashMap<String, Tensor>,
+    output_names: &[String],
+    registry: &OperatorRegistry,
+    level: PassLevel,
+    input_shapes: &HashMap<String, Vec<usize>>,
+) -> Vec<Node> {
+    let nodes = if level == PassLevel::All {
+        let known_shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
+        materialize_shape_ops(&nodes, weights, &known_shapes);
+        constant_fold::constant_fold(nodes, weights, registry, output_names)
+    } else {
+        nodes
+    };
+
     let nodes = dead_code::dead_node_elimination(nodes, output_names);
-    let nodes = cse::eliminate_common_subexpressions(nodes);
-    let nodes = fusion::fuse_matmul_add(nodes, weights);
-    let nodes = fusion::fuse_conv_batchnorm(nodes, weights);
-    let nodes = fusion::fuse_conv_relu(nodes);
-    let nodes = fusion::fuse_conv_clip_to_conv_relu6(nodes);
-    let nodes = fusion::fuse_mul_sigmoid_to_silu(nodes);
+    if level == PassLevel::Basic {
+        return nodes;
+    }
+
+    let nodes = if level == PassLevel::All {
+        cse::eliminate_common_subexpressions(nodes, output_names)
+    } else {
+        nodes
+    };
+
+    // Inference-mode Dropout is the identity; removing it first lets the
+    // downstream patterns (e.g. Softmax → Dropout → MatMul) match.
+    let nodes = fusion::eliminate_dropout_inference(nodes, weights, output_names);
+
+    let shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
+    let nodes = fusion::fuse_matmul_add(nodes, weights, &shapes, output_names);
+    let nodes = fusion::fuse_conv_batchnorm(nodes, weights, output_names);
+    let nodes = fusion::fuse_conv_relu(nodes, weights, output_names);
+    let nodes = fusion::fuse_conv_clip_to_conv_relu6(nodes, weights, output_names);
+    let nodes = fusion::fuse_mul_sigmoid_to_silu(nodes, output_names);
     let nodes = fusion::fuse_div_sqrt_to_rsqrt(nodes, weights);
     // Re-infer shapes after upstream fusions so that the standalone
     // BatchNorm fold can size its synthesized `factor`/`shift` constants
     // to broadcast correctly against the BN input (e.g. `[1, C, 1, 1]`
     // for a 4-D `[N, C, H, W]` input).  Without per-input rank the fold
     // would emit `[C]`-shaped constants that fail strict NumPy alignment.
-    let pre_fold_shapes = shape_inference::infer_shapes(&nodes, weights, &input_shapes);
+    let pre_fold_shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
     let nodes = fusion::fold_batch_norm_inference(nodes, weights, &pre_fold_shapes);
-    let nodes = fusion::fuse_layer_norm(nodes, weights);
-    let nodes = fusion::cancel_consecutive_transpose(nodes);
-    let nodes = fusion::fuse_matmul_transpose(nodes);
-    let nodes = fusion::fuse_add_matmul_to_gemm(nodes, weights);
-    fusion::cancel_consecutive_reshape(nodes)
+    let nodes = fusion::fuse_layer_norm(nodes, weights, &pre_fold_shapes, output_names);
+    let nodes = fusion::cancel_consecutive_transpose(nodes, output_names);
+    let nodes = fusion::fuse_matmul_transpose(nodes, output_names);
+    let nodes = fusion::fuse_add_matmul_to_gemm(nodes, weights, &pre_fold_shapes, output_names);
+    let nodes = fusion::fuse_gather_composition(nodes, weights, output_names);
+    // `ConvAddRelu` is an optimizer-generated op: only emit it when the active
+    // registry actually provides a kernel for it, otherwise the fused node
+    // would fail to dispatch at run time.
+    let nodes = if registry.get("ConvAddRelu").is_some() {
+        fusion::fuse_conv_add_relu(nodes, output_names)
+    } else {
+        nodes
+    };
+    let nodes = fusion::simplify_transpose_reshape(nodes, weights, &pre_fold_shapes, output_names);
+    fusion::cancel_consecutive_reshape(nodes, weights, &pre_fold_shapes, output_names)
 }
 
 /// For each `Shape` node whose input has a known shape, store the shape
@@ -106,6 +198,9 @@ fn materialize_shape_ops(
 }
 
 #[cfg(test)]
+mod wave1_tests;
+
+#[cfg(test)]
 pub(crate) mod test_utils {
     use crate::graph::{Attributes, Node, OpKind};
     use crate::tensor::Tensor;
@@ -119,11 +214,6 @@ pub(crate) mod test_utils {
             outputs: outputs.into_iter().map(String::from).collect(),
             attrs: Attributes::default(),
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn make_graph(nodes: Vec<Node>) -> Vec<Node> {
-        nodes
     }
 
     pub fn make_layer_norm_pattern(with_scale_bias: bool) -> (Vec<Node>, HashMap<String, Tensor>) {

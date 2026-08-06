@@ -41,8 +41,35 @@ fn test_sdpa_simd_matches_scalar() {
     let k2 = Tensor::new(k_data, vec![batch, heads, seq, hd]);
     let v2 = Tensor::new(v_data, vec![batch, heads, seq, hd]);
     let ref_out = {
-        // compute reference using known-good scalar helpers
-        use super::core::{mm, mm_a_bt, softmax_last_dim};
+        // Independent naive reference: plain triple loops, kept local to the
+        // test so it stays a genuine cross-check of the sgemm-backed kernels
+        // rather than a call into the same helpers.
+        use super::core::softmax_last_dim;
+        fn mm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+            let mut out = vec![0.0f32; m * n];
+            for i in 0..m {
+                for kk in 0..k {
+                    let a_val = a[i * k + kk];
+                    for j in 0..n {
+                        out[i * n + j] += a_val * b[kk * n + j];
+                    }
+                }
+            }
+            out
+        }
+        fn mm_a_bt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+            let mut out = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut s = 0.0f32;
+                    for kk in 0..k {
+                        s += a[i * k + kk] * b[j * k + kk];
+                    }
+                    out[i * n + j] = s;
+                }
+            }
+            out
+        }
         let q_batch = batch * heads;
         let k_batch = batch * heads;
         let v_batch = batch * heads;

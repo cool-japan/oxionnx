@@ -1,6 +1,7 @@
 //! Add(bias) + MatMul → Gemm with pre-computed bias fusion pass.
 
 use crate::graph::{Attributes, Node, OpKind};
+use crate::optimizer::graph_utils::{NameAllocator, TensorUsage};
 use crate::tensor::Tensor;
 use std::collections::{HashMap, HashSet};
 
@@ -17,9 +18,16 @@ use std::collections::{HashMap, HashSet};
 /// Actually, for bias added to input: (X + b) @ W = X @ W + b @ W. The fused
 /// bias would be b @ W which requires knowing W. Instead, we only fuse when the
 /// bias is a weight and we can compute the fused bias = bias @ W.
+///
+/// As with `MatMul + Add`, the emitted `Gemm` is only valid for a 2-D `A`, so
+/// the fusion requires `X`'s rank to be *known* to be 2.  The intermediate
+/// `Add` output must have exactly one consumer and must not be a declared graph
+/// output.
 pub fn fuse_add_matmul_to_gemm(
     nodes: Vec<Node>,
     weights: &mut HashMap<String, Tensor>,
+    known_shapes: &HashMap<String, Vec<usize>>,
+    output_names: &[String],
 ) -> Vec<Node> {
     if nodes.len() < 2 {
         return nodes;
@@ -32,14 +40,8 @@ pub fn fuse_add_matmul_to_gemm(
         }
     }
 
-    let mut consumer_count: HashMap<String, usize> = HashMap::new();
-    for node in &nodes {
-        for inp in &node.inputs {
-            if !inp.is_empty() {
-                *consumer_count.entry(inp.clone()).or_insert(0) += 1;
-            }
-        }
-    }
+    let usage = TensorUsage::new(&nodes, output_names);
+    let mut names = NameAllocator::new(&nodes, weights);
 
     let mut skip: HashSet<usize> = HashSet::new();
     let mut replacements: HashMap<usize, Node> = HashMap::new();
@@ -68,7 +70,7 @@ pub fn fuse_add_matmul_to_gemm(
             continue;
         }
 
-        if consumer_count.get(add_out).copied().unwrap_or(0) != 1 {
+        if !usage.is_fusable_intermediate(add_out) {
             continue;
         }
 
@@ -76,7 +78,7 @@ pub fn fuse_add_matmul_to_gemm(
             Some(&idx) => idx,
             None => continue,
         };
-        if skip.contains(&add_idx) {
+        if skip.contains(&add_idx) || replacements.contains_key(&add_idx) {
             continue;
         }
         if !matches!(nodes[add_idx].op, OpKind::Add) {
@@ -107,6 +109,15 @@ pub fn fuse_add_matmul_to_gemm(
             }
         };
 
+        // `Gemm`'s contract is 2-D × 2-D — see `fuse_matmul_add`.
+        let x_rank = known_shapes
+            .get(&x_name)
+            .map(|s| s.len())
+            .or_else(|| weights.get(&x_name).map(|t| t.ndim()));
+        if x_rank != Some(2) {
+            continue;
+        }
+
         let bias = match weights.get(&bias_name) {
             Some(t) => t.clone(),
             None => continue,
@@ -128,7 +139,13 @@ pub fn fuse_add_matmul_to_gemm(
             *fused_val = sum;
         }
 
-        let fused_bias_name = format!("{}_fused_add_matmul_bias", nodes[add_idx].name);
+        // Key the folded bias on the (spec-unique) MatMul output name rather
+        // than on `Node::name`, which ONNX allows to be empty or duplicated.
+        let name_base = match node.outputs.first() {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => continue,
+        };
+        let fused_bias_name = names.allocate(&name_base, "_fused_add_matmul_bias");
         weights.insert(
             fused_bias_name.clone(),
             Tensor::new(fused_bias_data, vec![n]),

@@ -37,7 +37,7 @@ pub use matmul::{gemm, gemm_into, matmul, matmul_into};
 // ── Unary element-wise: trig & rounding ──────────────────────────────────────
 pub use unary::{
     acos_op, acosh_op, asin_op, asinh_op, atan_op, atanh_op, ceil, cos_op, cosh_op, floor_op,
-    round_op, sign, sin_op, sinh_op, tan_op,
+    round_half_to_even, round_op, sign, sin_op, sinh_op, tan_op,
 };
 
 // ── Binary element-wise & variadic ───────────────────────────────────────────

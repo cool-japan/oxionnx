@@ -342,8 +342,8 @@ fn test_tfidf_vectorizer_tf() {
     attrs.ints.insert("min_gram_length".into(), 1);
     attrs.ints.insert("max_gram_length".into(), 1);
     attrs.ints.insert("max_skip_count".into(), 0);
-    // 3 unigrams
-    attrs.int_lists.insert("ngram_counts".into(), vec![3]);
+    // Unigrams start at pool index 0 (ngram_counts holds pool offsets).
+    attrs.int_lists.insert("ngram_counts".into(), vec![0]);
     // output index for each ngram
     attrs
         .int_lists
@@ -378,7 +378,8 @@ fn test_tfidf_vectorizer_idf() {
     attrs.ints.insert("min_gram_length".into(), 1);
     attrs.ints.insert("max_gram_length".into(), 1);
     attrs.ints.insert("max_skip_count".into(), 0);
-    attrs.int_lists.insert("ngram_counts".into(), vec![3]);
+    // Unigrams start at pool index 0 (ngram_counts holds pool offsets).
+    attrs.int_lists.insert("ngram_counts".into(), vec![0]);
     attrs
         .int_lists
         .insert("ngram_indexes".into(), vec![0, 1, 2]);
@@ -413,8 +414,8 @@ fn test_tfidf_vectorizer_bigram() {
     attrs.ints.insert("min_gram_length".into(), 2);
     attrs.ints.insert("max_gram_length".into(), 2);
     attrs.ints.insert("max_skip_count".into(), 0);
-    // 3 bigrams
-    attrs.int_lists.insert("ngram_counts".into(), vec![3]);
+    // No unigrams (bucket 0 spans [0, 0)); the bigrams start at pool index 0.
+    attrs.int_lists.insert("ngram_counts".into(), vec![0, 0]);
     attrs
         .int_lists
         .insert("ngram_indexes".into(), vec![0, 1, 2]);

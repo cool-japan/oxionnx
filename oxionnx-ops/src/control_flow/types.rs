@@ -10,11 +10,19 @@
 /// - Inputs 0..M-1: initial state tensors
 /// - Inputs M..N-1: scan input sequences
 /// - Attribute: "body" (Graph), "num_scan_inputs" (int)
-/// - Attribute: "scan_input_axes" (int list, default all 0)
+/// - Attribute: "scan_input_axes" (int list, default all 0; negative values
+///   count from the back of each scan input's own rank)
 /// - Attribute: "scan_input_directions" (int list, default all 0=forward)
+/// - Attribute: "scan_output_axes" (int list, default all 0; negative values
+///   count from the back of the stacked output's rank)
+/// - Attribute: "scan_output_directions" (int list, default all 0=append;
+///   1=prepend, i.e. reverse the accumulated order)
 /// - Body inputs: (state_0, ..., state_M-1, scan_elem_0, ..., scan_elem_K-1)
 /// - Body outputs: (state_0_out, ..., state_M-1_out, scan_out_0, ...)
-/// - Final outputs: final state tensors + scan output sequences (concatenated)
+/// - Final outputs: final state tensors + scan output sequences, each
+///   STACKED along a new axis (placed per `scan_output_axes`) -- per-iteration
+///   shape `[...]` over N iterations yields `[..., N, ...]`, not a
+///   concatenation along an existing axis.
 pub struct ScanOp;
 /// ONNX Loop operator.
 ///
@@ -27,7 +35,9 @@ pub struct ScanOp;
 /// - Attribute: "body" (Graph)
 /// - Body inputs: (iteration_num, condition, ...carried_deps)
 /// - Body outputs: (condition_out, ...carried_deps_out, ...scan_outputs)
-/// - Final outputs: final carried deps + concatenated scan outputs
+/// - Final outputs: final carried deps + scan outputs STACKED along a new
+///   leading axis -- per-iteration shape `[K]` over N iterations yields
+///   `[N, K]`, not a concatenation along an existing axis.
 pub struct LoopOp;
 /// ONNX If operator.
 ///

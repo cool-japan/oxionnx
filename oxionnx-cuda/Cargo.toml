@@ -22,6 +22,12 @@ oxicuda-dnn = { workspace = true }
 oxicuda-ptx = { workspace = true }
 oxicuda-launch = { workspace = true }
 thiserror = { workspace = true }
+# The declined-vs-failed contract (see `context` module docs) is only worth anything if a
+# shadow-verification MISMATCH is audible. `OXIONNX_CUDA_VERIFY=1` catches a GPU kernel that
+# returns a buffer of exactly the right shape, full of plausible wrong numbers -- the CPU
+# fallback keeps inference correct, but only `tracing::error!` tells the user their "GPU
+# acceleration" just quietly stopped applying. Costs nothing when no subscriber is attached.
+tracing = { workspace = true }
 
 [features]
 default = []

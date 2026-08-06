@@ -1,0 +1,126 @@
+# COOLJAPAN dependency policy enforcement for the OxiONNX workspace.
+#
+# [a9-4] Run `cargo deny check bans` (ideally `cargo deny --locked --workspace
+# check bans`) before releases. See ~/.claude/CLAUDE.md's "Dependency
+# Replacements" table for the full policy: every crate banned below has a
+# `oxi*`/COOLJAPAN-ecosystem replacement that must be used instead (oxiblas,
+# oxicode, oxifft, oxiz, oxisql-sqlite-compat, oxiarc-* for archive/
+# compression formats).
+#
+# As of this file's creation none of the crates below appear anywhere in
+# Cargo.lock (verified with `grep '^name = "..."' Cargo.lock` for every
+# banned name), so this file is a *preventive* guard against a future
+# dependency bump silently reintroducing one, not a fix for an existing
+# violation.
+
+[graph]
+# Check the full dependency graph across every optional feature (gpu, cuda,
+# directml, coreml, encryption, mmap, wasm, ndarray, simd, ...), not just the
+# default feature set, so a banned crate pulled in only by a non-default
+# feature is still caught.
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+ignore = []
+
+[licenses]
+# Permissive OSS licenses used throughout the Rust/COOLJAPAN ecosystem. Not
+# the focus of this policy file (see `[bans]` below, which is what finding
+# [a9-4] asks for) -- tighten separately if `cargo deny check licenses`
+# should become its own hard release gate.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+# This is the section finding [a9-4] asks for, enforced by
+# `cargo deny check bans`. Every `deny` entry below corresponds to a row in
+# CLAUDE.md's "Dependency Replacements" table.
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow-workspace = false
+allow = []
+
+deny = [
+    # openblas -> oxiblas
+    #
+    # NOTE: cargo-deny's `deny` list matches crate names *literally* -- there
+    # is no glob/wildcard support (verified empirically: a `{ crate =
+    # "aes*" }` entry against a graph that does contain a crate literally
+    # named `aes` silently matched nothing). So the "openblas*" family from
+    # the policy table is spelled out here as its known concrete crate
+    # names instead of relying on a wildcard that would silently be a no-op.
+    { crate = "openblas", reason = "COOLJAPAN policy: use oxiblas instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "openblas-src", reason = "COOLJAPAN policy: use oxiblas instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "openblas-sys", reason = "COOLJAPAN policy: use oxiblas instead (see ~/.claude/CLAUDE.md)" },
+
+    # bincode -> oxicode
+    { crate = "bincode", reason = "COOLJAPAN policy: use oxicode instead (see ~/.claude/CLAUDE.md)" },
+
+    # rustfft -> oxifft
+    { crate = "rustfft", reason = "COOLJAPAN policy: use oxifft instead (see ~/.claude/CLAUDE.md)" },
+
+    # zip / flate2 / zstd / bzip2 / lz4 / tar / snap / brotli / miniz_oxide -> oxiarc-*
+    { crate = "zip", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "flate2", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "zstd", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "zstd-safe", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md); wraps the `zstd-sys` C binding" },
+    { crate = "zstd-sys", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md); C binding underlying the `zstd`/`zstd-safe` crates" },
+    { crate = "bzip2", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "bzip2-sys", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md); C binding underlying the `bzip2` crate" },
+    { crate = "lz4", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "lz4-sys", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md); C binding underlying the `lz4` crate" },
+    { crate = "lz4_flex", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md); pure-Rust but still routed through oxiarc-* for a single archive/compression front door" },
+    { crate = "tar", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "snap", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "brotli", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "brotli-sys", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md); C binding underlying the `brotli` crate" },
+    { crate = "miniz_oxide", reason = "COOLJAPAN policy: use oxiarc-* instead (see ~/.claude/CLAUDE.md)" },
+
+    # Z3 -> oxiz
+    { crate = "z3", reason = "COOLJAPAN policy: use oxiz instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "z3-sys", reason = "COOLJAPAN policy: use oxiz instead (see ~/.claude/CLAUDE.md); C binding underlying the `z3` crate" },
+
+    # rusqlite -> oxisql-sqlite-compat
+    { crate = "rusqlite", reason = "COOLJAPAN policy: use oxisql-sqlite-compat instead (see ~/.claude/CLAUDE.md)" },
+    { crate = "libsqlite3-sys", reason = "COOLJAPAN policy: use oxisql-sqlite-compat instead (see ~/.claude/CLAUDE.md); C binding underlying `rusqlite`" },
+]
+
+# If a future dependency bump pulls one of the crates above in transitively
+# through a legitimate dependency, prefer adding a scoped exception --
+# a `wrappers = [...]` entry on the matching `deny` row above, naming the
+# direct dependent that pulls it in -- over deleting the ban outright. See
+# the suggested-fix note on finding [a9-4] in the wave-1 audit.
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

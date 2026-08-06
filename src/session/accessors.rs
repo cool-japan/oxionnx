@@ -9,7 +9,30 @@ use super::Session;
 
 impl Session {
     /// Register an additional (or replacement) operator at runtime.
+    ///
+    /// The operator is keyed by its own [`Operator::op_type`], so registering a
+    /// name that already exists replaces the existing implementation.
+    ///
+    /// # Cancellation
+    ///
+    /// On a session built with
+    /// [`with_session_cancellation`](crate::SessionBuilder::with_session_cancellation),
+    /// the operator is wrapped so that it, too, consults the session's
+    /// [`CancellationToken`](crate::CancellationToken) before it executes — a
+    /// late registration is a cancellation point exactly like every operator the
+    /// session was built with.  It used to go straight into the already-wrapped
+    /// registry unguarded, so a model whose long-running node was a
+    /// late-registered custom operator could not be stopped at that node at all.
+    ///
+    /// The wrapping is transparent: the registry key and every dispatch
+    /// predicate (`supports_inplace`, `supports_output_slots`, `native_dtypes`)
+    /// are the inner operator's, so the in-place, output-slot and typed fast
+    /// paths stay exactly as available as they were.
     pub fn register_op(&mut self, op: Box<dyn Operator>) {
+        let op = match self.cancellation.as_ref() {
+            Some(token) => super::cancellation::wrap_owned_op(op, token),
+            None => op,
+        };
         self.registry.register(op);
     }
 
@@ -163,6 +186,43 @@ impl Session {
         self.pool
             .as_ref()
             .and_then(|m| m.lock().ok().map(|p| p.stats().clone()))
+    }
+
+    /// Drop every idle GPU buffer this session has pooled, returning the memory
+    /// to the driver.  Returns the number of buffers released.
+    ///
+    /// # Why this is a method and not a step at the end of `run()`
+    ///
+    /// Wave-2's GPU lane proposed calling `pool.clear()` unconditionally when a
+    /// run finishes.  That is the wrong default: a `Session` exists to be run
+    /// **repeatedly**, and clearing the pool between runs means every inference
+    /// re-creates its device buffers — the pool would then only ever serve a
+    /// single run, which is precisely the case it was built to stop paying for.
+    /// The same lane's own report downgrades the item to "cosmetic, not
+    /// load-bearing": the pool is already bounded by a 256 MiB byte budget with
+    /// LRU eviction, so nothing is unbounded without the call.
+    ///
+    /// What was genuinely missing is the *ability* to release that memory at a
+    /// point the caller chooses — after the last inference of a batch job, when
+    /// a long-lived service goes idle, or before handing the GPU to another
+    /// process.  That is what this is.
+    ///
+    /// Returns `0` when the session has no live GPU context (no device, or a
+    /// CPU-only session), and also when the pool mutex is poisoned — a
+    /// best-effort release must not turn one panicking thread into a permanent
+    /// error for every later caller.
+    #[cfg(feature = "gpu")]
+    #[must_use = "the count says how many buffers were actually released"]
+    pub fn release_gpu_pool(&self) -> usize {
+        let Some(ref gpu) = self.gpu else {
+            return 0;
+        };
+        let Ok(mut pool) = gpu.pool.lock() else {
+            return 0;
+        };
+        let released = pool.available_count();
+        pool.clear();
+        released
     }
 
     /// Return the ordered execution provider list configured for this session.

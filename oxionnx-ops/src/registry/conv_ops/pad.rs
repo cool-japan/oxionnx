@@ -4,6 +4,27 @@ use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
 
 // ── Pad ─────────────────────────────────────────────────────────────────────
 
+/// Read the `constant_value` (input 2, optional) and opset-18 `axes` (input 3, optional)
+/// inputs shared by [`PadOp::execute`] and [`PadOp::execute_into_slots`]. `pads` (input 1) is
+/// required and read separately via `ctx.input(1)` so a missing tensor reports
+/// `TensorNotFound` instead of silently padding with an empty `pads` list. `mode` is read
+/// separately too (`ctx.attrs().s("mode")` already borrows cheaply with no lifetime to thread
+/// through a shared helper).
+///
+/// `constant_value` uses `.data.first()` rather than `.data[0]` because ONNX allows a present
+/// tensor to still be 0-element; indexing `[0]` on that would panic instead of falling back to
+/// the default, same as a genuinely absent input.
+fn read_optional_pad_inputs(ctx: &OpContext<'_>) -> (f32, Option<Vec<i64>>) {
+    let constant_value = ctx
+        .optional_input(2)
+        .and_then(|t| t.data.first().copied())
+        .unwrap_or(0.0);
+    let axes_vals: Option<Vec<i64>> = ctx
+        .optional_input(3)
+        .map(|t| t.data.iter().map(|&v| v as i64).collect());
+    (constant_value, axes_vals)
+}
+
 pub struct PadOp;
 impl Operator for PadOp {
     fn op_type(&self) -> &str {
@@ -13,15 +34,18 @@ impl Operator for PadOp {
         let input = ctx.input(0)?;
         let pads_tensor = ctx.input(1)?;
         let pads_vals: Vec<i64> = pads_tensor.data.iter().map(|&v| v as i64).collect();
-        let constant_value = ctx.optional_input(2).map(|t| t.data[0]).unwrap_or(0.0);
+        let (constant_value, axes_vals) = read_optional_pad_inputs(ctx);
         let mode = ctx.attrs().s("mode");
         let mode = if mode.is_empty() { "constant" } else { mode };
-        Ok(vec![crate::shape::pad(
+        let out = crate::shape::sequence::pad_axes(
             input,
             &pads_vals,
             mode,
             constant_value,
-        )])
+            axes_vals.as_deref(),
+        )
+        .map_err(OnnxError::ShapeMismatch)?;
+        Ok(vec![out])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -40,125 +64,27 @@ impl Operator for PadOp {
         let input = ctx.input(0)?;
         let pads_tensor = ctx.input(1)?;
         let pads_vals: Vec<i64> = pads_tensor.data.iter().map(|&v| v as i64).collect();
-        let constant_value = ctx.optional_input(2).map(|t| t.data[0]).unwrap_or(0.0);
+        let (constant_value, axes_vals) = read_optional_pad_inputs(ctx);
         let mode = ctx.attrs().s("mode");
-        let mode_str: &str = if mode.is_empty() { "constant" } else { mode };
+        let mode = if mode.is_empty() { "constant" } else { mode };
 
-        let ndim = input.ndim();
-        if pads_vals.len() != 2 * ndim {
-            return Err(OnnxError::Internal(format!(
-                "PadOp: pads length {} != 2 * ndim {}",
-                pads_vals.len(),
-                2 * ndim
-            )));
-        }
+        // Route through the single opset-18-aware implementation (negative pads = crop, `wrap`
+        // mode, and the `axes` input) instead of hand-rolling a second copy here that can drift
+        // from `execute()`'s behaviour.
+        let result = crate::shape::sequence::pad_axes(
+            input,
+            &pads_vals,
+            mode,
+            constant_value,
+            axes_vals.as_deref(),
+        )
+        .map_err(OnnxError::ShapeMismatch)?;
 
-        let begin: Vec<usize> = pads_vals[..ndim]
-            .iter()
-            .map(|&p| p.max(0) as usize)
-            .collect();
-        let end: Vec<usize> = pads_vals[ndim..]
-            .iter()
-            .map(|&p| p.max(0) as usize)
-            .collect();
-
-        let out_shape: Vec<usize> = (0..ndim)
-            .map(|d| input.shape[d] + begin[d] + end[d])
-            .collect();
-        let out_n: usize = out_shape.iter().product();
-
-        if slots[0].data.len() != out_n {
-            slots[0].data.resize(out_n, constant_value);
-        }
-        // Fill entire buffer with constant_value first (needed for "constant" mode,
-        // and also ensures padding regions are correct for "reflect"/"edge" modes
-        // which overwrite every position anyway).
-        slots[0].data.fill(constant_value);
-        slots[0].shape = out_shape.clone();
-
-        // Compute strides
-        let mut in_strides = vec![0_usize; ndim];
-        let mut s = 1_usize;
-        for i in (0..ndim).rev() {
-            in_strides[i] = s;
-            s *= input.shape[i];
-        }
-        let mut out_strides = vec![0_usize; ndim];
-        let mut s = 1_usize;
-        for i in (0..ndim).rev() {
-            out_strides[i] = s;
-            s *= out_shape[i];
-        }
-
-        match mode_str {
-            "reflect" => {
-                for (out_idx, out_val) in slots[0].data.iter_mut().enumerate() {
-                    let mut rem = out_idx;
-                    let mut in_idx = 0_usize;
-                    let mut valid = true;
-                    for d in 0..ndim {
-                        let out_coord = rem / out_strides[d];
-                        rem %= out_strides[d];
-                        let in_coord_signed = out_coord as isize - begin[d] as isize;
-                        let dim = input.shape[d] as isize;
-                        let mut c = in_coord_signed;
-                        if dim <= 1 {
-                            c = 0;
-                        } else {
-                            let period = 2 * (dim - 1);
-                            c = c.rem_euclid(period);
-                            if c >= dim {
-                                c = period - c;
-                            }
-                        }
-                        if c < 0 || c >= dim {
-                            valid = false;
-                            break;
-                        }
-                        in_idx += c as usize * in_strides[d];
-                    }
-                    if valid {
-                        *out_val = input.data[in_idx];
-                    }
-                }
-            }
-            "edge" => {
-                for (out_idx, out_val) in slots[0].data.iter_mut().enumerate() {
-                    let mut rem = out_idx;
-                    let mut in_idx = 0_usize;
-                    for d in 0..ndim {
-                        let out_coord = rem / out_strides[d];
-                        rem %= out_strides[d];
-                        let in_coord = (out_coord as isize - begin[d] as isize)
-                            .max(0)
-                            .min(input.shape[d] as isize - 1)
-                            as usize;
-                        in_idx += in_coord * in_strides[d];
-                    }
-                    *out_val = input.data[in_idx];
-                }
-            }
-            _ => {
-                // "constant" mode: fill already done above; copy input into interior
-                for (out_idx, out_val) in slots[0].data.iter_mut().enumerate() {
-                    let mut rem = out_idx;
-                    let mut in_idx = 0_usize;
-                    let mut inside = true;
-                    for d in 0..ndim {
-                        let out_coord = rem / out_strides[d];
-                        rem %= out_strides[d];
-                        let in_coord = out_coord as isize - begin[d] as isize;
-                        if in_coord < 0 || in_coord >= input.shape[d] as isize {
-                            inside = false;
-                            break;
-                        }
-                        in_idx += in_coord as usize * in_strides[d];
-                    }
-                    if inside {
-                        *out_val = input.data[in_idx];
-                    }
-                }
-            }
+        let out = &mut slots[0];
+        if out.shape == result.shape && out.data.len() == result.data.len() {
+            out.data.copy_from_slice(&result.data);
+        } else {
+            *out = result;
         }
         Ok(())
     }

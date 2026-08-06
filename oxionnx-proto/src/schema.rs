@@ -198,6 +198,23 @@ pub fn default_schemas() -> HashMap<String, OpSchema> {
     // ---- Quantization ----
     add_schema(&mut schemas, "QuantizeLinear", 2, Some(3), 1, Some(1));
     add_schema(&mut schemas, "DequantizeLinear", 2, Some(3), 1, Some(1));
+    // int8/uint8 operator family (ONNX Runtime QOperator format).
+    // QLinearConv: x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp [, B]
+    add_schema(&mut schemas, "QLinearConv", 8, Some(9), 1, Some(1));
+    // QLinearMatMul: a, a_scale, a_zp, b, b_scale, b_zp, y_scale, y_zp
+    add_schema(&mut schemas, "QLinearMatMul", 8, Some(8), 1, Some(1));
+    // MatMulInteger / ConvInteger: x, w [, x_zp [, w_zp]]
+    add_schema(&mut schemas, "MatMulInteger", 2, Some(4), 1, Some(1));
+    add_schema(&mut schemas, "ConvInteger", 2, Some(4), 1, Some(1));
+    // DynamicQuantizeLinear: x -> y, y_scale, y_zero_point
+    add_schema(
+        &mut schemas,
+        "DynamicQuantizeLinear",
+        1,
+        Some(1),
+        3,
+        Some(3),
+    );
 
     // ---- Comparison (binary -> 1 output) ----
     for op in &[
@@ -229,6 +246,19 @@ pub fn default_schemas() -> HashMap<String, OpSchema> {
     // ---- RNN ----
     add_schema(&mut schemas, "LSTM", 3, Some(8), 0, Some(3));
     add_schema(&mut schemas, "GRU", 3, Some(6), 0, Some(2));
+    // RNN: X, W, R [, B [, sequence_lens [, initial_h]]] -> Y, Y_h
+    add_schema(&mut schemas, "RNN", 3, Some(6), 0, Some(2));
+
+    // ---- Classic CNN / vision ops ----
+    add_schema(&mut schemas, "LRN", 1, Some(1), 1, Some(1));
+    add_schema(&mut schemas, "LpPool", 1, Some(1), 1, Some(1));
+    add_schema(&mut schemas, "GlobalLpPool", 1, Some(1), 1, Some(1));
+    // MaxUnpool: X, I [, output_shape]
+    add_schema(&mut schemas, "MaxUnpool", 2, Some(3), 1, Some(1));
+    add_schema(&mut schemas, "MaxRoiPool", 2, Some(2), 1, Some(1));
+    // Upsample-7 takes `scales` as an attribute, Upsample-9/10 as an input.
+    add_schema(&mut schemas, "Upsample", 1, Some(2), 1, Some(1));
+    add_schema(&mut schemas, "CastLike", 2, Some(2), 1, Some(1));
 
     // ---- Advanced ----
     add_schema(&mut schemas, "Einsum", 1, None, 1, Some(1));

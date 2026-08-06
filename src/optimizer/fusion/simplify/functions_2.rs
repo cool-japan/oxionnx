@@ -20,7 +20,7 @@ mod tests {
         let mut node2 = make_node(OpKind::Transpose, "t2", vec!["t1_out"], vec!["t2_out"]);
         node2.attrs.int_lists.insert("perm".to_string(), vec![1, 0]);
         let nodes = vec![node1, node2];
-        let result = cancel_consecutive_transpose(nodes);
+        let result = cancel_consecutive_transpose(nodes, &[]);
         assert_eq!(result.len(), 0);
     }
     #[test]
@@ -36,7 +36,7 @@ mod tests {
             .int_lists
             .insert("perm".to_string(), vec![1, 2, 0]);
         let nodes = vec![node1, node2];
-        let result = cancel_consecutive_transpose(nodes);
+        let result = cancel_consecutive_transpose(nodes, &[]);
         assert_eq!(result.len(), 0);
     }
     #[test]
@@ -52,7 +52,7 @@ mod tests {
             .int_lists
             .insert("perm".to_string(), vec![1, 2, 0]);
         let nodes = vec![node1, node2];
-        let result = cancel_consecutive_transpose(nodes);
+        let result = cancel_consecutive_transpose(nodes, &[]);
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].op, OpKind::Transpose));
         let perm = result[0].attrs.int_lists.get("perm").expect("perm attr");
@@ -66,7 +66,7 @@ mod tests {
         node2.attrs.int_lists.insert("perm".to_string(), vec![1, 0]);
         let relu = make_node(OpKind::Relu, "relu", vec!["t2_out"], vec!["out"]);
         let nodes = vec![node1, node2, relu];
-        let result = cancel_consecutive_transpose(nodes);
+        let result = cancel_consecutive_transpose(nodes, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "relu");
         assert_eq!(result[0].inputs[0], "x");
@@ -76,7 +76,7 @@ mod tests {
         let mut node = make_node(OpKind::Transpose, "t1", vec!["x"], vec!["t1_out"]);
         node.attrs.int_lists.insert("perm".to_string(), vec![1, 0]);
         let nodes = vec![node];
-        let result = cancel_consecutive_transpose(nodes);
+        let result = cancel_consecutive_transpose(nodes, &[]);
         assert_eq!(result.len(), 1);
     }
     #[test]
@@ -89,7 +89,9 @@ mod tests {
             vec!["r2_out"],
         );
         let nodes = vec![r1, r2];
-        let result = cancel_consecutive_reshape(nodes);
+        let mut weights = HashMap::new();
+        weights.insert("shape2".to_string(), Tensor::new(vec![2.0, 3.0], vec![2]));
+        let result = cancel_consecutive_reshape(nodes, &weights, &HashMap::new(), &[]);
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].op, OpKind::Reshape));
         assert_eq!(result[0].inputs[0], "x");
@@ -107,7 +109,13 @@ mod tests {
         );
         let relu = make_node(OpKind::Relu, "relu", vec!["r2_out"], vec!["out"]);
         let nodes = vec![r1, r2, relu];
-        let result = cancel_consecutive_reshape(nodes);
+        // Both Reshapes disappear only when the second provably restores `x`'s
+        // own shape — matching shape *names* proves nothing.
+        let mut weights = HashMap::new();
+        weights.insert("shape_a".to_string(), Tensor::new(vec![2.0, 3.0], vec![2]));
+        let mut shapes = HashMap::new();
+        shapes.insert("x".to_string(), vec![2, 3]);
+        let result = cancel_consecutive_reshape(nodes, &weights, &shapes, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "relu");
         assert_eq!(result[0].inputs[0], "x");
@@ -123,14 +131,14 @@ mod tests {
         );
         let relu = make_node(OpKind::Relu, "relu", vec!["r1_out"], vec!["relu_out"]);
         let nodes = vec![r1, r2, relu];
-        let result = cancel_consecutive_reshape(nodes);
+        let result = cancel_consecutive_reshape(nodes, &HashMap::new(), &HashMap::new(), &[]);
         assert_eq!(result.len(), 3);
     }
     #[test]
     fn test_cancel_consecutive_reshape_single_node() {
         let r1 = make_node(OpKind::Reshape, "r1", vec!["x", "shape1"], vec!["r1_out"]);
         let nodes = vec![r1];
-        let result = cancel_consecutive_reshape(nodes);
+        let result = cancel_consecutive_reshape(nodes, &HashMap::new(), &HashMap::new(), &[]);
         assert_eq!(result.len(), 1);
     }
     #[test]
@@ -139,7 +147,10 @@ mod tests {
         let r2 = make_node(OpKind::Reshape, "r2", vec!["r1_out", "s2"], vec!["r2_out"]);
         let r3 = make_node(OpKind::Reshape, "r3", vec!["r2_out", "s3"], vec!["r3_out"]);
         let nodes = vec![r1, r2, r3];
-        let result = cancel_consecutive_reshape(nodes);
+        let mut weights = HashMap::new();
+        weights.insert("s2".to_string(), Tensor::new(vec![2.0, 3.0], vec![2]));
+        weights.insert("s3".to_string(), Tensor::new(vec![6.0], vec![1]));
+        let result = cancel_consecutive_reshape(nodes, &weights, &HashMap::new(), &[]);
         assert!(result.len() <= 2);
         let last = result.last().expect("should have at least one node");
         assert_eq!(last.outputs[0], "r3_out");
@@ -149,7 +160,7 @@ mod tests {
         let sigmoid = make_node(OpKind::Sigmoid, "sigmoid", vec!["x"], vec!["sig_out"]);
         let mul = make_node(OpKind::Mul, "mul", vec!["x", "sig_out"], vec!["mul_out"]);
         let nodes = vec![sigmoid, mul];
-        let result = fuse_mul_sigmoid_to_silu(nodes);
+        let result = fuse_mul_sigmoid_to_silu(nodes, &[]);
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].op, OpKind::SiLU));
         assert_eq!(result[0].inputs, vec!["x"]);
@@ -160,7 +171,7 @@ mod tests {
         let sigmoid = make_node(OpKind::Sigmoid, "sigmoid", vec!["x"], vec!["sig_out"]);
         let mul = make_node(OpKind::Mul, "mul", vec!["sig_out", "x"], vec!["mul_out"]);
         let nodes = vec![sigmoid, mul];
-        let result = fuse_mul_sigmoid_to_silu(nodes);
+        let result = fuse_mul_sigmoid_to_silu(nodes, &[]);
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].op, OpKind::SiLU));
         assert_eq!(result[0].inputs, vec!["x"]);
@@ -171,7 +182,7 @@ mod tests {
         let mul = make_node(OpKind::Mul, "mul", vec!["x", "sig_out"], vec!["mul_out"]);
         let relu = make_node(OpKind::Relu, "relu", vec!["sig_out"], vec!["relu_out"]);
         let nodes = vec![sigmoid, mul, relu];
-        let result = fuse_mul_sigmoid_to_silu(nodes);
+        let result = fuse_mul_sigmoid_to_silu(nodes, &[]);
         assert_eq!(result.len(), 3);
     }
     #[test]
@@ -179,7 +190,7 @@ mod tests {
         let sigmoid = make_node(OpKind::Sigmoid, "sigmoid", vec!["y"], vec!["sig_out"]);
         let mul = make_node(OpKind::Mul, "mul", vec!["x", "sig_out"], vec!["mul_out"]);
         let nodes = vec![sigmoid, mul];
-        let result = fuse_mul_sigmoid_to_silu(nodes);
+        let result = fuse_mul_sigmoid_to_silu(nodes, &[]);
         assert_eq!(result.len(), 2);
     }
     #[test]
@@ -188,7 +199,7 @@ mod tests {
         let mul = make_node(OpKind::Mul, "mul", vec!["x", "sig_out"], vec!["mul_out"]);
         let relu = make_node(OpKind::Relu, "relu", vec!["mul_out"], vec!["relu_out"]);
         let nodes = vec![sigmoid, mul, relu];
-        let result = fuse_mul_sigmoid_to_silu(nodes);
+        let result = fuse_mul_sigmoid_to_silu(nodes, &[]);
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0].op, OpKind::SiLU));
         assert_eq!(result[0].outputs, vec!["mul_out"]);
@@ -255,17 +266,14 @@ mod tests {
             Tensor::new(vec![2.0, 0.0, 1.0], vec![3]),
         );
         weights.insert("idx2".to_string(), Tensor::new(vec![1.0, 2.0], vec![2]));
-        let result = fuse_gather_composition(nodes, &weights);
-        assert_eq!(result.len(), 2);
-        assert!(matches!(result[0].op, OpKind::Constant));
-        assert!(matches!(result[1].op, OpKind::Gather));
-        assert_eq!(result[1].inputs[0], "data");
-        assert_eq!(result[1].outputs[0], "g2_out");
-        let composed = result[0]
-            .attrs
-            .tensors
-            .get("value")
-            .expect("composed tensor");
+        let result = fuse_gather_composition(nodes, &mut weights, &[]);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].op, OpKind::Gather));
+        assert_eq!(result[0].inputs[0], "data");
+        assert_eq!(result[0].outputs[0], "g2_out");
+        let composed = weights
+            .get(&result[0].inputs[1])
+            .expect("composed indices initializer");
         assert_eq!(composed.data, vec![0.0, 1.0]);
     }
     #[test]
@@ -278,7 +286,7 @@ mod tests {
         let mut weights = HashMap::new();
         weights.insert("idx1".to_string(), Tensor::new(vec![0.0, 1.0], vec![2]));
         weights.insert("idx2".to_string(), Tensor::new(vec![0.0], vec![1]));
-        let result = fuse_gather_composition(nodes, &weights);
+        let result = fuse_gather_composition(nodes, &mut weights, &[]);
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0].op, OpKind::Gather));
         assert!(matches!(result[1].op, OpKind::Gather));
@@ -294,7 +302,7 @@ mod tests {
         let mut weights = HashMap::new();
         weights.insert("idx1".to_string(), Tensor::new(vec![0.0, 1.0], vec![2]));
         weights.insert("idx2".to_string(), Tensor::new(vec![0.0], vec![1]));
-        let result = fuse_gather_composition(nodes, &weights);
+        let result = fuse_gather_composition(nodes, &mut weights, &[]);
         assert_eq!(result.len(), 3);
     }
     #[test]
@@ -314,8 +322,8 @@ mod tests {
         );
         gather2.attrs.ints.insert("axis".to_string(), 0);
         let nodes = vec![gather1, gather2];
-        let weights = HashMap::new();
-        let result = fuse_gather_composition(nodes, &weights);
+        let mut weights = HashMap::new();
+        let result = fuse_gather_composition(nodes, &mut weights, &[]);
         assert_eq!(result.len(), 2);
     }
     #[test]
@@ -323,7 +331,7 @@ mod tests {
         let dropout = make_node(OpKind::Dropout, "dropout", vec!["x"], vec!["dropout_out"]);
         let relu = make_node(OpKind::Relu, "relu", vec!["dropout_out"], vec!["out"]);
         let nodes = vec![dropout, relu];
-        let result = eliminate_dropout_inference(nodes);
+        let result = eliminate_dropout_inference(nodes, &HashMap::new(), &[]);
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].op, OpKind::Relu));
         assert_eq!(result[0].inputs[0], "x");
@@ -344,7 +352,7 @@ mod tests {
             vec!["out"],
         );
         let nodes = vec![softmax, dropout, matmul];
-        let result = eliminate_dropout_inference(nodes);
+        let result = eliminate_dropout_inference(nodes, &HashMap::new(), &[]);
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0].op, OpKind::Softmax));
         assert!(matches!(result[1].op, OpKind::MatMul));
@@ -356,7 +364,7 @@ mod tests {
         dropout.attrs.ints.insert("training_mode".to_string(), 1);
         let relu = make_node(OpKind::Relu, "relu", vec!["dropout_out"], vec!["out"]);
         let nodes = vec![dropout, relu];
-        let result = eliminate_dropout_inference(nodes);
+        let result = eliminate_dropout_inference(nodes, &HashMap::new(), &[]);
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0].op, OpKind::Dropout));
     }
@@ -376,7 +384,7 @@ mod tests {
             vec!["out2"],
         );
         let nodes = vec![dropout, relu, mask_user];
-        let result = eliminate_dropout_inference(nodes);
+        let result = eliminate_dropout_inference(nodes, &HashMap::new(), &[]);
         assert_eq!(result.len(), 3);
         assert!(matches!(result[0].op, OpKind::Dropout));
     }
@@ -395,15 +403,17 @@ mod tests {
         );
         let nodes = vec![transpose, reshape];
         let weights = HashMap::new();
-        let result = simplify_transpose_reshape(nodes, &weights);
+        let result = simplify_transpose_reshape(nodes, &weights, &HashMap::new(), &[]);
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].op, OpKind::Reshape));
         assert_eq!(result[0].inputs[0], "x");
         assert_eq!(result[0].inputs[1], "target_shape");
         assert_eq!(result[0].outputs[0], "out");
     }
+    /// A real permutation followed by a flatten is **not** a memory no-op:
+    /// dropping the Transpose would flatten a different layout.
     #[test]
-    fn test_simplify_transpose_reshape_flatten_after_transpose() {
+    fn test_simplify_transpose_reshape_flatten_after_transpose_is_kept() {
         let mut transpose = make_node(OpKind::Transpose, "transpose", vec!["x"], vec!["t_out"]);
         transpose
             .attrs
@@ -418,10 +428,12 @@ mod tests {
         let nodes = vec![transpose, reshape];
         let mut weights = HashMap::new();
         weights.insert("flat_shape".to_string(), Tensor::new(vec![-1.0], vec![1]));
-        let result = simplify_transpose_reshape(nodes, &weights);
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0].op, OpKind::Reshape));
-        assert_eq!(result[0].inputs[0], "x");
+        let mut shapes = HashMap::new();
+        shapes.insert("x".to_string(), vec![2, 3, 4]);
+        let result = simplify_transpose_reshape(nodes, &weights, &shapes, &[]);
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0].op, OpKind::Transpose));
+        assert!(matches!(result[1].op, OpKind::Reshape));
     }
     #[test]
     fn test_simplify_transpose_reshape_no_simplification_non_trivial() {
@@ -439,7 +451,7 @@ mod tests {
         let nodes = vec![transpose, reshape];
         let mut weights = HashMap::new();
         weights.insert("shape_2d".to_string(), Tensor::new(vec![3.0, 4.0], vec![2]));
-        let result = simplify_transpose_reshape(nodes, &weights);
+        let result = simplify_transpose_reshape(nodes, &weights, &HashMap::new(), &[]);
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0].op, OpKind::Transpose));
         assert!(matches!(result[1].op, OpKind::Reshape));
@@ -460,7 +472,7 @@ mod tests {
         let relu = make_node(OpKind::Relu, "relu", vec!["t_out"], vec!["out2"]);
         let nodes = vec![transpose, reshape, relu];
         let weights = HashMap::new();
-        let result = simplify_transpose_reshape(nodes, &weights);
+        let result = simplify_transpose_reshape(nodes, &weights, &HashMap::new(), &[]);
         assert_eq!(result.len(), 3);
     }
 }

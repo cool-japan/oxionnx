@@ -53,13 +53,12 @@ pub(super) fn infer_onehot_shape(
         return None;
     }
 
-    let depth = if let Some(depth_tensor) = weights.get(depth_name) {
+    let depth = {
+        let depth_tensor = weights.get(depth_name)?;
         if depth_tensor.data.is_empty() {
             return None;
         }
         depth_tensor.data[0] as usize
-    } else {
-        return None;
     };
 
     let rank = indices_shape.len() as i64 + 1;
@@ -103,13 +102,12 @@ pub(super) fn infer_topk_shape(
         return None;
     }
 
-    let k = if let Some(k_tensor) = weights.get(k_name) {
+    let k = {
+        let k_tensor = weights.get(k_name)?;
         if k_tensor.data.is_empty() {
             return None;
         }
         k_tensor.data[0] as usize
-    } else {
-        return None;
     };
 
     let mut out = input_shape;

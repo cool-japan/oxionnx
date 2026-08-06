@@ -16,10 +16,13 @@ pub fn unique(
     let mut inverse = vec![0.0f32; x.data.len()];
 
     for (i, &val) in x.data.iter().enumerate() {
-        if let Some(pos) = seen
-            .iter()
-            .position(|(v, _)| (*v - val).abs() < f32::EPSILON)
-        {
+        // Exact bit-pattern equality, not an epsilon/tolerance window: ONNX Unique
+        // de-duplicates identical values, not "close" ones (an epsilon predicate would wrongly
+        // merge two genuinely distinct-but-close floats, e.g. 1.0 and 1.0+f32::EPSILON/2, and
+        // is also non-transitive as a dedup key, e.g. a chain of values each within epsilon of
+        // the next but not of each other). This mirrors `slices_equal` below (the `axis`-mode
+        // path in this same file), so both modes agree on what counts as "equal".
+        if let Some(pos) = seen.iter().position(|(v, _)| v.to_bits() == val.to_bits()) {
             inverse[i] = pos as f32;
         } else {
             inverse[i] = seen.len() as f32;
@@ -68,9 +71,12 @@ pub fn unique(
 /// For shape [d0,..,d_{ax-1}, d_ax, d_{ax+1},..,d_{n-1}], the slice has
 /// `outer * inner` elements where outer = product(shape[..ax]), inner = product(shape[ax+1..]).
 fn extract_axis_slice(data: &[f32], shape: &[usize], ax: usize, idx: usize) -> Vec<f32> {
-    let outer: usize = shape[..ax].iter().product::<usize>().max(1);
+    // No `.max(1)`: an empty slice already multiplies to 1 (correct vacuous case). Clamping a
+    // genuine zero-size outer/inner dim (e.g. shape [0,3,4] ax=1) to 1 would make the loop below
+    // index into `data`, which is correctly zero-length for that shape — an out-of-bounds panic.
+    let outer: usize = shape[..ax].iter().product::<usize>();
     let axis_size = shape[ax];
-    let inner: usize = shape[ax + 1..].iter().product::<usize>().max(1);
+    let inner: usize = shape[ax + 1..].iter().product::<usize>();
     let mut slice_data = Vec::with_capacity(outer * inner);
     for o in 0..outer {
         let base = (o * axis_size + idx) * inner;
@@ -182,8 +188,11 @@ fn unique_axis(
     let mut out_shape = x.shape.clone();
     out_shape[ax] = num_unique;
 
-    let outer: usize = x.shape[..ax].iter().product::<usize>().max(1);
-    let inner: usize = x.shape[ax + 1..].iter().product::<usize>().max(1);
+    // No `.max(1)` — see `extract_axis_slice` above: a genuine zero-size outer/inner dim must
+    // produce `outer`/`inner == 0` (so the copy loop below correctly does nothing), not a
+    // phantom 1 that then slices past the real (zero-length, for that shape) `x.data`/`out_data`.
+    let outer: usize = x.shape[..ax].iter().product::<usize>();
+    let inner: usize = x.shape[ax + 1..].iter().product::<usize>();
 
     let total_elems: usize = out_shape.iter().product();
     let mut out_data = vec![0.0f32; total_elems];
@@ -212,4 +221,57 @@ fn unique_axis(
         Tensor::new(inverse_data, vec![axis_size]),
         Tensor::new(counts, vec![num_unique]),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [Exact bit-pattern equality regression] `1e-7_f32` and `2e-7_f32` are distinct,
+    /// independently-representable f32 values (verified via Python:
+    /// `struct.pack('<f', 1e-7) = 95bfd633`, `struct.pack('<f', 2e-7) = 95bf5634`), but their
+    /// difference (~1.0000000117e-7) is *smaller* than `f32::EPSILON` (1.1920929e-7) — exactly
+    /// the case the old `(*v - val).abs() < f32::EPSILON` predicate got wrong, silently merging
+    /// two genuinely different values. ONNX Unique must de-duplicate identical values only.
+    #[test]
+    fn unique_flatten_does_not_merge_close_but_distinct_floats() {
+        let x = Tensor::new(vec![1e-7_f32, 2e-7_f32, 1e-7_f32], vec![3]);
+        let (vals, indices, inverse, counts) = unique(&x, None, false).expect("unique failed");
+        assert_eq!(
+            vals.data,
+            vec![1e-7_f32, 2e-7_f32],
+            "must stay 2 distinct groups"
+        );
+        assert_eq!(indices.data, vec![0.0, 1.0]);
+        assert_eq!(inverse.data, vec![0.0, 1.0, 0.0]);
+        assert_eq!(counts.data, vec![2.0, 1.0]);
+    }
+
+    /// Sanity companion to the above: bit-identical values (including `-0.0`/`0.0`, which are
+    /// numerically `==` but bit-distinct) still dedup/don't-dedup exactly as bit patterns say.
+    #[test]
+    fn unique_flatten_bit_identical_values_still_merge() {
+        let x = Tensor::new(vec![3.5_f32, 3.5_f32, 3.5_f32], vec![3]);
+        let (vals, _, inverse, counts) = unique(&x, None, false).expect("unique failed");
+        assert_eq!(vals.data, vec![3.5_f32]);
+        assert_eq!(inverse.data, vec![0.0, 0.0, 0.0]);
+        assert_eq!(counts.data, vec![3.0]);
+    }
+
+    /// [`.max(1)` zero-dim regression] axis-mode: a trailing (inner) dim of size 0 means every
+    /// per-axis "row" is itself empty (and therefore all rows compare equal — 0-length slices
+    /// are vacuously equal). `outer`/`inner` used to be clamped from a genuine 0 up to 1 by a
+    /// stray `.max(1)`, which then sliced the (correctly zero-length) `x.data`/`out_data` out of
+    /// bounds — a panic, not just a wrong shape.
+    #[test]
+    fn unique_axis_zero_size_inner_dim_does_not_panic() {
+        let x = Tensor::new(Vec::new(), vec![3, 0]); // 3 empty "rows", 0 elements total
+        let (y, indices, inverse, counts) = unique(&x, Some(0), false).expect("unique failed");
+        // All 3 empty rows are equal to each other -> exactly 1 unique row.
+        assert_eq!(y.shape, vec![1, 0]);
+        assert!(y.data.is_empty());
+        assert_eq!(indices.data, vec![0.0]);
+        assert_eq!(inverse.data, vec![0.0, 0.0, 0.0]);
+        assert_eq!(counts.data, vec![3.0]);
+    }
 }

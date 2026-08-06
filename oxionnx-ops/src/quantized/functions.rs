@@ -6,6 +6,37 @@ use oxionnx_core::{OnnxError, Tensor};
 
 use super::types::QuantizedTensor;
 
+// ── W2-perf-matmul (a6-19): cache-friendly row kernels ──────────────────────
+//
+// `quantized_matmul`/`fully_quantized_matmul` used an i-j-k loop order, so
+// the innermost reduction strided B by `n` (a new cache line every
+// iteration) and the accumulator's serial `+=` chain blocked vectorisation.
+// Reordering to i-p-j (`p` — the reduction axis — in the middle, `j` —
+// contiguous in B and in the output row — innermost) walks both B and the
+// output row contiguously and gives LLVM a vectorisable inner loop, with
+// *no change to the accumulation order for any individual output element*:
+// for a fixed `(i,j)`, both loop orders still sum the `p = 0..k` terms in
+// increasing `p` order — i-p-j only changes which *other* accumulators get
+// touched in between, and those are independent memory locations. The f32
+// per-tensor/per-channel kernels are therefore bit-identical to the
+// pre-reorder code (verified in `oxionnx-ops/tests/w2_perf_matmul.rs` against
+// numpy-derived values, and cross-checked bit-for-bit against a standalone
+// i-j-k reimplementation); the i32 kernels are exactly identical for the
+// same reason, and doubly so since integer addition is
+// associative/commutative even under wraparound.
+//
+// Per-column scale/zero-point are precomputed once per call (not once per
+// row, and not once per `(row, col)` as the original per-channel loop
+// implicitly repeated across every `p`), matching the brief's "hoist the
+// per-column scale/zero-point out of the p loop". The per-tensor scale/zp
+// are already loop-invariant scalars and need no such hoist.
+//
+// Row-blocks are parallelised over `i` with rayon once there are enough rows
+// to amortise the dispatch (`m >= 4`, matching the threshold used for batch
+// parallelism in `math_typed`/`math::matmul`) — at `m == 1` (the decode-phase
+// shape) there is nothing to parallelise across, only within a row, which
+// rayon's row-level split cannot help with anyway.
+
 /// Quantized matrix multiplication: A (f32) x B (i8) -> C (f32).
 ///
 /// This is the most common pattern in quantized inference:
@@ -31,45 +62,241 @@ pub fn quantized_matmul(a: &Tensor, b: &QuantizedTensor) -> Result<Tensor, OnnxE
         )));
     }
     let mut out = vec![0.0f32; m * n];
+    let a_data = &a.data;
+    let b_data = &b.data;
     if !b.params.per_channel {
         let scale = b.params.scale[0];
         let zp = b.params.zero_point[0] as i32;
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0f32;
-                for p in 0..k {
-                    let a_val = a.data[i * k + p];
-                    let b_val = (b.data[p * n + j] as i32 - zp) as f32 * scale;
-                    acc += a_val * b_val;
-                }
-                out[i * n + j] = acc;
+        let compute = |i: usize, out_row: &mut [f32]| {
+            per_tensor_row(&a_data[i * k..(i + 1) * k], b_data, out_row, k, scale, zp);
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if m >= 4 {
+            use rayon::prelude::*;
+            out.par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(i, row)| compute(i, row));
+        } else {
+            for (i, row) in out.chunks_mut(n).enumerate() {
+                compute(i, row);
             }
         }
+        #[cfg(target_arch = "wasm32")]
+        for (i, row) in out.chunks_mut(n).enumerate() {
+            compute(i, row);
+        }
     } else {
-        for i in 0..m {
-            for j in 0..n {
-                let ch_scale = if j < b.params.scale.len() {
-                    b.params.scale[j]
-                } else {
-                    1.0
-                };
-                let ch_zp = if j < b.params.zero_point.len() {
-                    b.params.zero_point[j] as i32
-                } else {
-                    0
-                };
-                let mut acc = 0.0f32;
-                for p in 0..k {
-                    let a_val = a.data[i * k + p];
-                    let b_val = (b.data[p * n + j] as i32 - ch_zp) as f32 * ch_scale;
-                    acc += a_val * b_val;
-                }
-                out[i * n + j] = acc;
+        let ch_scale: Vec<f32> = (0..n)
+            .map(|j| b.params.scale.get(j).copied().unwrap_or(1.0))
+            .collect();
+        let ch_zp: Vec<i32> = (0..n)
+            .map(|j| b.params.zero_point.get(j).map(|&z| z as i32).unwrap_or(0))
+            .collect();
+        let compute = |i: usize, out_row: &mut [f32]| {
+            per_channel_row(
+                &a_data[i * k..(i + 1) * k],
+                b_data,
+                out_row,
+                k,
+                &ch_scale,
+                &ch_zp,
+            );
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if m >= 4 {
+            use rayon::prelude::*;
+            out.par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(i, row)| compute(i, row));
+        } else {
+            for (i, row) in out.chunks_mut(n).enumerate() {
+                compute(i, row);
             }
+        }
+        #[cfg(target_arch = "wasm32")]
+        for (i, row) in out.chunks_mut(n).enumerate() {
+            compute(i, row);
         }
     }
     Ok(Tensor::new(out, vec![m, n]))
 }
+
+/// i-p-j per-tensor-scale row kernel: walks `b_data` and `out_row`
+/// contiguously (stride 1) instead of striding `b_data` by `n`.
+#[inline]
+fn per_tensor_row(
+    a_row: &[f32],
+    b_data: &[i8],
+    out_row: &mut [f32],
+    k: usize,
+    scale: f32,
+    zp: i32,
+) {
+    let n = out_row.len();
+    for (p, &av) in a_row.iter().enumerate().take(k) {
+        let b_row = &b_data[p * n..(p + 1) * n];
+        for (o, &bq) in out_row.iter_mut().zip(b_row.iter()) {
+            *o += av * ((bq as i32 - zp) as f32 * scale);
+        }
+    }
+}
+
+/// i-p-j per-channel row kernel: same access pattern as [`per_tensor_row`],
+/// with `ch_scale[j]`/`ch_zp[j]` (precomputed once per call, not per row or
+/// per element) indexed alongside `j` in the innermost loop.
+#[inline]
+fn per_channel_row(
+    a_row: &[f32],
+    b_data: &[i8],
+    out_row: &mut [f32],
+    k: usize,
+    ch_scale: &[f32],
+    ch_zp: &[i32],
+) {
+    let n = out_row.len();
+    for (p, &av) in a_row.iter().enumerate().take(k) {
+        let b_row = &b_data[p * n..(p + 1) * n];
+        for (((o, &bq), &cs), &cz) in out_row
+            .iter_mut()
+            .zip(b_row.iter())
+            .zip(ch_scale.iter())
+            .zip(ch_zp.iter())
+        {
+            *o += av * ((bq as i32 - cz) as f32 * cs);
+        }
+    }
+}
+/// i-p-j row kernel for the zero-zero-point fast path.
+///
+/// `row_acc[j] = Σ_p a_row[p] * b[p,j]`, accumulated in exact i32 (matching
+/// the original `acc: i32` per `(i,j)` — integer addition is associative
+/// under wraparound, so even the overflow behaviour is identical regardless
+/// of accumulation order), then converted to `f32 * output_scale` once per
+/// element after the full sum is known — never once per partial product, so
+/// this is not just numerically equivalent but performs the exact same
+/// float conversions as the pre-reorder code, just in `(i,p,j)` order.
+///
+/// `row_acc` is caller-provided scratch (length `n`) so the sequential path
+/// can reuse one buffer across all `m` rows instead of allocating per row.
+#[inline]
+fn fully_quantized_row_fast(
+    a_row: &[i8],
+    b_data: &[i8],
+    out_row: &mut [f32],
+    row_acc: &mut [i32],
+    k: usize,
+    output_scale: f32,
+) {
+    row_acc.iter_mut().for_each(|v| *v = 0);
+    let n = row_acc.len();
+    for (p, &av8) in a_row.iter().enumerate().take(k) {
+        let av = av8 as i32;
+        let b_row = &b_data[p * n..(p + 1) * n];
+        for (acc, &bq) in row_acc.iter_mut().zip(b_row.iter()) {
+            *acc += av * bq as i32;
+        }
+    }
+    for (o, &acc) in out_row.iter_mut().zip(row_acc.iter()) {
+        *o = acc as f32 * output_scale;
+    }
+}
+
+/// Sequential pass over every row for [`fully_quantized_row_fast`], reusing
+/// one `row_acc` scratch buffer across all `m` rows. Used directly when
+/// there's too little row-level work to amortise rayon's dispatch, and
+/// unconditionally on wasm32 (where rayon is not a dependency).
+fn fully_quantized_sequential_fast(
+    a_data: &[i8],
+    b_data: &[i8],
+    out: &mut [f32],
+    k: usize,
+    n: usize,
+    output_scale: f32,
+) {
+    let mut row_acc = vec![0i32; n];
+    for (i, row) in out.chunks_mut(n).enumerate() {
+        fully_quantized_row_fast(
+            &a_data[i * k..(i + 1) * k],
+            b_data,
+            row,
+            &mut row_acc,
+            k,
+            output_scale,
+        );
+    }
+}
+
+/// i-p-j row kernel for the general (non-zero zero-point) path — same access
+/// pattern as [`fully_quantized_row_fast`], with the zero-point correction
+/// (`- a_zp*col_sum_b[j] - b_zp*row_sum_a[i] + k_zp_product`) applied once
+/// per element in the final conversion pass, exactly matching the original
+/// per-`(i,j)` formula and evaluation order.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn fully_quantized_row_corrected(
+    a_row: &[i8],
+    b_data: &[i8],
+    out_row: &mut [f32],
+    row_acc: &mut [i32],
+    k: usize,
+    col_sum_b: &[i32],
+    a_zp: i32,
+    b_zp: i32,
+    row_sum_a_i: i32,
+    k_zp_product: i32,
+    output_scale: f32,
+) {
+    row_acc.iter_mut().for_each(|v| *v = 0);
+    let n = row_acc.len();
+    for (p, &av8) in a_row.iter().enumerate().take(k) {
+        let av = av8 as i32;
+        let b_row = &b_data[p * n..(p + 1) * n];
+        for (acc, &bq) in row_acc.iter_mut().zip(b_row.iter()) {
+            *acc += av * bq as i32;
+        }
+    }
+    for ((o, &raw), &cs) in out_row.iter_mut().zip(row_acc.iter()).zip(col_sum_b.iter()) {
+        let corrected = raw - a_zp * cs - b_zp * row_sum_a_i + k_zp_product;
+        *o = corrected as f32 * output_scale;
+    }
+}
+
+/// Sequential pass over every row for [`fully_quantized_row_corrected`],
+/// reusing one `row_acc` scratch buffer across all `m` rows. See
+/// [`fully_quantized_sequential_fast`] for why this is a separate function
+/// rather than inline at both call sites.
+#[allow(clippy::too_many_arguments)]
+fn fully_quantized_sequential_corrected(
+    a_data: &[i8],
+    b_data: &[i8],
+    out: &mut [f32],
+    k: usize,
+    n: usize,
+    col_sum_b: &[i32],
+    row_sum_a: &[i32],
+    a_zp: i32,
+    b_zp: i32,
+    k_zp_product: i32,
+    output_scale: f32,
+) {
+    let mut row_acc = vec![0i32; n];
+    for (i, row) in out.chunks_mut(n).enumerate() {
+        fully_quantized_row_corrected(
+            &a_data[i * k..(i + 1) * k],
+            b_data,
+            row,
+            &mut row_acc,
+            k,
+            col_sum_b,
+            a_zp,
+            b_zp,
+            row_sum_a[i],
+            k_zp_product,
+            output_scale,
+        );
+    }
+}
+
 /// Fully quantized matmul: A (i8) x B (i8) -> C (f32).
 ///
 /// Both inputs are quantized. Uses optimized integer arithmetic with
@@ -101,46 +328,94 @@ pub fn fully_quantized_matmul(
     let b_scale = b.params.scale[0];
     let b_zp = b.params.zero_point[0] as i32;
     let output_scale = a_scale * b_scale;
+    let a_data = &a.data;
+    let b_data = &b.data;
+
     if a_zp == 0 && b_zp == 0 {
         let mut out = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0i32;
-                for p in 0..k {
-                    acc += a.data[i * k + p] as i32 * b.data[p * n + j] as i32;
-                }
-                out[i * n + j] = acc as f32 * output_scale;
-            }
+        #[cfg(not(target_arch = "wasm32"))]
+        if m >= 4 {
+            use rayon::prelude::*;
+            out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+                let mut row_acc = vec![0i32; n];
+                fully_quantized_row_fast(
+                    &a_data[i * k..(i + 1) * k],
+                    b_data,
+                    row,
+                    &mut row_acc,
+                    k,
+                    output_scale,
+                );
+            });
+        } else {
+            fully_quantized_sequential_fast(a_data, b_data, &mut out, k, n, output_scale);
         }
+        #[cfg(target_arch = "wasm32")]
+        fully_quantized_sequential_fast(a_data, b_data, &mut out, k, n, output_scale);
         return Ok(Tensor::new(out, vec![m, n]));
     }
+
     let row_sum_a: Vec<i32> = (0..m)
-        .map(|i| {
-            let mut s = 0i32;
-            for p in 0..k {
-                s += a.data[i * k + p] as i32;
-            }
-            s
-        })
+        .map(|i| a_data[i * k..(i + 1) * k].iter().map(|&v| v as i32).sum())
         .collect();
     let mut col_sum_b = vec![0i32; n];
     for p in 0..k {
         for (j, cs) in col_sum_b.iter_mut().enumerate() {
-            *cs += b.data[p * n + j] as i32;
+            *cs += b_data[p * n + j] as i32;
         }
     }
     let k_zp_product = k as i32 * a_zp * b_zp;
     let mut out = vec![0.0f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut raw = 0i32;
-            for p in 0..k {
-                raw += a.data[i * k + p] as i32 * b.data[p * n + j] as i32;
-            }
-            let corrected = raw - a_zp * col_sum_b[j] - b_zp * row_sum_a[i] + k_zp_product;
-            out[i * n + j] = corrected as f32 * output_scale;
-        }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if m >= 4 {
+        use rayon::prelude::*;
+        out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+            let mut row_acc = vec![0i32; n];
+            fully_quantized_row_corrected(
+                &a_data[i * k..(i + 1) * k],
+                b_data,
+                row,
+                &mut row_acc,
+                k,
+                &col_sum_b,
+                a_zp,
+                b_zp,
+                row_sum_a[i],
+                k_zp_product,
+                output_scale,
+            );
+        });
+    } else {
+        fully_quantized_sequential_corrected(
+            a_data,
+            b_data,
+            &mut out,
+            k,
+            n,
+            &col_sum_b,
+            &row_sum_a,
+            a_zp,
+            b_zp,
+            k_zp_product,
+            output_scale,
+        );
     }
+    #[cfg(target_arch = "wasm32")]
+    fully_quantized_sequential_corrected(
+        a_data,
+        b_data,
+        &mut out,
+        k,
+        n,
+        &col_sum_b,
+        &row_sum_a,
+        a_zp,
+        b_zp,
+        k_zp_product,
+        output_scale,
+    );
+
     Ok(Tensor::new(out, vec![m, n]))
 }
 /// QLinearConv: Fully quantized 2D convolution.
@@ -333,6 +608,38 @@ pub fn qlinear_conv2d(
     }
     Ok(Tensor::new(output, vec![batch_size, c_out, h_out, w_out]))
 }
+/// Round to the nearest integer, ties to even (banker's rounding) — the
+/// rounding mode the ONNX `DynamicQuantizeLinear` spec mandates for both
+/// `round(qmin - min_x/y_scale)` and `round(x/y_scale)`. Rust's `f32::round`
+/// is ties-away-from-zero, which diverges exactly at the `.5` boundary
+/// (`2.5 -> 3` instead of the spec-correct `2`), so it cannot be used
+/// directly here. Hand-rolled rather than the standard-library
+/// `f32::round_ties_even` (stabilized in Rust 1.77) to stay compatible with
+/// this workspace's `rust-version` (1.75) MSRV — the same shape as
+/// `registry::quant_ops::round_ties_even_f32` and
+/// `indexing::quantize::round_ties_even`, kept file-local here rather than
+/// shared across modules, matching those two.
+#[inline]
+fn round_ties_even(v: f32) -> f32 {
+    if !v.is_finite() {
+        return v;
+    }
+    let floor = v.floor();
+    let diff = v - floor;
+    if diff > 0.5 {
+        floor + 1.0
+    } else if diff < 0.5 {
+        floor
+    } else {
+        // Exact tie: round to the neighbouring even integer.
+        if floor.rem_euclid(2.0) == 0.0 {
+            floor
+        } else {
+            floor + 1.0
+        }
+    }
+}
+
 /// Dynamic quantization: compute optimal uint8 quantization parameters from data.
 ///
 /// Returns `(quantized_tensor, scale, zero_point)` where values are in \[0, 255\]
@@ -340,6 +647,15 @@ pub fn qlinear_conv2d(
 /// convention (reinterpret as u8).
 ///
 /// The range always includes 0 to avoid bias in ReLU-like activations.
+///
+/// Matches the ONNX `DynamicQuantizeLinear` spec (and this crate's registered
+/// `DynamicQuantizeLinearOp`, which already implements it correctly) in two
+/// details that are easy to get backwards:
+///
+/// * the zero point is added **after** rounding (`round(x/s) + zp`), not
+///   inside it — for a negative half-way value the two orders differ by a
+///   full quantization step, and
+/// * rounding is **ties-to-even**, not half-away-from-zero.
 pub fn dynamic_quantize(x: &Tensor) -> Result<(Tensor, f32, i8), String> {
     if x.data.is_empty() {
         return Err("dynamic_quantize: empty tensor".into());
@@ -358,12 +674,12 @@ pub fn dynamic_quantize(x: &Tensor) -> Result<(Tensor, f32, i8), String> {
         .max(0.0);
     let range = max_val - min_val;
     let scale = if range < 1e-10 { 1e-10 } else { range / 255.0 };
-    let zp_f = (-min_val / scale).round().clamp(0.0, 255.0);
+    let zp_f = round_ties_even((-min_val / scale).clamp(0.0, 255.0));
     let zero_point = zp_f as u8 as i8;
     let data: Vec<f32> = x
         .data
         .iter()
-        .map(|&v| (v / scale + zp_f).round().clamp(0.0, 255.0))
+        .map(|&v| (round_ties_even(v / scale) + zp_f).clamp(0.0, 255.0))
         .collect();
     Ok((Tensor::new(data, x.shape.clone()), scale, zero_point))
 }

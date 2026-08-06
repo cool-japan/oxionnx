@@ -23,17 +23,31 @@ pub(super) const BINARY_EW_GPU_THRESHOLD: usize = 100_000;
 
 // --- Uniform param structs ---
 
+/// Uniform block for the softmax kernel.
+///
+/// `wg_per_row` is the dispatch grid's X extent so the kernel can rebuild the
+/// row index from a 2-D grid (`wid.y * wg_per_row + wid.x`), exactly as
+/// [`LayerNormParams`] does for normalization instances.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct SoftmaxParams {
     pub num_rows: u32,
     pub row_len: u32,
+    pub wg_per_row: u32,
+    pub _pad: u32,
 }
 
+/// Uniform block shared by the unary and binary element-wise kernels.
+///
+/// `alpha` carries the LeakyRelu slope (ignored by every other entry point);
+/// `row_threads` is `grid_x * 256` so the kernels can rebuild a flat index from
+/// a 2-D dispatch grid.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct EwParams {
     pub len: u32,
+    pub alpha: f32,
+    pub row_threads: u32,
     pub _pad: u32,
 }
 
@@ -43,7 +57,7 @@ pub(super) struct ReduceParams {
     pub outer_size: u32,
     pub axis_len: u32,
     pub inner_size: u32,
-    pub _pad: u32,
+    pub row_threads: u32,
 }
 
 #[repr(C)]
@@ -52,7 +66,8 @@ pub(super) struct LayerNormParams {
     pub n_elements: u32,
     pub batch_count: u32,
     pub eps: f32,
-    pub _pad: u32,
+    /// Workgroups along X, used to rebuild the instance index in a 2-D grid.
+    pub wg_per_row: u32,
 }
 
 #[repr(C)]
@@ -62,6 +77,10 @@ pub(super) struct BatchNormParams {
     pub channels: u32,
     pub spatial_size: u32,
     pub eps: f32,
+    pub row_threads: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 #[repr(C)]
@@ -69,41 +88,20 @@ pub(super) struct BatchNormParams {
 pub(super) struct TransposeParams {
     pub total_elements: u32,
     pub ndim: u32,
-    pub _pad0: u32,
+    pub row_threads: u32,
     pub _pad1: u32,
 }
 
 // ========================================================================
-// Helper: read back a staging buffer into Vec<f32>
+// Shared device guards
 // ========================================================================
 
-/// Read back GPU staging buffer contents into a `Vec<f32>`.
-///
-/// On wasm32, blocking device poll is not supported, so this returns `None`.
-pub(super) fn read_back(
-    _device: &wgpu::Device,
-    _staging: &wgpu::Buffer,
-    _count: usize,
-) -> Option<Vec<f32>> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        None
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let slice = _staging.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        _device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        if receiver.recv().ok()?.is_err() {
-            return None;
-        }
-        let data = slice.get_mapped_range();
-        let result: Vec<f32> = bytemuck::cast_slice(&data)[.._count].to_vec();
-        drop(data);
-        _staging.unmap();
-        Some(result)
-    }
-}
+// Read-back, dispatch planning and limit checks all live in `device_guard` so
+// the matmul path in `compute.rs` and the shader paths here share one
+// implementation (and one bounded, non-panicking failure mode).
+pub(super) use crate::device_guard::{
+    checked_storage_bytes, plan_dispatch, read_back_and_recycle, DispatchGrid, ErrorScope,
+};
+
+/// Workgroup size (threads along X) used by every element-wise-style kernel.
+pub(super) const WG_SIZE: u32 = 256;

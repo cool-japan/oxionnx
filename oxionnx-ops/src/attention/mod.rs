@@ -3,6 +3,7 @@
 
 pub mod cached;
 pub mod core;
+pub(crate) mod gemm;
 #[cfg(feature = "simd")]
 pub(crate) mod simd_sdpa;
 pub(crate) mod typed;
@@ -21,6 +22,9 @@ pub(crate) use typed::{
     multi_head_attention_bf16, multi_head_attention_f16, scaled_dot_product_attention_bf16,
     scaled_dot_product_attention_f16, MhaDims, SdpaDims,
 };
+
+#[cfg(test)]
+mod parity_tests;
 
 #[cfg(all(test, feature = "simd"))]
 mod simd_tests;

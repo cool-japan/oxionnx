@@ -71,6 +71,88 @@ impl SizeClassPool {
             }
         }
     }
+    /// Acquire a buffer of exactly `size` elements whose **contents are
+    /// unspecified**.
+    ///
+    /// Identical to [`SizeClassPool::acquire`] in every respect except one: it
+    /// does not zero the elements a recycled buffer already has.  A buffer that
+    /// comes back from the pool already the right length is returned with the
+    /// previous tensor's values still in it; a shorter one is grown with zeros
+    /// (there is nothing else to grow it with) and a fresh allocation is zeroed
+    /// because `vec![0.0; n]` is how one is made.
+    ///
+    /// # When this is correct — and when it silently leaks data
+    ///
+    /// Only for a caller that writes **every** element before anything reads
+    /// one.  `acquire` exists to make "forgot to initialise" impossible; this
+    /// entry point trades that guarantee for one avoided `memset` per output
+    /// buffer, which on a convolution or a matmul is a full pass over the output
+    /// tensor immediately before the kernel overwrites it.
+    ///
+    /// Used wrongly, the failure mode is not a crash: it is the *previous*
+    /// tensor's values appearing in the untouched part of the new one — safe
+    /// Rust, wrong numbers, and a leak of one intermediate's contents into
+    /// another.  That is why this is a separate, explicitly-named method rather
+    /// than a change to `acquire`, and why the engine does not route its output
+    /// slots through it yet: see the note on
+    /// [`Session::acquire_output_slots`](crate::Session) — deciding per operator
+    /// requires a "fully writes its outputs" predicate on the `Operator` trait,
+    /// which does not exist today.
+    ///
+    /// No `unsafe`, and no uninitialised memory is ever exposed: the returned
+    /// `Vec` has length `size` and every element is a valid `f32`, just not
+    /// necessarily `0.0`.
+    ///
+    /// ```
+    /// use oxionnx::SizeClassPool;
+    ///
+    /// let mut pool = SizeClassPool::new();
+    /// let mut buf = pool.acquire(4);
+    /// buf.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+    /// pool.release(buf);
+    ///
+    /// // The recycled buffer is exactly the requested length, and the caller is
+    /// // responsible for writing all of it.
+    /// let reused = pool.acquire_for_overwrite(4);
+    /// assert_eq!(reused.len(), 4);
+    /// ```
+    pub fn acquire_for_overwrite(&mut self, size: usize) -> Vec<f32> {
+        let class = bucket_for(size);
+        let bucket = self.bucket_mut(class);
+        let best_idx = Self::best_fit_index(bucket, size);
+        let found = match best_idx {
+            Some(idx) => Some((class, idx)),
+            None => self.find_in_larger_buckets(class, size),
+        };
+        match found {
+            Some((found_class, idx)) => {
+                let bucket = self.bucket_mut(found_class);
+                let mut buf = bucket.remove(idx);
+                self.stats.reuse_count += 1;
+                let freed_bytes = buf.capacity() * std::mem::size_of::<f32>();
+                self.stats.current_bytes = self.stats.current_bytes.saturating_sub(freed_bytes);
+                // `truncate` when it is already long enough: no write at all.
+                // `resize` only when it is short, and then only the tail is
+                // written — `resize` never touches the elements it keeps.
+                if buf.len() >= size {
+                    buf.truncate(size);
+                } else {
+                    buf.resize(size, 0.0);
+                }
+                buf
+            }
+            None => {
+                self.stats.alloc_count += 1;
+                let buf = vec![0.0_f32; size];
+                let allocated_bytes = buf.capacity() * std::mem::size_of::<f32>();
+                let total = self.stats.current_bytes + allocated_bytes;
+                if total > self.stats.peak_bytes {
+                    self.stats.peak_bytes = total;
+                }
+                buf
+            }
+        }
+    }
     /// Release a buffer back into the pool.
     ///
     /// The buffer is placed into the bucket corresponding to its length (requested size).

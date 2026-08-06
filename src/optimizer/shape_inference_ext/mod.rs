@@ -9,6 +9,7 @@ mod elementwise;
 mod indexing;
 mod reduce;
 mod spatial;
+pub(crate) mod spatial_attrs;
 
 use crate::graph::{Node, OpKind};
 use crate::tensor::Tensor;
@@ -349,35 +350,71 @@ pub(crate) fn infer_ext_node_shapes(
         }
 
         // DFT:
-        //   Input shape is [B, L] or [B, L, 1|2]; output is [B, out_len, 2].
-        //   `out_len` = L when onesided=0, or L/2+1 when onesided=1.
-        //   When inputs[1] (optional dft_length override) is absent we know the
-        //   DFT length equals the signal length L and can produce a static shape.
-        //   If inputs[1] is present as a weight constant we can resolve that too,
-        //   but the common case is that it's absent.
+        //   The transform may run along ANY axis except the trailing (real or
+        //   implicit) component axis, selected by the `axis` attribute (opset
+        //   17-19, default -2) or input[2] (opset 20+).  This used to hardcode
+        //   `in_shape[0] = batch, in_shape[1] = signal_len` and emit a 3-D
+        //   `[batch, out_len, 2]`, which is wrong for any non-default axis or
+        //   rank > 3 — cases the operator rejected outright before Wave 1 and
+        //   now executes.  Mirrors `DFTOp::execute` in
+        //   `oxionnx-ops/src/dsp/dft.rs`.
         OpKind::DFT => {
             let in_shape = get_input_shape(node, 0, known)?;
-            if in_shape.len() < 2 {
+            let ndim = in_shape.len();
+            if ndim < 2 {
                 return None;
             }
-            let batch = in_shape[0];
-            let signal_len = in_shape[1];
-            // Only infer when the optional dft_length input is absent.
-            // (If it's present we'd need to read the weight tensor value.)
-            let has_dft_length_input = node.inputs.get(1).is_some_and(|s| !s.is_empty());
-            if has_dft_length_input {
-                // Cannot determine DFT length statically without the tensor value.
+            // Component-axis determination: the 2-D form is the real-signal
+            // shorthand with no explicit component axis; otherwise the trailing
+            // dim must be 1 (real) or 2 (complex).
+            let component_dim_present = if ndim == 2 {
+                false
+            } else {
+                match in_shape[ndim - 1] {
+                    1 | 2 => true,
+                    // The operator reports a ShapeMismatch.
+                    _ => return None,
+                }
+            };
+            let mut out_shape: Vec<usize> = if component_dim_present {
+                in_shape[..ndim - 1].to_vec()
+            } else {
+                in_shape.clone()
+            };
+
+            // Both the DFT length (input[1]) and the axis (input[2], opset 20+)
+            // are runtime *values*, not shapes; decline rather than guess.
+            if node.inputs.get(1).is_some_and(|s| !s.is_empty())
+                || node.inputs.get(2).is_some_and(|s| !s.is_empty())
+            {
                 return None;
             }
-            let n = signal_len;
+
+            // Logical rank always counts the (real or implicit) component axis,
+            // matching the spec's `rank(input)` for axis normalization.
+            let logical_rank = i64::try_from(out_shape.len()).ok()?.checked_add(1)?;
+            let normalized = node.attrs.i("axis", -2).rem_euclid(logical_rank);
+            if normalized == logical_rank - 1 {
+                // Resolves to the component axis: the operator rejects this.
+                return None;
+            }
+            let axis = usize::try_from(normalized).ok()?;
+            let n = *out_shape.get(axis)?;
+            if n == 0 {
+                return None;
+            }
+
             let inverse = node.attrs.i("inverse", 0) != 0;
             let onesided = if inverse {
                 false // ONNX spec: onesided is ignored for inverse DFT
             } else {
                 node.attrs.i("onesided", 0) != 0
             };
-            let out_len = if onesided { n / 2 + 1 } else { n };
-            Some(vec![vec![batch, out_len, 2]])
+            out_shape[axis] = if onesided { n / 2 + 1 } else { n };
+            // The output always carries an explicit component axis of size 2,
+            // even when the input used the 2-D real-signal shorthand.
+            out_shape.push(2);
+            Some(vec![out_shape])
         }
 
         // STFT:
@@ -405,11 +442,8 @@ pub(crate) fn infer_ext_node_shapes(
             let frame_length: usize = {
                 let fl_name = node.inputs.get(3).map(|s| s.as_str()).unwrap_or("");
                 if !fl_name.is_empty() {
-                    if let Some(t) = weights.get(fl_name) {
-                        *t.data.first()? as usize
-                    } else {
-                        return None;
-                    }
+                    let t = weights.get(fl_name)?;
+                    *t.data.first()? as usize
                 } else {
                     let w_name = node.inputs.get(2).map(|s| s.as_str()).unwrap_or("");
                     if !w_name.is_empty() {

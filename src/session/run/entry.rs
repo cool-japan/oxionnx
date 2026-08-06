@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use super::super::Session;
 use super::state::SessionRunState;
+use super::{OutputSet, RefCounts};
 
 impl Session {
     /// Core inference engine shared by `run` and `run_with_binding`.
@@ -21,22 +22,38 @@ impl Session {
             Self::validate_input_shapes(&self.input_infos, inputs)?;
         }
 
-        // Update dynamic dimension bindings and re-resolve intermediate shapes if needed
-        self.update_dynamic_dims(inputs)?;
+        // Resolve intermediate shapes for THIS run.  The value is held by the run
+        // (as an immutable `Arc`, so a repeated run copies nothing) and threaded
+        // through the execution paths as an argument: two concurrent `run()` calls
+        // with different batch sizes must not be able to observe each other's
+        // shapes.  See `Session::resolve_run_shapes`.
+        let resolved_shapes = self.resolve_run_shapes(inputs)?;
 
-        let output_set: std::collections::HashSet<&str> =
-            self.output_names.iter().map(|s| s.as_str()).collect();
-        let mut ref_counts: HashMap<String, usize> = HashMap::new();
-        for node in &self.sorted_nodes {
-            for inp in &node.inputs {
-                if !inp.is_empty() && !self.weights.contains_key(inp) {
-                    *ref_counts.entry(inp.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-        for name in &self.output_names {
-            *ref_counts.entry(name.clone()).or_insert(0) += 1;
-        }
+        let output_set: OutputSet<'_> = self.output_names.iter().map(|s| s.as_str()).collect();
+        // Reference counts drive when an intermediate's buffer may be recycled.
+        // A node "consumes" its `inputs` **and** every outer-scope name its
+        // subgraph attributes capture: ONNX subgraphs bind those implicitly by
+        // name, so they appear nowhere in `node.inputs`, yet an `If`/`Loop`/`Scan`
+        // body reads them out of the live run state.  Counting only `node.inputs`
+        // freed captured tensors before the subgraph ever ran — and, because the
+        // count of 1 also unlocked the in-place path, mutated them first.
+        // `Session::decrement_refs_state` releases exactly the same set, so the
+        // counts stay symmetric.  See `run::scheduling::subgraph_captures`.
+        //
+        // The *contents* of this map are the same on every run — they depend only
+        // on the node list, the weights and the graph outputs, all fixed at build
+        // time — so they are computed once, into `Session::run_plan`.  Rebuilding
+        // them here walked every node, every input and every subgraph capture
+        // (a recursive free-name walk per control-flow node) on every inference.
+        // What is left is one `extend` over a precomputed vector; the run still
+        // gets a *fresh* map, because the counts are decremented as it proceeds.
+        //
+        // The keys **borrow** from `self.run_plan`, which is immutable for the
+        // whole run, so the map allocates one table and no strings.  See
+        // [`RefCounts`] for why the hasher is `hashbrown`'s rather than SipHash.
+        let base = &self.run_plan.base_ref_counts;
+        let mut ref_counts: RefCounts<'_> = RefCounts::with_capacity(base.len());
+        ref_counts.extend(base.iter().map(|(name, count)| (name.as_str(), *count)));
 
         let mut state = SessionRunState::with_capacity(self.sorted_nodes.len());
         // Seed state with input tensors (one clone per input, not per op)
@@ -55,13 +72,13 @@ impl Session {
         }
 
         if use_parallel {
-            self.run_parallel_inner(&mut state, &mut ref_counts, &output_set)?;
+            self.run_parallel_inner(&mut state, &mut ref_counts, &output_set, &resolved_shapes)?;
         } else {
-            self.run_sequential_inner(&mut state, &mut ref_counts, &output_set)?;
+            self.run_sequential_inner(&mut state, &mut ref_counts, &output_set, &resolved_shapes)?;
         }
 
         let pool_ref = self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>);
-        Ok(state.take_outputs(&self.output_names, pool_ref))
+        state.take_outputs(&self.output_names, &self.weights, pool_ref)
     }
 
     /// Run inference with the given named inputs.

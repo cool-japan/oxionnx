@@ -1,6 +1,7 @@
 //! Conv + Add + ReLU fusion pass (ResNet residual block pattern).
 
 use crate::graph::{Node, OpKind};
+use crate::optimizer::graph_utils::TensorUsage;
 use std::collections::{HashMap, HashSet};
 
 /// Conv + Add + ReLU fusion (ResNet residual block pattern).
@@ -16,10 +17,14 @@ use std::collections::{HashMap, HashSet};
 /// no bias, an empty string is used for the B slot.
 ///
 /// Conditions:
-/// - Conv output has exactly one consumer (the Add node).
-/// - Add output has exactly one consumer (the Relu node).
+/// - Conv output has exactly one consumer (the Add node) and is not a graph output.
+/// - Add output has exactly one consumer (the Relu node) and is not a graph output.
 /// - One of Add's inputs comes from Conv; the other is the residual / skip connection.
-pub fn fuse_conv_add_relu(nodes: Vec<Node>) -> Vec<Node> {
+///
+/// The fused `ConvAddRelu` op has no kernel in the default registry, so
+/// [`crate::optimizer::optimize`] only runs this pass when the active
+/// `OperatorRegistry` provides one.
+pub fn fuse_conv_add_relu(nodes: Vec<Node>, output_names: &[String]) -> Vec<Node> {
     if nodes.len() < 3 {
         return nodes;
     }
@@ -31,14 +36,7 @@ pub fn fuse_conv_add_relu(nodes: Vec<Node>) -> Vec<Node> {
         }
     }
 
-    let mut consumer_count: HashMap<String, usize> = HashMap::new();
-    for node in &nodes {
-        for inp in &node.inputs {
-            if !inp.is_empty() {
-                *consumer_count.entry(inp.clone()).or_insert(0) += 1;
-            }
-        }
-    }
+    let usage = TensorUsage::new(&nodes, output_names);
 
     let mut skip: HashSet<usize> = HashSet::new();
     let mut replacements: HashMap<usize, Node> = HashMap::new();
@@ -56,8 +54,9 @@ pub fn fuse_conv_add_relu(nodes: Vec<Node>) -> Vec<Node> {
 
         let relu_input = &node.inputs[0];
 
-        // Relu input must have exactly one consumer (this Relu)
-        if consumer_count.get(relu_input).copied().unwrap_or(0) != 1 {
+        // Relu input must have exactly one consumer (this Relu) and must not
+        // be a graph output — the fused node no longer produces it.
+        if !usage.is_fusable_intermediate(relu_input) {
             continue;
         }
 
@@ -85,7 +84,8 @@ pub fn fuse_conv_add_relu(nodes: Vec<Node>) -> Vec<Node> {
             let try_find_conv =
                 |conv_candidate: &str, residual_candidate: &str| -> Option<(usize, String)> {
                     // Conv output must have exactly one consumer (this Add)
-                    if consumer_count.get(conv_candidate).copied().unwrap_or(0) != 1 {
+                    // and must not be a declared graph output.
+                    if !usage.is_fusable_intermediate(conv_candidate) {
                         return None;
                     }
                     let idx = producer.get(conv_candidate)?;
@@ -93,6 +93,11 @@ pub fn fuse_conv_add_relu(nodes: Vec<Node>) -> Vec<Node> {
                         return None;
                     }
                     if !matches!(nodes[*idx].op, OpKind::Conv) {
+                        return None;
+                    }
+                    // An already-fused activation would have to run between the
+                    // Conv and the Add, which `ConvAddRelu` cannot express.
+                    if !nodes[*idx].attrs.s("activation").is_empty() {
                         return None;
                     }
                     Some((*idx, residual_candidate.to_string()))

@@ -1,21 +1,31 @@
 //! GpuContext — holds the wgpu device/queue and all cached compute pipelines.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use super::functions::{
     bgl_storage_ro, bgl_storage_rw, bgl_uniform, BATCH_NORM_SHADER, BINARY_ELEMENTWISE_SHADER,
     ELEMENTWISE_SHADER, LAYER_NORM_SHADER, MATMUL_SHADER, REDUCE_SHADER, SOFTMAX_SHADER,
     TILED_MATMUL_SHADER, TRANSPOSE_SHADER,
 };
-use super::tracker_pool::{GpuBufferPool, GpuTensorTracker};
+use super::tracker_pool::GpuBufferPool;
+use crate::device_guard::GpuLimits;
 
 /// Holds the wgpu device and queue, plus cached compute pipelines and buffer pool.
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Device limits that gate every dispatch (cached to keep hot paths cheap).
+    pub limits: GpuLimits,
+    /// Set once the device has reported an error we could not recover from.
+    /// While set, every `gpu_*` entry point declines so work goes to the CPU.
+    degraded: Arc<AtomicBool>,
+    /// First error observed on this device, kept for diagnostics.
+    last_error: Arc<Mutex<Option<String>>>,
     pub matmul_pipeline: wgpu::ComputePipeline,
     pub matmul_bind_group_layout: wgpu::BindGroupLayout,
-    // Softmax pipeline (two-pass: pass1 = exp, pass2 = normalize)
-    pub softmax_pass1_pipeline: wgpu::ComputePipeline,
-    pub softmax_pass2_pipeline: wgpu::ComputePipeline,
+    // Softmax pipeline (one workgroup per row, fused max/exp/sum/normalize)
+    pub softmax_pipeline: wgpu::ComputePipeline,
     pub softmax_bind_group_layout: wgpu::BindGroupLayout,
     // Element-wise pipelines (relu, sigmoid, gelu, tanh, exp, sqrt, abs, neg, log, silu, leaky_relu)
     pub relu_pipeline: wgpu::ComputePipeline,
@@ -52,17 +62,16 @@ pub struct GpuContext {
     // Transpose pipeline (general permutation)
     pub transpose_pipeline: wgpu::ComputePipeline,
     pub transpose_bind_group_layout: wgpu::BindGroupLayout,
-    // Buffer pool
+    /// Byte-bounded, LRU-evicting pool of idle output buffers.
     pub pool: std::sync::Mutex<GpuBufferPool>,
-    // Tensor location tracker for host-device transfer minimization
-    pub tracker: std::sync::Mutex<GpuTensorTracker>,
 }
 
 impl GpuContext {
     /// Try to create a GPU context. Returns `None` if no GPU is available.
     ///
-    /// On native targets, this blocks using `pollster`. On wasm32, this always
-    /// returns `None` — use [`Self::try_new_async`] instead.
+    /// On native targets, this blocks using `pollster`. On wasm32 it returns
+    /// `None`, as does [`Self::try_new_async`] — see that method for why the
+    /// browser backend is gated off rather than silently discarding results.
     pub fn try_new() -> Option<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -70,7 +79,7 @@ impl GpuContext {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            // wasm32 cannot block; callers must use try_new_async().
+            // wasm32 cannot block, and the async path declines too (a7-10).
             None
         }
     }
@@ -78,11 +87,39 @@ impl GpuContext {
     /// Async GPU context creation.
     ///
     /// On native targets this is called internally by [`Self::try_new`].
-    /// On wasm32 targets this is the only way to create a GPU context (uses WebGPU).
+    ///
+    /// # wasm32 / WebGPU
+    ///
+    /// [a7-10] This returns `None` on wasm32. Every kernel in this crate is a
+    /// *synchronous* `Option`-returning function that ends in a blocking
+    /// read-back, and blocking is impossible in the browser: `read_back`
+    /// (device_guard.rs) therefore cannot complete a `map_async` there. Before
+    /// this gate, a wasm32 context still uploaded inputs, allocated buffers,
+    /// encoded a pass and called `queue.submit` for every node, then discarded
+    /// the result and returned `None` — the CPU recomputed the same op, so the
+    /// backend was pure overhead that could never produce a value.
+    ///
+    /// Declining at context creation makes that honest: no dispatch is ever
+    /// encoded, no buffer is ever allocated, and the session runs on the CPU
+    /// path directly. Restoring browser acceleration requires an `async`
+    /// variant of every `gpu_*` entry point (so the caller can await the
+    /// `map_async` future) plus a `wasm-bindgen-futures` bridge — a public API
+    /// split, not a local fix.
     pub async fn try_new_async() -> Option<Self> {
-        let backends = if cfg!(target_arch = "wasm32") {
-            wgpu::Backends::BROWSER_WEBGPU
-        } else if cfg!(target_os = "linux") {
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self::acquire_device().await
+        }
+    }
+
+    /// Request an adapter and device, then build the context.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn acquire_device() -> Option<Self> {
+        let backends = if cfg!(target_os = "linux") {
             wgpu::Backends::VULKAN
         } else {
             wgpu::Backends::all()
@@ -104,22 +141,88 @@ impl GpuContext {
             .await
             .ok()?;
 
-        let (device, queue) = adapter
+        // Ask for what the adapter actually supports: the defaults cap storage
+        // bindings at 128 MiB and buffers at 256 MiB, which forces perfectly
+        // ordinary tensors onto the CPU. Fall back to the conservative defaults
+        // if the driver refuses the full set.
+        let device_queue = match adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("oxionnx"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await
-            .ok()?;
+        {
+            Ok(pair) => pair,
+            Err(_) => adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("oxionnx"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                })
+                .await
+                .ok()?,
+        };
+        let (device, queue) = device_queue;
 
         Self::build_from_device_queue(device, queue)
+    }
+
+    /// True once the device has reported an unrecoverable error.
+    ///
+    /// Every GPU entry point checks this first and declines while it is set, so
+    /// a driver reset or an out-of-memory condition degrades the session to CPU
+    /// execution instead of aborting the process.
+    #[inline]
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Record an unrecoverable device error and degrade to CPU execution.
+    ///
+    /// Native-only: every caller sits on a blocking path (`read_back`,
+    /// `ErrorScope::finish`) that wasm32 does not compile.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn mark_degraded(&self, reason: impl Into<String>) {
+        self.degraded.store(true, Ordering::Relaxed);
+        if let Ok(mut slot) = self.last_error.lock() {
+            if slot.is_none() {
+                *slot = Some(reason.into());
+            }
+        }
+    }
+
+    /// The first device error observed, if any.
+    #[must_use]
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Build the GPU context (pipelines, pool, tracker) from an already-acquired
     /// device and queue. Shared by both synchronous and asynchronous init paths.
     pub fn build_from_device_queue(device: wgpu::Device, queue: wgpu::Queue) -> Option<Self> {
+        // wgpu turns unhandled device errors into panics by default. This crate
+        // is contractually allowed to decline any node, so route them into a
+        // flag instead and let every dispatch fall back to the CPU.
+        let degraded = Arc::new(AtomicBool::new(false));
+        let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        {
+            let degraded = Arc::clone(&degraded);
+            let last_error = Arc::clone(&last_error);
+            device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
+                degraded.store(true, Ordering::Relaxed);
+                if let Ok(mut slot) = last_error.lock() {
+                    if slot.is_none() {
+                        *slot = Some(err.to_string());
+                    }
+                }
+            }));
+        }
+        let limits = GpuLimits::from_device(&device);
+
         // Create the GEMM shader module and pipeline once.
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matmul_shader"),
@@ -206,19 +309,11 @@ impl GpuContext {
             bind_group_layouts: &[Some(&softmax_bgl)],
             immediate_size: 0,
         });
-        let softmax_pass1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("softmax_pass1"),
+        let softmax_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("softmax_pipeline"),
             layout: Some(&softmax_pl),
             module: &softmax_shader,
-            entry_point: Some("pass1_exp"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let softmax_pass2 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("softmax_pass2"),
-            layout: Some(&softmax_pl),
-            module: &softmax_shader,
-            entry_point: Some("pass2_normalize"),
+            entry_point: Some("softmax_rows"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -577,10 +672,12 @@ impl GpuContext {
         Some(Self {
             device,
             queue,
+            limits,
+            degraded,
+            last_error,
             matmul_pipeline: pipeline,
             matmul_bind_group_layout: bind_group_layout,
-            softmax_pass1_pipeline: softmax_pass1,
-            softmax_pass2_pipeline: softmax_pass2,
+            softmax_pipeline,
             softmax_bind_group_layout: softmax_bgl,
             relu_pipeline,
             sigmoid_pipeline,
@@ -611,7 +708,51 @@ impl GpuContext {
             transpose_pipeline,
             transpose_bind_group_layout: tr_bgl,
             pool: std::sync::Mutex::new(GpuBufferPool::new(64)),
-            tracker: std::sync::Mutex::new(GpuTensorTracker::new()),
         })
+    }
+}
+
+/// Quiesce the device before its fields — the underlying `wgpu::Device` /
+/// `Queue` / `Instance` and every cached pipeline — run their own automatic
+/// drops.
+///
+/// No `gpu_*` entry point in this crate ever leaves a submission in flight
+/// across a call boundary: every dispatch reads its result back (or times
+/// out and marks the context degraded) before returning. So in the common
+/// case — a context that was actually used for compute — this `poll` finds
+/// nothing outstanding and returns immediately.
+///
+/// It exists for the *uncommon* case: a session built with a live GPU
+/// context whose graph never actually dispatched a single node to it —
+/// `OpPlacement::CpuOnly` (the crate-wide default) or a graph whose tensors
+/// all stayed below the dispatch size floor — where this `drop` may be the
+/// *first* explicit synchronization point with the driver since context
+/// creation. Native GPU drivers commonly run asynchronous background work
+/// per device/instance after creation (shader analysis and pipeline-cache
+/// housekeeping); this crate's own pipeline construction above creates over
+/// twenty compute pipelines up front, and on this crate's own test hardware
+/// that visibly spawns extra driver worker threads (seen under a debugger as
+/// `[vkrt] Analysis` / `[vkcf] Analysis` / `[vkps] Update`). Tearing the
+/// device down with no synchronization point first gives that work no
+/// defined place to finish *before* `vkDestroyDevice` / `vkDestroyInstance`
+/// run — and unlike a submitted compute dispatch, nothing else in this
+/// crate ever waits on it. A bounded, explicit wait here is cheap when there
+/// is nothing to wait for, and is the documented, supported way to bring a
+/// `wgpu::Device` to a quiescent point before the handles wrapping it go
+/// away.
+///
+/// Best-effort only, deliberately: a poll error or timeout does not change
+/// the fact that every field below is about to run its own drop regardless
+/// — `Drop::drop` cannot return a `Result`, and this device is being
+/// destroyed either way, successful quiescence or not.
+impl Drop for GpuContext {
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(5)),
+            });
+        }
     }
 }

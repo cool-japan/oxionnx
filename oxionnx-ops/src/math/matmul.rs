@@ -2,161 +2,28 @@ use oxionnx_core::Tensor;
 
 use super::broadcast::broadcast_to;
 
-// ── Shared helper: compute one batch slice into `dst` ───────────────────────
-
-/// Write the product `a[a_off..] @ b[b_off..]` (shape M×K × K×N) into `dst`.
-#[inline]
-#[allow(unsafe_code)]
-#[allow(clippy::too_many_arguments)]
-fn matmul_batch_slice(
-    a_data: &[f32],
-    b_data: &[f32],
-    dst: &mut [f32],
-    a_off: usize,
-    b_off: usize,
-    m: usize,
-    k: usize,
-    n: usize,
-) {
-    if m >= 4 {
-        #[allow(unsafe_code)]
-        unsafe {
-            matrixmultiply::sgemm(
-                m,
-                k,
-                n,
-                1.0,
-                a_data[a_off..].as_ptr(),
-                k as isize,
-                1,
-                b_data[b_off..].as_ptr(),
-                n as isize,
-                1,
-                0.0,
-                dst.as_mut_ptr(),
-                n as isize,
-                1,
-            );
-        }
-    } else {
-        for i in 0..m {
-            let a_row = &a_data[a_off + i * k..a_off + (i + 1) * k];
-            for j in 0..n {
-                let mut s = 0.0f32;
-                for (kk, &a_val) in a_row.iter().enumerate() {
-                    s += a_val * b_data[b_off + kk * n + j];
-                }
-                dst[i * n + j] = s;
-            }
-        }
-    }
-}
-
 // ── MatMul / Gemm ───────────────────────────────────────────────────────────
+//
+// The core `A @ B` computation for both MatMul and Gemm is
+// `crate::math_typed::sgemm_strided` — the single stride-aware
+// `matrixmultiply::sgemm` call, shared with the typed F32 dispatch arms in
+// `crate::registry::math_ops::matmul_gemm` (see `math_typed`'s module doc
+// comment for why it lives there rather than here: it must be reachable from
+// both this module and that one, which are not in an ancestor/descendant
+// relationship). `matmul`/`gemm` delegate to their `_into` counterparts so
+// the batching/parallelisation decision exists in exactly one place.
 
 /// Matrix multiplication supporting batched tensors.
 /// Last two dims: [M, K] @ [K, N] = [M, N]
 ///
 /// When `batch_size >= 4` and not targeting wasm32, batch iterations are
-/// parallelised with rayon for throughput.
-#[allow(unsafe_code)] // matrixmultiply::sgemm requires unsafe
+/// parallelised with rayon for throughput. Every batch slice — including
+/// M<4, e.g. the M=1 decode-phase GEMM of an autoregressive transformer's
+/// `[1,1,d] @ [d,d]` projections — is computed via `matrixmultiply::sgemm`;
+/// there is no naive scalar fallback loop.
 pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, String> {
-    let an = a.ndim();
-    let bn = b.ndim();
-
-    if an < 2 || bn < 2 {
-        return Err(format!(
-            "matmul requires at least 2D tensors, got {}D and {}D",
-            an, bn
-        ));
-    }
-
-    let m = a.shape[an - 2];
-    let k = a.shape[an - 1];
-    let k2 = b.shape[bn - 2];
-    let n = b.shape[bn - 1];
-
-    if k != k2 {
-        return Err(format!("matmul: inner dimensions mismatch {k} != {k2}"));
-    }
-
-    let a_batch: Vec<usize> = a.shape[..an - 2].to_vec();
-    let b_batch: Vec<usize> = b.shape[..bn - 2].to_vec();
-    let out_batch = Tensor::broadcast_shape(&a_batch, &b_batch)?;
-
-    let batch_size: usize = out_batch.iter().product::<usize>().max(1);
-    let a_batch_stride = m * k;
-    let b_batch_stride = k * n;
-    let mn = m * n;
-    let out_size = batch_size * mn;
-
-    let a_batches = a.numel() / (m * k);
-    let b_batches = b.numel() / (k * n);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let out = if batch_size >= 4 {
-        use rayon::prelude::*;
-        let a_data = &a.data;
-        let b_data = &b.data;
-        let results: Vec<Vec<f32>> = (0..batch_size)
-            .into_par_iter()
-            .map(|b_idx| {
-                let a_off = (b_idx % a_batches) * a_batch_stride;
-                let b_off = (b_idx % b_batches) * b_batch_stride;
-                let mut buf = vec![0.0f32; mn];
-                matmul_batch_slice(a_data, b_data, &mut buf, a_off, b_off, m, k, n);
-                buf
-            })
-            .collect();
-        let mut out = Vec::with_capacity(out_size);
-        for r in results {
-            out.extend_from_slice(&r);
-        }
-        out
-    } else {
-        let mut out = vec![0.0f32; out_size];
-        for b_idx in 0..batch_size {
-            let a_off = (b_idx % a_batches) * a_batch_stride;
-            let b_off = (b_idx % b_batches) * b_batch_stride;
-            let c_off = b_idx * mn;
-            matmul_batch_slice(
-                &a.data,
-                &b.data,
-                &mut out[c_off..c_off + mn],
-                a_off,
-                b_off,
-                m,
-                k,
-                n,
-            );
-        }
-        out
-    };
-
-    #[cfg(target_arch = "wasm32")]
-    let out = {
-        let mut out = vec![0.0f32; out_size];
-        for b_idx in 0..batch_size {
-            let a_off = (b_idx % a_batches) * a_batch_stride;
-            let b_off = (b_idx % b_batches) * b_batch_stride;
-            let c_off = b_idx * mn;
-            matmul_batch_slice(
-                &a.data,
-                &b.data,
-                &mut out[c_off..c_off + mn],
-                a_off,
-                b_off,
-                m,
-                k,
-                n,
-            );
-        }
-        out
-    };
-
-    let mut out_shape = out_batch;
-    out_shape.push(m);
-    out_shape.push(n);
+    let mut out = Vec::new();
+    let out_shape = matmul_into(a, b, &mut out)?;
     Ok(Tensor::new(out, out_shape))
 }
 
@@ -170,28 +37,19 @@ pub fn gemm(
     trans_a: bool,
     trans_b: bool,
 ) -> Result<Tensor, String> {
-    let a_eff = if trans_a { transpose_2d(a)? } else { a.clone() };
-    let b_eff = if trans_b { transpose_2d(b)? } else { b.clone() };
-    let mut result = matmul(&a_eff, &b_eff)?;
-    if alpha != 1.0 {
-        result.data.iter_mut().for_each(|v| *v *= alpha);
-    }
-    if let Some(c) = c {
-        let c_bcast = broadcast_to(c, &result.shape);
-        for (r, &cv) in result.data.iter_mut().zip(c_bcast.data.iter()) {
-            *r += beta * cv;
-        }
-    }
-    Ok(result)
+    let mut out = Vec::new();
+    let out_shape = gemm_into(a, b, c, alpha, beta, trans_a, trans_b, &mut out)?;
+    Ok(Tensor::new(out, out_shape))
 }
 
 /// Matrix multiplication that writes the result directly into `out`.
 ///
 /// Resizes `out` to the exact output length, then writes every element in
-/// place — no temporary allocation for the output buffer.
+/// place: no temporary output allocation, and (for `batch_size >= 4`) no
+/// per-batch `Vec` collected and copied back either — each rayon task writes
+/// straight into its slice of `out` (see `crate::math_typed::matmul_f32_into`).
 ///
 /// Returns the output shape `[batch..., M, N]`.
-#[allow(unsafe_code)] // matrixmultiply::sgemm requires unsafe
 pub fn matmul_into(a: &Tensor, b: &Tensor, out: &mut Vec<f32>) -> Result<Vec<usize>, String> {
     let an = a.ndim();
     let bn = b.ndim();
@@ -203,82 +61,15 @@ pub fn matmul_into(a: &Tensor, b: &Tensor, out: &mut Vec<f32>) -> Result<Vec<usi
         ));
     }
 
-    let m = a.shape[an - 2];
     let k = a.shape[an - 1];
     let k2 = b.shape[bn - 2];
-    let n = b.shape[bn - 1];
-
     if k != k2 {
         return Err(format!(
             "matmul_into: inner dimensions mismatch {k} != {k2}"
         ));
     }
 
-    let a_batch: Vec<usize> = a.shape[..an - 2].to_vec();
-    let b_batch: Vec<usize> = b.shape[..bn - 2].to_vec();
-    let out_batch = Tensor::broadcast_shape(&a_batch, &b_batch)?;
-
-    let batch_size: usize = out_batch.iter().product::<usize>().max(1);
-    let a_batch_stride = m * k;
-    let b_batch_stride = k * n;
-    let mn = m * n;
-    let out_size = batch_size * mn;
-
-    let a_batches = a.numel() / (m * k);
-    let b_batches = b.numel() / (k * n);
-
-    // Pre-size the slot buffer — zero-copy target.
-    out.resize(out_size, 0.0_f32);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    if batch_size >= 4 {
-        use rayon::prelude::*;
-        let a_data = &a.data;
-        let b_data = &b.data;
-        out.par_chunks_mut(mn).enumerate().for_each(|(b_idx, dst)| {
-            let a_off = (b_idx % a_batches) * a_batch_stride;
-            let b_off = (b_idx % b_batches) * b_batch_stride;
-            matmul_batch_slice(a_data, b_data, dst, a_off, b_off, m, k, n);
-        });
-    } else {
-        for b_idx in 0..batch_size {
-            let a_off = (b_idx % a_batches) * a_batch_stride;
-            let b_off = (b_idx % b_batches) * b_batch_stride;
-            let c_off = b_idx * mn;
-            matmul_batch_slice(
-                &a.data,
-                &b.data,
-                &mut out[c_off..c_off + mn],
-                a_off,
-                b_off,
-                m,
-                k,
-                n,
-            );
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    for b_idx in 0..batch_size {
-        let a_off = (b_idx % a_batches) * a_batch_stride;
-        let b_off = (b_idx % b_batches) * b_batch_stride;
-        let c_off = b_idx * mn;
-        matmul_batch_slice(
-            &a.data,
-            &b.data,
-            &mut out[c_off..c_off + mn],
-            a_off,
-            b_off,
-            m,
-            k,
-            n,
-        );
-    }
-
-    let mut out_shape = out_batch;
-    out_shape.push(m);
-    out_shape.push(n);
-    Ok(out_shape)
+    crate::math_typed::matmul_f32_into(&a.data, &a.shape, &b.data, &b.shape, out)
 }
 
 /// Gemm that writes Y = alpha * A' @ B' + beta * C directly into `out`.
@@ -286,9 +77,20 @@ pub fn matmul_into(a: &Tensor, b: &Tensor, out: &mut Vec<f32>) -> Result<Vec<usi
 /// Resizes `out` to M*N elements, then writes in place.
 /// Returns the output shape `[M, N]`.
 ///
-/// Note: `trans_a`/`trans_b` require a transposed copy of A/B (unavoidable
-/// without a tiled write-side transpose), so only the final result write is
-/// zero-copy.
+/// When both `a` and `b` are exactly 2D — the ONNX-spec shape for Gemm, and
+/// what every fusion pass and every hand-authored `Gemm` node actually
+/// carries — a transposed operand is expressed by swapping `sgemm`'s
+/// row/column strides (see `sgemm_strided` in `crate::math_typed`)
+/// instead of being materialised as a physical copy. `transB=1` is the
+/// common case (a PyTorch `nn.Linear` weight is stored
+/// `[out_features, in_features]`), so for a `[4096, 4096]` weight this
+/// removes a 64 MB copy on every `run()` call, once per layer.
+///
+/// A non-2D `a`/`b` — only reachable from the untyped `Gemm::execute`, which
+/// (unlike `execute_typed`) does not validate rank; a rank-3+ Gemm input is
+/// malformed-model territory per the ONNX spec, not the hot path — falls
+/// back to the batched `transpose_2d` + `matmul_into` path, unchanged from
+/// before this optimisation.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_into(
     a: &Tensor,
@@ -300,6 +102,9 @@ pub fn gemm_into(
     trans_b: bool,
     out: &mut Vec<f32>,
 ) -> Result<Vec<usize>, String> {
+    if a.ndim() == 2 && b.ndim() == 2 {
+        return gemm_2d_into(a, b, c, alpha, beta, trans_a, trans_b, out);
+    }
     let a_eff = if trans_a { transpose_2d(a)? } else { a.clone() };
     let b_eff = if trans_b { transpose_2d(b)? } else { b.clone() };
     let out_shape = matmul_into(&a_eff, &b_eff, out)?;
@@ -307,14 +112,81 @@ pub fn gemm_into(
         out.iter_mut().for_each(|v| *v *= alpha);
     }
     if let Some(c_tensor) = c {
-        // Build a temporary Tensor view over the current `out` for shape broadcast.
-        // We work on the raw slice to avoid cloning `out` again.
         let c_bcast = broadcast_to(c_tensor, &out_shape);
         for (r, &cv) in out.iter_mut().zip(c_bcast.data.iter()) {
             *r += beta * cv;
         }
     }
     Ok(out_shape)
+}
+
+/// The rank-2 fast path for [`gemm_into`]: a single, stride-transposed
+/// `sgemm_strided` call with no operand copy.
+///
+/// `alpha`/`beta` are applied exactly as [`gemm_into`]'s general path
+/// applies them — as separate passes over `out` after the raw `A @ B` is
+/// written — rather than folded into `sgemm_strided`'s native `alpha`/`beta`
+/// parameters. That fold is possible (prefill `out` with the broadcast `C`
+/// and let `sgemm` combine it), but it would change how `alpha`/`beta` are
+/// rounded relative to the pre-optimisation code, for a saving of O(MN)
+/// against an O(MNK) kernel — not worth the numerical-parity risk. This way,
+/// the only thing that changes relative to before is how the raw `A @ B`
+/// term itself is computed, and per `sgemm_strided`'s doc comment that is
+/// bit-identical to transpose-then-multiply (strides don't affect
+/// `matrixmultiply`'s packing/accumulation order).
+#[allow(clippy::too_many_arguments)]
+fn gemm_2d_into(
+    a: &Tensor,
+    b: &Tensor,
+    c: Option<&Tensor>,
+    alpha: f32,
+    beta: f32,
+    trans_a: bool,
+    trans_b: bool,
+    out: &mut Vec<f32>,
+) -> Result<Vec<usize>, String> {
+    let (m, k) = if trans_a {
+        (a.shape[1], a.shape[0])
+    } else {
+        (a.shape[0], a.shape[1])
+    };
+    let (k2, n) = if trans_b {
+        (b.shape[1], b.shape[0])
+    } else {
+        (b.shape[0], b.shape[1])
+    };
+    if k != k2 {
+        return Err(format!("gemm: inner dimensions mismatch {k} != {k2}"));
+    }
+    out.resize(m * n, 0.0f32);
+
+    // A is stored `[m,k]` normally (row stride k, col stride 1) and `[k,m]`
+    // when transposed (row stride 1, col stride m) so that `A[i,p]` still
+    // reads the logical (post-transpose) element at `(i,p)`; B mirrors this.
+    let (rsa, csa) = if trans_a {
+        (1isize, m as isize)
+    } else {
+        (k as isize, 1isize)
+    };
+    let (rsb, csb) = if trans_b {
+        (1isize, k as isize)
+    } else {
+        (n as isize, 1isize)
+    };
+    crate::math_typed::sgemm_strided(
+        m, k, n, 1.0, &a.data, rsa, csa, &b.data, rsb, csb, 0.0, out, n as isize, 1,
+    );
+
+    if alpha != 1.0 {
+        out.iter_mut().for_each(|v| *v *= alpha);
+    }
+    if let Some(c_tensor) = c {
+        let c_bcast = broadcast_to(c_tensor, &[m, n]);
+        for (r, &cv) in out.iter_mut().zip(c_bcast.data.iter()) {
+            *r += beta * cv;
+        }
+    }
+    Ok(vec![m, n])
 }
 
 fn transpose_2d(t: &Tensor) -> Result<Tensor, String> {
@@ -339,4 +211,60 @@ fn transpose_2d(t: &Tensor) -> Result<Tensor, String> {
     new_shape.push(cols);
     new_shape.push(rows);
     Ok(Tensor::new(out, new_shape))
+}
+
+// ── Perf smoke tests: before/after timing notes for W2-perf-matmul ─────────
+//
+// These are `#[ignore]`d (they don't run under the normal correctness gate)
+// and print wall-clock timings for the exact shapes called out in the
+// a6-0/a6-6/a6-17 findings. Run with:
+//   cargo test -p oxionnx-ops --release --lib math::matmul::perf_smoke -- --ignored --nocapture
+#[cfg(test)]
+mod perf_smoke {
+    use super::*;
+    use std::time::Instant;
+
+    fn timed(label: &str, iters: u32, mut f: impl FnMut()) {
+        // one warm-up call, untimed
+        f();
+        let start = Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "{label}: {:.3} ms/call ({iters} calls, {:.3} ms total)",
+            elapsed.as_secs_f64() * 1000.0 / f64::from(iters),
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_m1_gemm_decode() {
+        // The decode-phase LLM GEMM from a6-0/a6-6: [1,4096] @ [4096,4096]^T
+        // (transB=1, matching a PyTorch nn.Linear weight layout).
+        let a = Tensor::new(vec![0.01f32; 4096], vec![1, 4096]);
+        let w = Tensor::new(vec![0.001f32; 4096 * 4096], vec![4096, 4096]);
+        timed("gemm M=1 [1,4096]x[4096,4096]^T (transB)", 20, || {
+            let _ = gemm(&a, &w, None, 1.0, 0.0, false, true).expect("gemm");
+        });
+        timed("matmul M=1 [1,4096]x[4096,4096]", 20, || {
+            let _ = matmul(&a, &w).expect("matmul");
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_batched_matmul_decode() {
+        // Batched-attention decode matmul: [B*H,1,d] @ [B*H,d,S]
+        let bh = 32;
+        let d = 64;
+        let s = 128;
+        let a = Tensor::new(vec![0.01f32; bh * d], vec![bh, 1, d]);
+        let b = Tensor::new(vec![0.001f32; bh * d * s], vec![bh, d, s]);
+        timed("matmul batched [32,1,64]x[32,64,128]", 200, || {
+            let _ = matmul(&a, &b).expect("matmul");
+        });
+    }
 }

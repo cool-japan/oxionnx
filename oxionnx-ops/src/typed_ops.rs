@@ -294,7 +294,24 @@ pub fn typed_tanh(x: &TypedTensor) -> TypedTensor {
 }
 
 /// GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+///
+/// The F32 storage arm routes through `nn::gelu_slice` -- the same kernel the
+/// untyped `Tensor` path (`GeluOp::execute` / `execute_inplace` /
+/// `execute_into_slots`, all via `nn::gelu` / `nn::gelu_slice`) uses. With the
+/// "simd" feature enabled, `nn::gelu_slice` dispatches to a vectorized
+/// approximate-tanh kernel that differs at the ULP level from the plain
+/// `f32::tanh()` formula below; without this, an F32 `TypedTensor` and a
+/// plain `Tensor` holding identical data would silently disagree on Gelu's
+/// output for the exact same node. Other dtypes still go through `f32`
+/// conversion via `typed_unary_op` and the scalar formula -- they never had a
+/// same-dtype untyped kernel to match, and are far enough from a bit-exact
+/// story anyway (dtype cast is already lossy).
 pub fn typed_gelu(x: &TypedTensor) -> TypedTensor {
+    if let TensorStorage::F32(data) = &x.storage {
+        let mut out = data.clone();
+        crate::nn::gelu_slice(&mut out);
+        return TypedTensor::new(TensorStorage::F32(out), x.shape.clone());
+    }
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     const COEF: f32 = 0.044_715;
     typed_unary_op(x, |v| {
@@ -651,5 +668,77 @@ mod tests {
             TensorStorage::I64(v) => assert_eq!(v[0], 1i64 << 40),
             other => panic!("expected I64 storage, got {:?}", other.dtype()),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // typed_gelu -- cross-path consistency with the untyped `nn::gelu` kernel
+    // (W2-residuals item 2)
+    // -----------------------------------------------------------------------
+
+    /// F32 `typed_gelu` must route through the exact same kernel as the untyped
+    /// `Tensor` path (`nn::gelu`, via `nn::gelu_slice`) -- not merely an
+    /// equivalent formula. This is an exact `assert_eq!`, not a tolerance
+    /// check: both call sites bottom out in the same `nn::gelu_slice`, so a
+    /// `TypedTensor` and a plain `Tensor` holding identical F32 data must
+    /// produce bit-identical output. Run both with and without `--features
+    /// simd` -- without it the two formulas already agreed (this passed
+    /// before the fix too); with it, `nn::gelu_slice` dispatches to a
+    /// vectorized approximate-tanh kernel that the old scalar-formula
+    /// `typed_gelu` did not use, and only routing through `nn::gelu_slice`
+    /// keeps the two paths equal.
+    #[test]
+    fn typed_gelu_f32_matches_untyped_nn_gelu_exactly() {
+        let data = vec![-3.0_f32, -1.5, -0.5, 0.0, 0.25, 1.0, 2.0, 4.5];
+        let n = data.len();
+        let typed_in = make_f32(data.clone(), vec![n]);
+        let typed_out = typed_gelu(&typed_in);
+        assert_eq!(typed_out.dtype(), DType::F32);
+        assert_eq!(typed_out.shape, vec![n]);
+
+        let untyped_out = crate::nn::gelu(&oxionnx_core::Tensor::new(data, vec![n]));
+
+        match &typed_out.storage {
+            TensorStorage::F32(v) => assert_eq!(
+                v, &untyped_out.data,
+                "typed_gelu(F32) must be bit-identical to nn::gelu on the same data"
+            ),
+            other => panic!("expected F32 storage, got {:?}", other.dtype()),
+        }
+    }
+
+    /// Non-F32 dtypes keep the plain scalar tanh-approx formula (`to_f32_vec`,
+    /// apply the formula, cast back) -- they never had a same-dtype untyped
+    /// kernel to match in the first place. Pins two things at once: the
+    /// output dtype still follows the input (F16 in, F16 out), and the value
+    /// is exactly the scalar formula rounded to F16 by `TypedTensor::cast`
+    /// (same `half::f16::from_f32` round used to build the F16 input here),
+    /// not silently routed through the F32/simd arm added above.
+    #[test]
+    fn typed_gelu_f16_preserves_dtype_and_uses_scalar_formula() {
+        let xs = vec![-2.0_f32, -1.0, 0.0, 1.0, 2.0];
+        let input = make_f16(xs.clone(), vec![xs.len()]);
+        let out = typed_gelu(&input);
+        assert_eq!(out.dtype(), DType::F16, "F16 input must yield F16 output");
+
+        const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+        const COEF: f32 = 0.044_715;
+        // `xs` are all exactly representable in f16 (small half-integers), so
+        // the formula can be evaluated on the original f32 values directly --
+        // the f16 round-trip on input is a no-op here, isolating the rounding
+        // this test checks to exactly the one on the *output* cast.
+        let expect_f16: Vec<f32> = xs
+            .iter()
+            .map(|&v| {
+                let inner = SQRT_2_OVER_PI * (v + COEF * v * v * v);
+                let exact = 0.5 * v * (1.0 + inner.tanh());
+                half::f16::from_f32(exact).to_f32()
+            })
+            .collect();
+
+        assert_eq!(
+            out.storage.to_f32_vec(),
+            expect_f16,
+            "typed_gelu(F16) must equal the scalar formula, rounded to f16"
+        );
     }
 }

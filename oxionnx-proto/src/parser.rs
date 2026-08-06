@@ -1,12 +1,29 @@
 //! Minimal ONNX protobuf parser — zero external dependencies.
 //!
-//! Supports the subset of proto3 wire format needed for ONNX model files:
+//! Supports the protobuf wire format needed for ONNX model files:
 //! - Varint (wire type 0): i32, i64, bool, enum
 //! - 64-bit fixed (wire type 1): f64
 //! - Length-delimited (wire type 2): strings, bytes, nested messages, packed arrays
+//! - Groups (wire types 3/4): skipped, as required for unknown-field tolerance
 //! - 32-bit fixed (wire type 5): f32
+//!
+//! ONNX's schema is proto2, so every repeated numeric field is accepted in both its
+//! packed and unpacked form. All offset arithmetic is checked: a malformed or
+//! truncated file yields an `Err`, never a panic, and nesting is depth-bounded by
+//! [`MAX_NESTING_DEPTH`].
 
 use crate::types::*;
+
+/// Maximum protobuf message nesting depth accepted by the parser.
+///
+/// ONNX subgraph attributes (`If`/`Loop`/`Scan` bodies) nest recursively, and each
+/// level costs only a handful of wire bytes. Without a bound, a small hostile file
+/// can drive the parser (and the recursive `Drop` of the resulting tree) past the
+/// thread stack and abort the process. 64 is far above anything a real model uses.
+pub const MAX_NESTING_DEPTH: u32 = 64;
+
+/// Largest legal protobuf field number (2^29 - 1).
+const MAX_FIELD_NUMBER: u64 = 0x1FFF_FFFF;
 
 #[derive(Debug)]
 enum WireValue<'a> {
@@ -14,8 +31,16 @@ enum WireValue<'a> {
     Fixed64([u8; 8]),
     Bytes(&'a [u8]),
     Fixed32([u8; 4]),
+    /// A group (wire types 3/4). Groups are a deprecated protobuf encoding that no
+    /// ONNX message uses, but a conformant parser must skip them rather than abort.
+    Group,
 }
 
+/// Read a base-128 varint, rejecting encodings that do not fit in 64 bits.
+///
+/// The 10th byte may only carry bit 63 (`0x00` or `0x01`); anything larger would
+/// silently discard bits, letting two distinct byte sequences decode to the same
+/// value — a way for a corrupt length to masquerade as a valid one.
 pub fn read_varint(buf: &[u8], mut pos: usize) -> Result<(u64, usize), String> {
     let mut result = 0u64;
     let mut shift = 0u32;
@@ -25,67 +50,194 @@ pub fn read_varint(buf: &[u8], mut pos: usize) -> Result<(u64, usize), String> {
         }
         let byte = buf[pos];
         pos += 1;
+        if shift == 63 {
+            // 10th byte: only bit 63 is representable, and no 11th byte may follow.
+            if byte > 0x01 {
+                return Err("varint: overflow (value exceeds 64 bits)".into());
+            }
+            return Ok((result | ((byte as u64) << 63), pos));
+        }
         result |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
-            break;
+            return Ok((result, pos));
         }
         shift += 7;
-        if shift >= 64 {
-            return Err("varint: overflow".into());
-        }
     }
-    Ok((result, pos))
+}
+
+/// Compute `pos + len`, rejecting overflow and any end past the buffer.
+#[inline]
+fn checked_end(pos: usize, len: usize, buf_len: usize, what: &str) -> Result<usize, String> {
+    match pos.checked_add(len) {
+        Some(end) if end <= buf_len => Ok(end),
+        _ => Err(format!(
+            "{what}: EOF (need {len} bytes at offset {pos}, buffer is {buf_len})"
+        )),
+    }
+}
+
+/// Convert a wire-format length to `usize`, rejecting values that cannot be
+/// addressed on this target (relevant on 32-bit targets such as wasm32).
+#[inline]
+fn len_to_usize(len: u64, what: &str) -> Result<usize, String> {
+    usize::try_from(len).map_err(|_| format!("{what}: length {len} exceeds addressable memory"))
 }
 
 fn read_field<'a>(buf: &'a [u8], pos: usize) -> Result<(u32, WireValue<'a>, usize), String> {
-    let (tag, pos) = read_varint(buf, pos)?;
-    let field_no = (tag >> 3) as u32;
-    let wire_type = (tag & 0x7) as u8;
+    read_field_at(buf, pos, 0)
+}
+
+fn read_field_at<'a>(
+    buf: &'a [u8],
+    pos: usize,
+    depth: u32,
+) -> Result<(u32, WireValue<'a>, usize), String> {
+    let (field_no, wire_type, pos) = read_tag(buf, pos)?;
     match wire_type {
         0 => {
             let (v, pos) = read_varint(buf, pos)?;
             Ok((field_no, WireValue::Varint(v), pos))
         }
         1 => {
-            if pos + 8 > buf.len() {
-                return Err("fixed64: EOF".into());
-            }
-            let arr = [
-                buf[pos],
-                buf[pos + 1],
-                buf[pos + 2],
-                buf[pos + 3],
-                buf[pos + 4],
-                buf[pos + 5],
-                buf[pos + 6],
-                buf[pos + 7],
-            ];
-            Ok((field_no, WireValue::Fixed64(arr), pos + 8))
+            let end = checked_end(pos, 8, buf.len(), "fixed64")?;
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&buf[pos..end]);
+            Ok((field_no, WireValue::Fixed64(arr), end))
         }
         2 => {
             let (len, pos) = read_varint(buf, pos)?;
-            let len = len as usize;
-            if pos + len > buf.len() {
-                return Err(format!(
-                    "length-delimited: EOF (need {len}, have {})",
-                    buf.len() - pos
-                ));
-            }
-            Ok((field_no, WireValue::Bytes(&buf[pos..pos + len]), pos + len))
+            let len = len_to_usize(len, "length-delimited")?;
+            let end = checked_end(pos, len, buf.len(), "length-delimited")?;
+            Ok((field_no, WireValue::Bytes(&buf[pos..end]), end))
         }
+        3 => {
+            let end = skip_group(buf, pos, field_no, depth)?;
+            Ok((field_no, WireValue::Group, end))
+        }
+        4 => Err(format!(
+            "unexpected end-group tag for field {field_no} at pos {pos}"
+        )),
         5 => {
-            if pos + 4 > buf.len() {
-                return Err("fixed32: EOF".into());
-            }
-            let arr = [buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]];
-            Ok((field_no, WireValue::Fixed32(arr), pos + 4))
+            let end = checked_end(pos, 4, buf.len(), "fixed32")?;
+            let mut arr = [0u8; 4];
+            arr.copy_from_slice(&buf[pos..end]);
+            Ok((field_no, WireValue::Fixed32(arr), end))
         }
         wt => Err(format!("unknown wire type {wt} at pos {pos}")),
     }
 }
 
+/// Read a field tag, returning `(field_no, wire_type, next_pos)`.
+///
+/// Shared with the streaming parser so both paths validate field numbers identically.
+pub(crate) fn read_tag(buf: &[u8], pos: usize) -> Result<(u32, u8, usize), String> {
+    let (tag, next) = read_varint(buf, pos)?;
+    let raw_field_no = tag >> 3;
+    if raw_field_no == 0 || raw_field_no > MAX_FIELD_NUMBER {
+        return Err(format!("invalid field number {raw_field_no}"));
+    }
+    Ok((raw_field_no as u32, (tag & 0x7) as u8, next))
+}
+
+/// Read a length-delimited payload whose length prefix starts at `pos`.
+///
+/// Returns the payload slice and the offset just past it. Every advance is checked,
+/// so a hostile length can neither overflow `pos + len` nor escape the buffer.
+pub(crate) fn read_len_delim_at<'a>(
+    buf: &'a [u8],
+    pos: usize,
+    what: &str,
+) -> Result<(&'a [u8], usize), String> {
+    let (len, after_len) = read_varint(buf, pos)?;
+    let len = len_to_usize(len, what)?;
+    let end = checked_end(after_len, len, buf.len(), what)?;
+    Ok((&buf[after_len..end], end))
+}
+
+/// Skip a single field value in an in-memory buffer.
+///
+/// `pos` must point just past the field tag; the returned offset is just past the value.
+pub(crate) fn skip_field_value_in_buf(
+    buf: &[u8],
+    pos: usize,
+    field_no: u32,
+    wire_type: u8,
+) -> Result<usize, String> {
+    match wire_type {
+        0 => Ok(read_varint(buf, pos)?.1),
+        1 => checked_end(pos, 8, buf.len(), "fixed64"),
+        2 => {
+            let (len, after_len) = read_varint(buf, pos)?;
+            let len = len_to_usize(len, "length-delimited")?;
+            checked_end(after_len, len, buf.len(), "length-delimited")
+        }
+        3 => skip_group(buf, pos, field_no, 0),
+        4 => Err(format!(
+            "unexpected end-group tag for field {field_no} at pos {pos}"
+        )),
+        5 => checked_end(pos, 4, buf.len(), "fixed32"),
+        wt => Err(format!("unknown wire type {wt} at pos {pos}")),
+    }
+}
+
+/// Skip a group body, returning the offset just past its matching end-group tag.
+fn skip_group(
+    buf: &[u8],
+    mut pos: usize,
+    group_field_no: u32,
+    depth: u32,
+) -> Result<usize, String> {
+    if depth >= MAX_NESTING_DEPTH {
+        return Err(format!(
+            "group nesting exceeds maximum depth {MAX_NESTING_DEPTH}"
+        ));
+    }
+    loop {
+        if pos >= buf.len() {
+            return Err(format!(
+                "group {group_field_no}: unterminated (EOF before end-group tag)"
+            ));
+        }
+        let (tag, after_tag) = read_varint(buf, pos)?;
+        if (tag & 0x7) as u8 == 4 {
+            let end_field_no = tag >> 3;
+            if end_field_no != u64::from(group_field_no) {
+                return Err(format!(
+                    "group {group_field_no}: mismatched end-group tag for field {end_field_no}"
+                ));
+            }
+            return Ok(after_tag);
+        }
+        let (_, _, next) = read_field_at(buf, pos, depth + 1)?;
+        pos = next;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────
 
+/// Decode a packed run of varints, invoking `push` for each decoded value.
+fn for_each_packed_varint<F: FnMut(u64)>(b: &[u8], mut push: F) -> Result<(), String> {
+    let mut p = 0;
+    while p < b.len() {
+        let (v, np) = read_varint(b, p)?;
+        push(v);
+        p = np;
+    }
+    Ok(())
+}
+
+/// Parse a `TensorProto`.
+///
+/// Field numbers follow onnx.proto exactly:
+/// 1 = dims (packed int64), 2 = data_type, 3 = segment, 4 = float_data (packed float),
+/// 5 = int32_data (packed varint), 6 = string_data (repeated bytes),
+/// 7 = int64_data (packed varint), 8 = name, 9 = raw_data,
+/// 10 = double_data (packed fixed64), 11 = uint64_data (packed varint),
+/// 13 = external_data, 14 = data_location.
+///
+/// Every repeated numeric field is accepted in both packed and unpacked form, as
+/// required by the protobuf spec (ONNX's own .proto is proto2, where `floats`-style
+/// fields are emitted unpacked unless explicitly marked `[packed = true]`).
 pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
     let mut t = TensorProto::default();
     let mut pos = 0;
@@ -99,40 +251,51 @@ pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
             }
             (1, WireValue::Bytes(b)) => {
                 // dims: packed int64
-                let mut p = 0;
-                while p < b.len() {
-                    let (v, np) = read_varint(b, p)?;
-                    t.dims.push(v as i64);
-                    p = np;
-                }
+                for_each_packed_varint(b, |v| t.dims.push(v as i64))?;
             }
             (2, WireValue::Varint(v)) => t.data_type = v as i32,
+            (3, WireValue::Bytes(b)) => {
+                // segment: this TensorProto holds only a slice of the logical tensor.
+                // Loading it as if it were complete yields silently wrong data, so
+                // refuse it explicitly instead.
+                let (begin, end) = parse_tensor_segment(b)?;
+                if begin != 0 || end != 0 {
+                    return Err(format!(
+                        "TensorProto '{}': segmented tensors are not supported (segment begin={begin}, end={end})",
+                        t.name
+                    ));
+                }
+            }
             (8, WireValue::Bytes(b)) => t.name = String::from_utf8_lossy(b).into_owned(),
             (4, WireValue::Bytes(b)) => {
                 // float_data: packed float32
+                t.float_data.reserve(b.len() / 4);
                 for chunk in b.chunks_exact(4) {
                     t.float_data
                         .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 }
             }
-            (5, WireValue::Bytes(b)) => {
-                // int32_data: packed int32
-                for chunk in b.chunks_exact(4) {
-                    t.int32_data
-                        .push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                }
+            (4, WireValue::Fixed32(b)) => {
+                // float_data: individual (unpacked) float32
+                t.float_data.push(f32::from_le_bytes(b));
             }
+            (5, WireValue::Bytes(b)) => {
+                // int32_data: packed varint (proto int32 → varint, not fixed32)
+                for_each_packed_varint(b, |v| t.int32_data.push(v as i32))?;
+            }
+            (5, WireValue::Varint(v)) => t.int32_data.push(v as i32),
             (6, WireValue::Bytes(b)) => {
-                // int64_data: packed int64
-                for chunk in b.chunks_exact(8) {
-                    t.int64_data.push(i64::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                        chunk[7],
-                    ]));
-                }
+                // string_data: repeated bytes — one raw value per occurrence
+                t.string_data.push(b.to_vec());
             }
             (7, WireValue::Bytes(b)) => {
+                // int64_data: packed varint
+                for_each_packed_varint(b, |v| t.int64_data.push(v as i64))?;
+            }
+            (7, WireValue::Varint(v)) => t.int64_data.push(v as i64),
+            (10, WireValue::Bytes(b)) => {
                 // double_data: packed float64
+                t.double_data.reserve(b.len() / 8);
                 for chunk in b.chunks_exact(8) {
                     t.double_data.push(f64::from_le_bytes([
                         chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
@@ -140,10 +303,15 @@ pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
                     ]));
                 }
             }
-            (7, WireValue::Fixed64(b)) => {
+            (10, WireValue::Fixed64(b)) => {
                 // double_data: individual (unpacked) float64
                 t.double_data.push(f64::from_le_bytes(b));
             }
+            (11, WireValue::Bytes(b)) => {
+                // uint64_data: packed varint
+                for_each_packed_varint(b, |v| t.uint64_data.push(v))?;
+            }
+            (11, WireValue::Varint(v)) => t.uint64_data.push(v),
             (9, WireValue::Bytes(b)) => t.raw_data = b.to_vec(),
             (13, WireValue::Bytes(b)) => {
                 // ONNX spec: field 13 = repeated StringStringEntryProto external_data.
@@ -169,9 +337,31 @@ pub fn parse_tensor_proto(buf: &[u8]) -> Result<TensorProto, String> {
     Ok(t)
 }
 
+/// Parse a `TensorProto.Segment` sub-message, returning `(begin, end)`.
+fn parse_tensor_segment(buf: &[u8]) -> Result<(i64, i64), String> {
+    let mut begin = 0i64;
+    let mut end = 0i64;
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        match (field, value) {
+            (1, WireValue::Varint(v)) => begin = v as i64,
+            (2, WireValue::Varint(v)) => end = v as i64,
+            _ => {}
+        }
+    }
+    Ok((begin, end))
+}
+
 // ─────────────────────────────────────────────────────────────────
 
+/// Parse an `AttributeProto`.
 pub fn parse_attribute(buf: &[u8]) -> Result<AttributeProto, String> {
+    parse_attribute_at(buf, 0)
+}
+
+fn parse_attribute_at(buf: &[u8], depth: u32) -> Result<AttributeProto, String> {
     let mut attr = AttributeProto::default();
     let mut pos = 0;
     while pos < buf.len() {
@@ -184,15 +374,21 @@ pub fn parse_attribute(buf: &[u8]) -> Result<AttributeProto, String> {
             (4, WireValue::Bytes(b)) => attr.value.s = String::from_utf8_lossy(b).into_owned(),
             (5, WireValue::Bytes(b)) => attr.value.t = Some(parse_tensor_proto(b)?),
             (6, WireValue::Bytes(b)) => {
-                attr.value.g = Some(Box::new(parse_graph(b)?));
+                attr.value.g = Some(Box::new(parse_graph_at(b, depth + 1)?));
             }
             (7, WireValue::Bytes(b)) => {
                 // floats: packed
+                attr.value.floats.reserve(b.len() / 4);
                 for chunk in b.chunks_exact(4) {
                     attr.value
                         .floats
                         .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 }
+            }
+            (7, WireValue::Fixed32(b)) => {
+                // floats: individual (unpacked) float32 — ONNX's proto2 schema does not
+                // mark `floats` as packed, so real writers emit one tag per element.
+                attr.value.floats.push(f32::from_le_bytes(b));
             }
             (8, WireValue::Varint(v)) => {
                 // ints: individual varint
@@ -200,28 +396,45 @@ pub fn parse_attribute(buf: &[u8]) -> Result<AttributeProto, String> {
             }
             (8, WireValue::Bytes(b)) => {
                 // ints: packed varint
-                let mut p = 0;
-                while p < b.len() {
-                    let (v, np) = read_varint(b, p)?;
-                    attr.value.ints.push(v as i64);
-                    p = np;
-                }
+                for_each_packed_varint(b, |v| attr.value.ints.push(v as i64))?;
             }
             (9, WireValue::Bytes(b)) => {
-                let mut p = 0;
-                while p < b.len() {
-                    let (field2, val2, next2) = read_field(b, p)?;
-                    p = next2;
-                    if field2 == 0 {
-                        if let WireValue::Bytes(s) = val2 {
-                            attr.value
-                                .strings
-                                .push(String::from_utf8_lossy(s).into_owned());
-                        }
-                    }
-                }
+                // AttributeProto.strings is `repeated bytes strings = 9`: each field-9
+                // occurrence carries one raw string value directly — it is NOT a nested
+                // message. Push the bytes verbatim. Re-parsing them as protobuf mis-decodes
+                // any string whose leading bytes resemble a tag + length prefix, e.g.
+                // ONNX-ML TreeEnsemble "nodes_modes" entries like "BRANCH_GTE" (0x42 0x52…
+                // decodes as field 8 / wire type 2 / length 82, tripping a spurious EOF).
+                attr.value
+                    .strings
+                    .push(String::from_utf8_lossy(b).into_owned());
+            }
+            (10, WireValue::Bytes(b)) => {
+                // tensors (AttributeType::TENSORS)
+                attr.value.tensors.push(parse_tensor_proto(b)?);
+            }
+            (11, WireValue::Bytes(b)) => {
+                // graphs (AttributeType::GRAPHS)
+                attr.value.graphs.push(parse_graph_at(b, depth + 1)?);
+            }
+            (14, WireValue::Bytes(_)) | (15, WireValue::Bytes(_)) => {
+                return Err(format!(
+                    "attribute '{}': TYPE_PROTO attributes (tp / type_protos) are not supported",
+                    attr.name
+                ));
             }
             (20, WireValue::Varint(v)) => attr.value.attr_type = v as i32,
+            (21, WireValue::Bytes(b)) => {
+                // ref_attr_name: this attribute takes its value from the enclosing
+                // function's attribute of that name.
+                attr.value.ref_attr_name = String::from_utf8_lossy(b).into_owned();
+            }
+            (22, WireValue::Bytes(_)) | (23, WireValue::Bytes(_)) => {
+                return Err(format!(
+                    "attribute '{}': sparse tensor attributes are not supported",
+                    attr.name
+                ));
+            }
             _ => {}
         }
     }
@@ -230,7 +443,12 @@ pub fn parse_attribute(buf: &[u8]) -> Result<AttributeProto, String> {
 
 // ─────────────────────────────────────────────────────────────────
 
+/// Parse a `NodeProto`.
 pub fn parse_node(buf: &[u8]) -> Result<NodeProto, String> {
+    parse_node_at(buf, 0)
+}
+
+fn parse_node_at(buf: &[u8], depth: u32) -> Result<NodeProto, String> {
     let mut node = NodeProto::default();
     let mut pos = 0;
     while pos < buf.len() {
@@ -241,8 +459,9 @@ pub fn parse_node(buf: &[u8]) -> Result<NodeProto, String> {
             (2, WireValue::Bytes(b)) => node.outputs.push(String::from_utf8_lossy(b).into_owned()),
             (3, WireValue::Bytes(b)) => node.name = String::from_utf8_lossy(b).into_owned(),
             (4, WireValue::Bytes(b)) => node.op_type = String::from_utf8_lossy(b).into_owned(),
-            (5, WireValue::Bytes(b)) => node.attributes.push(parse_attribute(b)?),
+            (5, WireValue::Bytes(b)) => node.attributes.push(parse_attribute_at(b, depth)?),
             (7, WireValue::Bytes(b)) => node.domain = String::from_utf8_lossy(b).into_owned(),
+            (8, WireValue::Bytes(b)) => node.overload = String::from_utf8_lossy(b).into_owned(),
             _ => {}
         }
     }
@@ -251,27 +470,49 @@ pub fn parse_node(buf: &[u8]) -> Result<NodeProto, String> {
 
 // ─────────────────────────────────────────────────────────────────
 
+/// Parse a `GraphProto`.
 pub fn parse_graph(buf: &[u8]) -> Result<GraphProto, String> {
+    parse_graph_at(buf, 0)
+}
+
+fn parse_graph_at(buf: &[u8], depth: u32) -> Result<GraphProto, String> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(format!(
+            "graph nesting exceeds maximum depth {MAX_NESTING_DEPTH}"
+        ));
+    }
     let mut graph = GraphProto::default();
     let mut pos = 0;
     while pos < buf.len() {
         let (field, value, next) = read_field(buf, pos)?;
         pos = next;
         match (field, value) {
-            (1, WireValue::Bytes(b)) => graph.nodes.push(parse_node(b)?),
+            (1, WireValue::Bytes(b)) => graph.nodes.push(parse_node_at(b, depth)?),
             (2, WireValue::Bytes(b)) => graph.name = String::from_utf8_lossy(b).into_owned(),
             (5, WireValue::Bytes(b)) => graph.initializers.push(parse_tensor_proto(b)?),
             (11, WireValue::Bytes(b)) => {
                 // ValueInfoProto for graph inputs — parse full info and extract name
-                let vi = parse_value_info_proto(b);
+                let vi = parse_value_info_proto(b)?;
                 graph.inputs.push(vi.name.clone());
                 graph.input_value_infos.push(vi);
             }
             (12, WireValue::Bytes(b)) => {
                 // ValueInfoProto for graph outputs
-                let vi = parse_value_info_proto(b);
+                let vi = parse_value_info_proto(b)?;
                 graph.outputs.push(vi.name.clone());
                 graph.output_value_infos.push(vi);
+            }
+            (13, WireValue::Bytes(b)) => {
+                // value_info: shape/dtype metadata for intermediate values
+                graph.value_infos.push(parse_value_info_proto(b)?);
+            }
+            (15, WireValue::Bytes(_)) => {
+                // sparse_initializer: dropping it would leave the graph referencing a
+                // tensor that never materialises, so fail with a diagnosable message.
+                return Err(format!(
+                    "graph '{}': sparse_initializer is not supported",
+                    graph.name
+                ));
             }
             _ => {}
         }
@@ -298,120 +539,104 @@ pub fn parse_graph(buf: &[u8]) -> Result<GraphProto, String> {
 ///   }
 /// }
 /// ```
-pub fn parse_value_info_proto(buf: &[u8]) -> ValueInfoProto {
+pub fn parse_value_info_proto(buf: &[u8]) -> Result<ValueInfoProto, String> {
     let mut vi = ValueInfoProto::default();
     let mut pos = 0;
     while pos < buf.len() {
-        match read_field(buf, pos) {
-            Ok((1, WireValue::Bytes(b), next)) => {
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        match (field, value) {
+            (1, WireValue::Bytes(b)) => {
                 vi.name = String::from_utf8_lossy(b).into_owned();
-                pos = next;
             }
-            Ok((2, WireValue::Bytes(b), next)) => {
+            (2, WireValue::Bytes(b)) => {
                 // TypeProto — look for tensor_type (field 1)
-                parse_type_proto_into(b, &mut vi);
-                pos = next;
+                parse_type_proto_into(b, &mut vi)?;
             }
-            Ok((_, _, next)) => {
-                pos = next;
-            }
-            Err(_) => break,
+            _ => {}
         }
     }
-    vi
+    Ok(vi)
 }
 
 /// Parse TypeProto bytes and fill elem_type / shape into `vi`.
-fn parse_type_proto_into(buf: &[u8], vi: &mut ValueInfoProto) {
+fn parse_type_proto_into(buf: &[u8], vi: &mut ValueInfoProto) -> Result<(), String> {
     let mut pos = 0;
     while pos < buf.len() {
-        match read_field(buf, pos) {
-            Ok((1, WireValue::Bytes(b), next)) => {
-                // tensor_type: Tensor { 1: elem_type, 2: shape }
-                parse_tensor_type_into(b, vi);
-                pos = next;
-            }
-            Ok((_, _, next)) => {
-                pos = next;
-            }
-            Err(_) => break,
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        if let (1, WireValue::Bytes(b)) = (field, value) {
+            // tensor_type: Tensor { 1: elem_type, 2: shape }
+            parse_tensor_type_into(b, vi)?;
         }
     }
+    Ok(())
 }
 
 /// Parse TensorTypeProto bytes and fill elem_type / shape into `vi`.
-fn parse_tensor_type_into(buf: &[u8], vi: &mut ValueInfoProto) {
+fn parse_tensor_type_into(buf: &[u8], vi: &mut ValueInfoProto) -> Result<(), String> {
     let mut pos = 0;
     while pos < buf.len() {
-        match read_field(buf, pos) {
-            Ok((1, WireValue::Varint(v), next)) => {
-                vi.elem_type = v as i32;
-                pos = next;
-            }
-            Ok((2, WireValue::Bytes(b), next)) => {
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        match (field, value) {
+            (1, WireValue::Varint(v)) => vi.elem_type = v as i32,
+            (2, WireValue::Bytes(b)) => {
                 // TensorShapeProto — repeated Dimension (field 1)
-                parse_shape_proto_into(b, vi);
-                pos = next;
+                parse_shape_proto_into(b, vi)?;
             }
-            Ok((_, _, next)) => {
-                pos = next;
-            }
-            Err(_) => break,
+            _ => {}
         }
     }
+    Ok(())
 }
 
 /// Parse TensorShapeProto bytes and append dimensions into `vi.shape` and `vi.dim_params`.
-fn parse_shape_proto_into(buf: &[u8], vi: &mut ValueInfoProto) {
+fn parse_shape_proto_into(buf: &[u8], vi: &mut ValueInfoProto) -> Result<(), String> {
     let mut pos = 0;
     while pos < buf.len() {
-        match read_field(buf, pos) {
-            Ok((1, WireValue::Bytes(b), next)) => {
-                // Dimension: field 1 = dim_value (varint), field 2 = dim_param (string)
-                let (dim_value, dim_param) = parse_dimension(b);
-                vi.shape.push(dim_value);
-                vi.dim_params.push(dim_param);
-                pos = next;
-            }
-            Ok((_, _, next)) => {
-                pos = next;
-            }
-            Err(_) => break,
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        if let (1, WireValue::Bytes(b)) = (field, value) {
+            // Dimension: field 1 = dim_value (varint), field 2 = dim_param (string)
+            let (dim_value, dim_param) = parse_dimension(b)?;
+            vi.shape.push(dim_value);
+            vi.dim_params.push(dim_param);
         }
     }
+    Ok(())
 }
 
 /// Parse a single Dimension message and return (static_size, symbolic_param_name).
 ///
-/// ONNX Dimension fields:
-///   1: dim_value (varint) — concrete size; 0 means dynamic
+/// ONNX Dimension fields (a `oneof`):
+///   1: dim_value (varint) — concrete size, which may legitimately be 0
 ///   2: dim_param (string) — symbolic name (e.g. "batch_size")
-fn parse_dimension(buf: &[u8]) -> (Option<i64>, Option<String>) {
+///
+/// A dimension with neither field set is unknown; only that case yields `None`,
+/// so an explicit zero-sized dimension is no longer confused with a symbolic one.
+fn parse_dimension(buf: &[u8]) -> Result<(Option<i64>, Option<String>), String> {
     let mut dim_value: Option<i64> = None;
     let mut dim_param: Option<String> = None;
     let mut pos = 0;
     while pos < buf.len() {
-        match read_field(buf, pos) {
-            Ok((1, WireValue::Varint(v), next)) => {
-                // dim_value: 0 = dynamic/batch, >0 = static
-                dim_value = if v == 0 { None } else { Some(v as i64) };
-                pos = next;
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        match (field, value) {
+            (1, WireValue::Varint(v)) => {
+                dim_value = Some(v as i64);
             }
-            Ok((2, WireValue::Bytes(s), next)) => {
+            (2, WireValue::Bytes(s)) => {
                 // dim_param: symbolic dimension name
                 let name = String::from_utf8_lossy(s).into_owned();
                 if !name.is_empty() {
                     dim_param = Some(name);
                 }
-                pos = next;
             }
-            Ok((_, _, next)) => {
-                pos = next;
-            }
-            Err(_) => break,
+            _ => {}
         }
     }
-    (dim_value, dim_param)
+    Ok((dim_value, dim_param))
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -440,33 +665,12 @@ pub fn parse_model(buf: &[u8]) -> Result<ModelProto, String> {
             }
             (7, WireValue::Bytes(b)) => model.graph = parse_graph(b)?,
             (8, WireValue::Bytes(b)) => {
-                // OperatorSetIdProto — field 1 = domain (string), field 2 = version (varint)
-                let mut domain = String::new();
-                let mut version = 0i64;
-                let mut p = 0;
-                while p < b.len() {
-                    if let Ok((f, val, np)) = read_field(b, p) {
-                        match (f, val) {
-                            (1, WireValue::Bytes(s)) => {
-                                domain = String::from_utf8_lossy(s).into_owned();
-                            }
-                            (2, WireValue::Varint(v)) => {
-                                version = v as i64;
-                            }
-                            _ => {}
-                        }
-                        p = np;
-                    } else {
-                        break;
-                    }
-                }
+                let import = parse_opset_import(b)?;
                 // Backwards compat: set opset_version from default domain
-                if domain.is_empty() {
-                    model.opset_version = version;
+                if import.domain.is_empty() {
+                    model.opset_version = import.version;
                 }
-                model
-                    .opset_imports
-                    .push(crate::types::OpsetImport { domain, version });
+                model.opset_imports.push(import);
             }
             (14, WireValue::Bytes(b)) => {
                 let (key, val) = parse_string_string_entry(b)?;
@@ -475,10 +679,132 @@ pub fn parse_model(buf: &[u8]) -> Result<ModelProto, String> {
             (20, WireValue::Bytes(b)) => {
                 model.training_info.push(parse_training_info(b)?);
             }
+            (25, WireValue::Bytes(b)) => {
+                model.functions.push(parse_function_proto(b)?);
+            }
             _ => {}
         }
     }
     Ok(model)
+}
+
+// ─── Model-local functions (ModelProto field 25) ──────────────────────────
+
+/// A parsed ONNX `FunctionProto` — one entry of a model's *local function
+/// library* (`ModelProto.functions`, wire field 25).
+///
+/// A local function is a named, reusable subgraph: nodes elsewhere in the model
+/// call it by `(domain, op_type)` and the runtime is expected to substitute the
+/// body. PyTorch `dynamo` export and opset-18+ ONNX both emit these routinely,
+/// and a loader that ignores field 25 turns every such call into an unknown
+/// operator even though the model carries a complete body for it.
+///
+/// Wire layout (`onnx.proto`):
+/// ```text
+/// FunctionProto {
+///    1: name (string)
+///    4: input (repeated string)     — formal input names
+///    5: output (repeated string)    — formal output names
+///    6: attribute (repeated string) — attribute names with no default
+///    7: node (repeated NodeProto)   — the body
+///    8: doc_string (string)
+///    9: opset_import (repeated OperatorSetIdProto)
+///   10: domain (string)
+///   11: attribute_proto (repeated AttributeProto) — attributes *with* defaults
+///   13: overload (string)
+/// }
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct FunctionProto {
+    /// Function name; combined with [`domain`](Self::domain) it is what a call
+    /// node's `op_type` / `domain` pair matches against.
+    pub name: String,
+    /// Function domain (`""` = the default ONNX domain).
+    pub domain: String,
+    /// Formal input names, positionally matched to a call node's inputs.
+    pub inputs: Vec<String>,
+    /// Formal output names, positionally matched to a call node's outputs.
+    pub outputs: Vec<String>,
+    /// `attribute` (field 6): attribute names that have **no** declared default.
+    /// A body reference to one of these that the call site does not supply
+    /// leaves the attribute unset (i.e. the operator's own default applies).
+    pub attribute_names: Vec<String>,
+    /// `attribute_proto` (field 11): attributes that carry a default value,
+    /// used when the call site omits them. This is a *different* field from
+    /// `attribute` (field 6), which is only a list of names.
+    pub attribute_defaults: Vec<AttributeProto>,
+    /// The function body.
+    pub nodes: Vec<NodeProto>,
+    /// Operator sets the body is written against.
+    pub opset_imports: Vec<OpsetImport>,
+    /// `overload` (field 13): disambiguates same-name functions (IR ≥ 10).
+    pub overload: String,
+}
+
+/// Parse one `FunctionProto` message.
+pub fn parse_function_proto(buf: &[u8]) -> Result<FunctionProto, String> {
+    let mut func = FunctionProto::default();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        match (field, value) {
+            (1, WireValue::Bytes(b)) => func.name = String::from_utf8_lossy(b).into_owned(),
+            (4, WireValue::Bytes(b)) => func.inputs.push(String::from_utf8_lossy(b).into_owned()),
+            (5, WireValue::Bytes(b)) => func.outputs.push(String::from_utf8_lossy(b).into_owned()),
+            (6, WireValue::Bytes(b)) => func
+                .attribute_names
+                .push(String::from_utf8_lossy(b).into_owned()),
+            (7, WireValue::Bytes(b)) => func.nodes.push(parse_node(b)?),
+            (9, WireValue::Bytes(b)) => func.opset_imports.push(parse_opset_import(b)?),
+            (10, WireValue::Bytes(b)) => func.domain = String::from_utf8_lossy(b).into_owned(),
+            (11, WireValue::Bytes(b)) => func.attribute_defaults.push(parse_attribute(b)?),
+            (13, WireValue::Bytes(b)) => func.overload = String::from_utf8_lossy(b).into_owned(),
+            _ => {}
+        }
+    }
+    Ok(func)
+}
+
+/// Parse a model's local function library (`ModelProto.functions`, field 25).
+///
+/// Takes the same buffer as [`parse_model`] and rescans only its *top-level*
+/// fields, which is cheap: a length-delimited field is skipped by its length,
+/// so the (large) `graph` submessage is never walked.
+///
+/// [`parse_model`] now collects the same library into [`ModelProto::functions`]
+/// in its one pass over `buf`, so `crate::model::load*` reads that field
+/// instead of calling this a second time — do not reintroduce the second scan
+/// there. This function remains for a caller that holds only raw bytes and
+/// wants just the function list, e.g. without paying for a full `parse_model`.
+pub fn parse_model_functions(buf: &[u8]) -> Result<Vec<FunctionProto>, String> {
+    let mut functions = Vec::new();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        if let (25, WireValue::Bytes(b)) = (field, value) {
+            functions.push(parse_function_proto(b)?);
+        }
+    }
+    Ok(functions)
+}
+
+/// Parse an `OperatorSetIdProto` (field 1 = domain, field 2 = version).
+fn parse_opset_import(buf: &[u8]) -> Result<OpsetImport, String> {
+    let mut domain = String::new();
+    let mut version = 0i64;
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (field, value, next) = read_field(buf, pos)?;
+        pos = next;
+        match (field, value) {
+            (1, WireValue::Bytes(s)) => domain = String::from_utf8_lossy(s).into_owned(),
+            (2, WireValue::Varint(v)) => version = v as i64,
+            _ => {}
+        }
+    }
+    Ok(OpsetImport { domain, version })
 }
 
 /// Parse a TrainingInfoProto message.
@@ -859,5 +1185,59 @@ mod tests {
         let subgraph = attr.value.g.as_ref().unwrap();
         assert_eq!(subgraph.nodes.len(), 1);
         assert_eq!(subgraph.nodes[0].op_type, "Relu");
+    }
+
+    #[test]
+    fn test_issue_3_strings_attribute_repeated_bytes() {
+        // Regression for https://github.com/cool-japan/oxionnx/issues/3
+        //
+        // AttributeProto.strings is `repeated bytes strings = 9`. Each field-9 entry is a
+        // single raw string, NOT a nested message. ONNX-ML TreeEnsemble models store the
+        // "nodes_modes" attribute this way, with values such as "BRANCH_GTE" / "LEAF".
+        //
+        // "BRANCH_GTE" begins with bytes 0x42 ('B') 0x52 ('R'): if the entry is (wrongly)
+        // re-parsed as protobuf, 0x42 decodes as field 8 / wire type 2 and 0x52 as a length
+        // prefix of 82, which overruns the 10-byte string and raised
+        // `length-delimited: EOF (need 82, have 8)` — exactly the failure reported in #3.
+        //
+        // Build a NodeProto (mirroring the real model) whose attribute carries these
+        // string values, and assert they are decoded verbatim rather than re-parsed.
+        let mut modes_attr = Vec::new();
+        modes_attr.extend(encode_bytes_field(1, b"nodes_modes")); // name (field 1)
+        modes_attr.extend(encode_bytes_field(9, b"BRANCH_GTE")); // strings (field 9)
+        modes_attr.extend(encode_bytes_field(9, b"LEAF")); // strings (field 9)
+        modes_attr.extend(encode_bytes_field(9, b"BRANCH_LEQ")); // strings (field 9)
+        modes_attr.extend(encode_varint_field(20, 8)); // attr_type = STRINGS (field 20)
+
+        // Verify direct attribute parsing does not error and preserves every string.
+        let attr = parse_attribute(&modes_attr).expect("strings attribute must parse");
+        assert_eq!(attr.name, "nodes_modes");
+        assert_eq!(
+            attr.value.strings,
+            vec![
+                "BRANCH_GTE".to_string(),
+                "LEAF".to_string(),
+                "BRANCH_LEQ".to_string(),
+            ]
+        );
+
+        // Verify the full node path (parse_node -> parse_attribute) also succeeds.
+        let mut node_bytes = Vec::new();
+        node_bytes.extend(encode_bytes_field(1, b"input")); // input
+        node_bytes.extend(encode_bytes_field(2, b"variable")); // output
+        node_bytes.extend(encode_bytes_field(4, b"TreeEnsembleRegressor")); // op_type
+        node_bytes.extend(encode_bytes_field(5, &modes_attr)); // attribute
+
+        let node = parse_node(&node_bytes).expect("node with strings attribute must parse");
+        assert_eq!(node.op_type, "TreeEnsembleRegressor");
+        assert_eq!(node.attributes.len(), 1);
+        assert_eq!(
+            node.attributes[0].value.strings,
+            vec![
+                "BRANCH_GTE".to_string(),
+                "LEAF".to_string(),
+                "BRANCH_LEQ".to_string(),
+            ]
+        );
     }
 }

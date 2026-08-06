@@ -1,10 +1,10 @@
-# OxiONNX 0.1.4 -- Pure Rust ONNX Inference Engine
+# OxiONNX 0.1.5 -- Pure Rust ONNX Inference Engine
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
 **Author:** COOLJAPAN OU (Team Kitasan)
 
-**Current stats (2026-06-08):** ~67,129 SLoC (Rust code) | 167 OpKind variants | 1,264 tests passing | workspace layout (8 crates)
+**Current stats (2026-08-06):** ~126,388 SLoC (Rust code, tokei) | 190 OpKind variants | 188 registered operators (203 op-type strings incl. aliases) | 2,946 tests passing | workspace layout (8 crates)
 **Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)
 **Zero C/C++ dependencies.**
 
@@ -53,9 +53,9 @@
 
 - [x] Multi-threaded execution -- identify independent branches in the DAG; execute in parallel with rayon
 - [x] Topological-level parallelism -- group nodes by topological depth; run each level in parallel
-- [x] Streaming / chunked inference for sequence models (process in fixed-length windows)
-- [x] Async execution API -- `session.run_async()` returning a future
-- [x] Session serialization -- save pre-optimized graph to disk; reload without re-optimization
+- [x] Streaming / chunked inference for sequence models -- token-by-token generation via `session.generate(prompt, GenerationConfig)` (implemented v0.1.5 wave 2; see Async & Streaming below for the exact API)
+- [x] Async execution API -- `Arc<Session>::run_async()` returning a `RunFuture` (+ `spawn_run()`/`block_on()`) (implemented v0.1.5 wave 2)
+- [x] Session serialization -- `save_optimized()`/`load_optimized()`, version-tagged binary, reload at `OptLevel::None` (implemented v0.1.5 wave 2)
 - [x] Execution provider abstraction (CPU, GPU, future backends) with fallback chain
 - [x] In-place element-wise ops -- `Add`, `Mul`, `ReLU`, `GELU` when output shape == input shape and input has no other consumers
 
@@ -210,9 +210,9 @@ Summary of key items:
 - [x] Shader library -- WGSL compute shaders for MatMul, Conv2D, element-wise ops, Softmax, Reduction, Attention
 - [x] Automatic CPU-to-GPU fallback when an operator has no GPU kernel
 - [x] GPU memory pool -- reuse `wgpu::Buffer` allocations across inference calls
-- [x] Host-device transfer minimization -- keep tensors on GPU between consecutive GPU-capable nodes
+- [ ] Host-device transfer minimization -- keep tensors on GPU between consecutive GPU-capable nodes (never actually implemented: `GpuTensorTracker` promised this but nothing ever called `store`/`take`/`is_on_gpu` outside its own unit test; deleted as dead code in v0.1.5 wave 2 rather than left as a false claim. Real keep-on-GPU chaining needs `Tensor` to carry a device buffer, or the session executor to hold a residency map, plus buffer-taking variants of every `gpu_*` entry point -- none of which is a change local to `oxionnx-gpu`)
 - [x] Tiled MatMul with shared memory for large dimensions
-- [x] WebGPU compatibility for wasm32 targets
+- [ ] WebGPU compatibility for wasm32 targets (honestly declined as of v0.1.5 wave 2: `GpuContext::try_new`/`try_new_async` return `None` on wasm32 at context-creation time, so the CPU path runs directly. Before this, a wasm32 context still uploaded inputs, encoded a pass, and called `queue.submit` for every node, then discarded the result because blocking `map_async` readback is impossible in the browser -- pure overhead that could never produce a value. Restoring real browser acceleration needs an `async` variant of every `gpu_*` entry point plus a `wasm-bindgen-futures` bridge, a public API split, not a local fix)
 - [x] Benchmark GPU vs CPU paths for each operator; auto-select fastest
 
 ---
@@ -279,9 +279,9 @@ Summary of key items:
 
 ### Async & Streaming
 
-- [x] `async` inference API for non-blocking execution
-- [x] Streaming token generation API for autoregressive models (yield tokens as produced)
-- [x] Cancellation token support for long-running inference
+- [x] `async` inference API for non-blocking execution -- `Arc<Session>::run_async()` / `spawn_run()` / dependency-free `block_on()` (implemented v0.1.5 wave 2)
+- [x] Streaming token generation API for autoregressive models (yield tokens as produced) -- `session.generate(prompt, GenerationConfig)` returns a `TokenStream`, feeding `present.*` back in as the next step's `past.*` (implemented v0.1.5 wave 2)
+- [x] Cancellation token support -- `SessionBuilder::with_session_cancellation()` (session-scoped) and `GenerationConfig::with_cancellation()` (per-generation) (implemented v0.1.5 wave 2)
 
 ### Foreign Bindings
 
@@ -295,11 +295,11 @@ Summary of key items:
 
 - [x] Top-level README with:
   - [x] Feature overview and architecture diagram
-  - [x] Supported opset table (opset version, operator name, status)
-  - [x] Performance comparison table (vs onnxruntime, tract, etc.)
-  - [x] Quickstart code example
-- [x] Keywords: `onnx`, `inference`, `machine-learning`, `neural-network`, `pure-rust`
-- [x] Categories: `science`, `algorithms`, `wasm`
+  - [ ] Supported opset table (opset version, operator name, status) -- not in the README as a static table; `oxionnx::opset_coverage` exists as a runtime API instead (see Testing & Quality above). README ships an operator/category table without a per-opset breakdown
+  - [ ] Performance comparison table (vs onnxruntime, tract, etc.) -- deliberately not shipped; replaced with an honest prose "Comparison note" plus `cargo bench` pointers, since no reproducible cross-engine numbers exist to publish (see the perf reports under Section 17 wave 2 for why: measurements swung 2-3x under concurrent-agent load and the A/B harnesses that produced clean numbers were throwaway)
+  - [x] Quickstart code example (compile-checked against the current `Session`/`SessionBuilder`/`Tensor` API as of v0.1.5 wave 3)
+- [x] Keywords: `onnx`, `inference`, `deep-learning`, `machine-learning`, `pure-rust` (root `Cargo.toml`; corrected wording -- previously listed as `neural-network` instead of `deep-learning`)
+- [x] Categories: `science`, `algorithms` (root `Cargo.toml`; corrected count -- previously claimed a third `wasm` category that was never actually set on the root crate)
 - [x] `cargo doc --no-deps` with zero warnings across all subcrates
 - [x] All public items documented with doc comments
 - [x] `cargo publish --dry-run` passes for every subcrate (oxionnx-core verified; others blocked only by unpublished deps)
@@ -510,7 +510,7 @@ changing the `Operator::execute` return contract.
 - [x] Infrastructure: `TypedOpContext`, `native_dtypes()`, `execute_typed()` hooks on `Operator` trait (all with backward-compat defaults) — `oxionnx-core/src/operator.rs`, `operator_typed.rs`, `operator_slots.rs`
 - [x] Pilot: 40 operators declare `native_dtypes()` + `execute_typed()` (Add, Sub, Mul, Div, Neg, Sqrt, Relu, Sigmoid, Tanh, Gelu, Exp, Log, Abs, Erf, Identity, Cast, Reshape, + 23 more)
 - [x] Typed arithmetic wired: `typed_add`, `typed_sub`, `typed_mul`, `typed_div`, `typed_relu`, `typed_sigmoid`, `typed_tanh`, `typed_gelu`, `typed_exp` from `typed_ops.rs` used in `execute_typed` bodies
-- [x] Session `run_typed()`: still uses f32 fallback for now — per-node typed dispatch deferred to v0.1.6 (requires `run_typed` rewrite to carry TypedTensor intermediates)
+- [x] Session `run_typed()`: initial pilot used an f32 fallback for every node, with per-node typed dispatch deferred to v0.1.6 -- **superseded by the v0.1.6 follow-up directly below**, which shipped; current `run_typed()` (`src/session/run/typed.rs`) carries `TypedTensor` intermediates and dispatches through `execute_typed` per-node whenever every present input's dtype is in that operator's `native_dtypes()`, falling back to a surgical f32 cast only for the inputs/ops that need it. Confirmed by reading the current source, not just this checklist
 - [x] v0.1.6 follow-up: Rewrite `run_typed` to carry `TypedTensor` intermediates; per-node dispatch via `native_dtypes()` (skip f32 round-trip)
 - [x] v0.1.6 follow-up: Native integer arithmetic in `typed_ops.rs` (Add/Sub/Mul/Div for I8/I16/I32/I64 without f32 intermediate)
 - [x] v0.1.6 follow-up: Native dispatch for Conv, MatMul, Gemm (heavy hand-written kernels — conv.rs, rnn.rs, attention.rs)
@@ -520,49 +520,37 @@ changing the `Operator::execute` return contract.
   - [x] **v0.1.10+ scoped slice: ConvOp + ConvTransposeOp native typed dispatch (F16/BF16)** — `native_dtypes()` for F32/F16/BF16; `execute_typed` with cast-compute-cast kernels (f32 accumulator). New module `conv_typed.rs`. No f32 round-trip for input/weight.
   - [x] **v0.1.10+ scoped slice: LSTMOp + GRUOp native typed dispatch (F16/BF16)** — `native_dtypes()` for F32/F16/BF16; `execute_typed` with cast-compute-cast kernels. New module `rnn_typed.rs`. Multi-output (3 outputs for LSTM, 2 for GRU). No f32 round-trip.
 
-### Phase E — DirectML Execution Provider (scaffold)
+### Phase E — DirectML Execution Provider (Windows) — COMPLETE (Wave 3 + Wave 4)
+
+> **Reconciled 2026-07-11.** The three redundant `/stub-check` tracking sections below (Wave 3
+> roadmap, "Stubs to implement" 2026-06-12, "Stubs to implement" 2026-06-22) all described the
+> *same* work — turning the `oxionnx-directml` scaffold into a real execution provider. That work
+> is now done. The 19 duplicate unchecked items are collapsed here.
+>
+> **Verification honesty (load-bearing):** there is no Windows host and no D3D12 GPU in this
+> environment, so the GPU code path **cannot be executed here** and is **not hardware-verified**.
+> What *is* verified: every Windows FFI line is compile- and lint-clean via
+> `cargo clippy --target x86_64-pc-windows-gnu` (the crate had never even compiled for Windows
+> before — `context.rs` imported `CreateEventW` without the `Win32_Security` feature), and every
+> shader/operator *algorithm* is proven on Linux against a CPU oracle (`reference.rs`). Whether the
+> D3D12 barrier sequences, descriptor bindings, and fence waits produce correct results on real
+> silicon is settled only by `examples/directml_self_check.rs` + `OXIONNX_DIRECTML_VERIFY=1` on a
+> Windows box. **Activation is opt-in** (`OXIONNX_DIRECTML=1` / `.with_directml(true)`, default OFF)
+> precisely because a GPU kernel bug returns plausible-but-wrong numbers rather than crashing.
+
 - [x] New subcrate `oxionnx-directml` with cross-platform shim (non-Windows: `try_new() -> None`) and Windows `#[cfg(target_os = "windows")]` D3D12 context skeleton
-- [x] Feature flag `directml` wired: root `Cargo.toml`, session field (`Session::dml`), session init, dispatch block in `run_sequential_inner` (CUDA → DirectML → wgpu → CPU priority order)
-- [x] Dispatch coverage: MatMul, Add, Mul, Relu, Sigmoid — all return `Err` (scaffold) → CPU fallback
+- [x] Feature flag `directml` wired: root `Cargo.toml`, session field (`Session::dml`), session init, dispatch block (CUDA → DirectML → wgpu → CPU priority order)
 - [x] `DirectMLExecutionProvider` preserved as ort-compat no-op (with-feature: real factory path)
-- [ ] v0.1.6 follow-up: Compile and bind the MatMul HLSL compute shader (`MATMUL_HLSL` constant in `kernels/matmul.rs`)
-- [ ] v0.1.6 follow-up: Compile and bind element-wise HLSL shaders (Add, Mul, Relu, Sigmoid)
-- [ ] v0.1.6 follow-up: End-to-end Windows CI job (windows-latest matrix entry in `.github/workflows.disabled/ci.yml`)
-- [ ] v0.1.6 follow-up: Extend dispatch to Conv, Softmax, Reduce
-
-## DirectML Wave 3 — D3D12/HLSL GPU pipeline (tracked 2026-06-07 by /stub-check)
-Tracked roadmap, NOT a regression. The current crate is a correct, intentional cross-platform scaffold (Windows: try_new() → None, dispatch falls through to CPU; non-Windows: documented zero-overhead no-op). The HLSL shader sources (MATMUL_HLSL, ELEMENTWISE_BINARY_HLSL, ELEMENTWISE_UNARY_HLSL) are already written; only the Windows-side D3D12 host wiring is deferred. **Must be implemented and tested on a Windows host / CI runner** — the entire pipeline is `#[cfg(target_os = "windows")]` behind the target-gated `windows` crate and cannot be compiled, clippy'd, or tested on macOS/Linux. Scope: large (~400–700 LoC of Windows-only FFI, 5 HLSL PSOs, plus a shader-compiler decision: D3DCompile vs precompiled DXIL).
-
-- [ ] oxionnx-directml: src/context.rs:95 — TODO(Wave3): create the real Windows D3D12 device context
-  - **Approach:** CreateDXGIFactory2 → IDXGIFactory4 adapter enumeration → feature-level 12_0 probe → D3D12CreateDevice; create a compute command queue (D3D12_COMMAND_LIST_TYPE_COMPUTE), ID3D12Fence + CreateEventW; populate the currently-`_reserved: ()` WindowsContext fields. Windows-only.
-  - **Scope:** large
-  - **Prerequisites:** Windows host + target-gated `windows` crate + D3D12 runtime; a Windows CI runner for verification
-  - **Risk:** untestable off-Windows; device/fence/event lifetimes must be leak-free and correctly synchronized
-- [ ] oxionnx-directml: src/kernels/matmul.rs:44 — TODO(Wave3): bind & dispatch MATMUL_HLSL
-  - **Approach:** Compile MATMUL_HLSL to a PSO; root signature CBV(b0)+SRV(t0,t1)+UAV(u0); upload A/B + allocate C; descriptor heap; record dispatch ceil(M/16)×ceil(N/16)×1; fence wait; readback C into Tensor.
-  - **Scope:** large
-  - **Prerequisites:** context.rs:95 device context first
-  - **Risk:** root-signature/descriptor-binding correctness; readback barriers; result must match the CPU MatMul reference
-- [ ] oxionnx-directml: src/kernels/elementwise.rs:29 — TODO(Wave3): dispatch ADD (ELEMENTWISE_BINARY_HLSL main_add)
-  - **Approach:** PSO from the main_add entry point; CBV(N)+SRV(t0,t1)+UAV(u0); upload both inputs; dispatch ceil(N/256); readback.
-  - **Scope:** medium
-  - **Prerequisites:** context.rs:95 device context first
-  - **Risk:** shared binary-elementwise harness must be reused by mul; off-Windows untestable
-- [ ] oxionnx-directml: src/kernels/elementwise.rs:46 — TODO(Wave3): dispatch MUL (ELEMENTWISE_BINARY_HLSL main_mul)
-  - **Approach:** Same binary harness as add, different PSO entry point (main_mul).
-  - **Scope:** small (after add harness exists)
-  - **Prerequisites:** elementwise.rs:29 add harness
-  - **Risk:** off-Windows untestable
-- [ ] oxionnx-directml: src/kernels/elementwise.rs:56 — TODO(Wave3): dispatch RELU (ELEMENTWISE_UNARY_HLSL main_relu)
-  - **Approach:** PSO from main_relu; CBV(N)+SRV(t0)+UAV(u0); single-input upload/dispatch/readback (unary harness).
-  - **Scope:** medium
-  - **Prerequisites:** context.rs:95 device context first
-  - **Risk:** unary harness must be reused by sigmoid; off-Windows untestable
-- [ ] oxionnx-directml: src/kernels/elementwise.rs:66 — TODO(Wave3): dispatch SIGMOID (ELEMENTWISE_UNARY_HLSL main_sigmoid)
-  - **Approach:** Same unary harness as relu, different PSO entry point (main_sigmoid).
-  - **Scope:** small (after relu harness exists)
-  - **Prerequisites:** elementwise.rs:56 relu harness
-  - **Risk:** off-Windows untestable
+- [x] **Dual backend, DML-first:** shared D3D12 device/queue/fence/event; genuine `IDMLDevice` operators when `DirectML.dll` is present (resolved via `LoadLibraryW`/`GetProcAddress` so its absence falls back rather than failing process launch), else an HLSL/D3D12 compute engine (`D3DCompile` at runtime), else CPU
+- [x] **Platform-neutral core, Linux-tested:** `plan.rs`/`layout.rs` do all shape validation, `u32` range-checking, dispatch-grid + DML descriptor layout math; `reference.rs` is a shader-faithful CPU oracle; `hlsl.rs` holds the shader sources
+- [x] `context.rs`: real D3D12 device context (DXGI adapter enumeration skipping WARP unless `OXIONNX_DIRECTML_ALLOW_WARP=1`, feature-level 12_0→11_0 probe, compute queue, fence + `CreateEventW`), all COM state behind a `Mutex` with a documented `unsafe impl Send` so `Session: Sync` holds on Windows (pinned by `assert_send_sync::<Session>()`)
+- [x] Compile & bind the MatMul HLSL compute shader — 2-D×2-D only; the transposed dispatch-grid doc-comment bug fixed and pinned by `hlsl_grid_is_not_transposed`
+- [x] Compile & bind element-wise HLSL shaders (Add, Sub, Mul, Div, Relu, Sigmoid, Tanh)
+- [x] Extend dispatch to Conv, Softmax, Reduce{Sum,Mean,Max,Min} — Softmax/Reduce on both HLSL and DML paths; Conv on the genuine-DML path only (`DML_CONVOLUTION`, cross-correlation mode to match ONNX), HLSL declines Conv to CPU
+- [x] Observability: `Ok(None)`=declined vs `Err`=failed no longer conflated (killed the double `.ok()`-swallow); `OXIONNX_DIRECTML_VERIFY=1` shadow-compares every GPU result against the oracle; `OXIONNX_DIRECTML_STRICT=1` turns silent CPU-fallback into a hard error
+- [x] End-to-end Windows CI job (windows-latest build+test) + a Linux→Windows cross-clippy job (incl. the `Session: Sync` gate) added inside `.github/workflows.disabled/` (CI stays disabled per user policy)
+- [x] `is_supported_op` routes exactly the 15 claimed ops (`MatMul, Gemm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, ReduceSum, ReduceMean, ReduceMax, ReduceMin, Conv`); kept in lockstep with `dispatch::route` by test
+- [x] 242 crate tests (all Linux-executed or cross-target type-checked); `examples/directml_self_check.rs` shipped as the hardware acceptance gate
 
 ### Phase F — Operator-Level IOBinding Reuse (pilot)
 - [x] `execute_into_slots()` + `supports_output_slots()` hooks on `Operator` trait (backward-compat defaults)
@@ -609,11 +597,172 @@ Tracked roadmap, NOT a regression. The current crate is a correct, intentional c
 ## Proposed follow-ups (deferred from v0.1.6 run, 2026-04-17)
 
 - **D.3 — Native dispatch for Conv / Attention / RNN** (**COMPLETE**): MatMul (v0.1.8), Gemm (v0.1.9), AttentionOp+MHA (v0.1.10), ConvOp+ConvTransposeOp+LSTMOp+GRUOp (v0.1.10+), Attention SIMD/NEON/AVX2 (v0.1.10+) — all shipped. No remaining items.
-- **E.4 — DirectML real HLSL compilation** (v0.1.7): D3DCompile flow requires Windows hardware. Cannot validate on darwin (dev machine). Waiting for Windows CI or user access.
-- **E.5 — Windows DirectML CI job** (v0.1.7+): All CI disabled by user. Will not re-enable without explicit instruction.
-- **E.6 — DirectML Conv/Softmax/Reduce kernels** (v0.1.7): Depends on E.4 landing first.
-- **E.7 — DirectML Q4/Q8 support** (v0.1.8): Depends on E.4 + E.6.
+## Stubs to implement (added 2026-06-12 by /cooljapan-stub-check) — SUPERSEDED
+
+> These three items (context, MATMUL dispatch, elementwise shaders) were duplicates of the
+> DirectML Wave 3 work now marked complete under **Phase E** above. Closed 2026-07-11.
+
+- **E.4 — DirectML real HLSL compilation** (**COMPLETE**): `D3DCompile` runtime path implemented in `backend/d3d12/shader.rs`; compile-verified for Windows via cross-target clippy. Runtime correctness needs a Windows GPU (`self_check`).
+- **E.5 — Windows DirectML CI job** (**COMPLETE**, stays disabled): windows-latest build+test job + Linux→Windows cross-clippy job added inside `.github/workflows.disabled/`. Not re-enabled — CI remains off per user policy.
+- **E.6 — DirectML Conv/Softmax/Reduce kernels** (**COMPLETE**): shipped Wave 4 — Softmax/Reduce on both HLSL and DML paths, Conv on the genuine-DML path (`DML_CONVOLUTION`).
+- **E.7 — DirectML Q4/Q8 support** (deferred): quantized DirectML kernels remain future work; the f32 `run()` path is the only surface DirectML sees today. Genuinely blocked on hardware access to validate.
 - **F.11 — Slot-indexed Vec<Tensor> SessionRunState** (v0.1.8): Replace the HashMap backing with a `Vec<Tensor>` + name→index lookup table. Would save the HashMap hash computation per node (~121 ops per run). Requires a mirror change in `TypedSessionRunState` and care around `bound_outputs` ownership. Defer until a real-world workload shows HashMap cost as material.
-- **F.12 — Zero-copy per-op `execute_into_slots` for non-pilot hot ops** (**COMPLETE**): 22 hot ops shipped hand-coded slot-write bodies in v0.1.6. v0.1.7 added 27 more: shape_ops (Squeeze/Unsqueeze/Flatten/Expand/Split/Tile/DepthToSpace/SpaceToDepth/ReverseSequence), nn_ops (Clip/LeakyRelu/PRelu/HardSigmoid/Celu/Elu/Selu/ThresholdedRelu/LpNorm/MeanVarianceNorm/Hardmax/Shrink), conv_ops (MaxPool/AveragePool/GlobalAveragePool/GlobalMaxPool/Pad/Resize). v0.1.8 added 3 more: Gather, ScatterND, ScatterElements — subtotal 52. v0.1.9 added 2 more: Conv, ConvTranspose — subtotal 54. v0.1.10 added 2 more: LSTM, GRU — subtotal 56. v0.1.4 added 2 more: AttentionOp, MultiHeadAttentionOp — **total 58 of 121 ops** with hand-coded slot-write bodies. Phase F operator slot-write sweep fully closed.
+- **F.12 — Zero-copy per-op `execute_into_slots` for non-pilot hot ops** (**COMPLETE**): 22 hot ops shipped hand-coded slot-write bodies in v0.1.6. v0.1.7 added 27 more: shape_ops (Squeeze/Unsqueeze/Flatten/Expand/Split/Tile/DepthToSpace/SpaceToDepth/ReverseSequence), nn_ops (Clip/LeakyRelu/PRelu/HardSigmoid/Celu/Elu/Selu/ThresholdedRelu/LpNorm/MeanVarianceNorm/Hardmax/Shrink), conv_ops (MaxPool/AveragePool/GlobalAveragePool/GlobalMaxPool/Pad/Resize). v0.1.8 added 3 more: Gather, ScatterND, ScatterElements — subtotal 52. v0.1.9 added 2 more: Conv, ConvTranspose — subtotal 54. v0.1.10 added 2 more: LSTM, GRU — subtotal 56. v0.1.4 added 2 more: AttentionOp, MultiHeadAttentionOp — **total 58 of 121 ops** with hand-coded slot-write bodies. Phase F operator slot-write sweep fully closed. (The "121" denominator is the registry size as of v0.1.4; it has since grown to 188 as of the v0.1.5 hardening program — see Section 17 — and slot-write coverage for those newer ops has not been re-audited against this count.)
 - **F.13 — F.12 remaining complex ops** (**COMPLETE**, v0.1.4): AttentionOp and MultiHeadAttentionOp shipped hand-coded `execute_into_slots` bodies (`registry/rnn_ops/attention.rs`). Backed by new allocation-free kernels `sdpa_into`, `sdpa_output_shape`, `reshape_from_heads_into`, `multi_head_attention_into` extracted from `attention/core.rs`. SIMD zeroing bug for `seq_q > 1` fixed as part of this work. 21 new tests in `oxionnx-ops/tests/output_slots_attention_test.rs`.
 - **F.14 — Remaining 47 ops slot-write sweep** (**COMPLETE**, v0.1.4): Added true zero-copy `execute_into_slots` bodies for 47 additional operators, bringing the total to **105 of 121 ops** with hand-coded slot-write bodies. Covered: normalization ops (LayerNorm, GroupNorm, BatchNorm, RmsNorm, InstanceNorm) and activations (Softmax, LogSoftmax) via new `_into` kernel variants in `nn/normalization.rs`; reduce ops (ReduceSum/Mean/Max/Min/Prod/L1/L2/LogSum/LogSumExp/SumSquare) via new `reduce_with_into`/`reduce_output_shape` primitives in `math/reduce.rs`; ArgMax, ArgMin, CumSum, TopK (2-output) via new `_into` variants in `math/argminmax.rs` and `math/topk.rs`; variadic ops (Min/Max/Mean/Sum); comparison binary ops (Equal/Greater/GreaterOrEqual/Less/LessOrEqual/And/Or/Xor) via macro update; bitwise binary ops (BitwiseAnd/Or/Xor) via macro update; unary ops (Not, IsInf, IsNaN, BitwiseNot) with inline; shape/utility ops (Shape, Size, Constant, ConstantOfShape, EyeLike, Trilu, Einsum). 41 new tests in `oxionnx-ops/tests/output_slots_f14_test.rs`. Remaining 16 ops without slot bodies are variable-output (NonZero, Range, Compress, Unique, NonMaxSuppression, GatherND, GatherElements, Where), type-sensitive (QuantizeLinear, DequantizeLinear, OneHot), ML ops (11 LinearClassifier/TreeEnsemble/SVM/etc.), and spatial ops (RotaryEmbedding/GridSample/RoiAlign).
+
+## Stubs to implement (added 2026-06-22 by /cooljapan-stub-check) — SUPERSEDED
+
+> All six DirectML items below (context acquisition, MATMUL, and the ADD/MUL/RELU/SIGMOID HLSL
+> shaders) were the same Wave 3 work now complete under **Phase E** above. The note's premise held
+> up exactly: the dispatch/device-acquisition code was implementable cross-platform behind the
+> Windows cfg gates and is compile-verified there; end-to-end GPU correctness still needs a Windows
+> D3D12 device (`examples/directml_self_check.rs`). Closed 2026-07-11.
+
+---
+
+## 17. Production-Grade Hardening Program (2026-08-05, v0.1.5)
+
+> 12-lens exhaustive audit (spec conformance ×3, engine, proto robustness, panics, GPU, CUDA/CoreML,
+> stubs, API/release, performance, test gaps) produced **232 findings**. Executed as 3 waves of
+> parallel subagent implementation with file-ownership partitioning.
+
+### Wave 1 — Critical/High correctness (163 findings, 16 domains) — COMPLETE (2026-08-05)
+- [x] A proto-parser: checked pos+len everywhere, recursion depth limit, alloc clamping, correct TensorProto field numbers/encodings, group/unpacked-field handling (eager + streaming consistent)
+- [x] B proto-model: dtype-aware weight decode (no silent zero-fill), STRINGS attrs wired, external-data sandbox + offset validation, dims validation
+- [x] C shape-ops: Slice negative/steps/sentinels, Pad axes/negative/wrap, checked axis normalization across Concat/Split/Flatten/Unsqueeze/Transpose/Reshape, Split zero-size chunks
+- [x] D indexing-quant: Where real broadcast, Scatter reduction attr + bounds + negative idx, Gather consistency, Quantize/Dequantize per-axis + dtype-derived saturation
+- [x] E conv-pool: auto_pad everywhere, ceil_mode/dilations in real kernels, ConvTranspose output_shape, checked out-shape math
+- [x] F resize: real cubic, nearest_mode variants, coordinate_transformation_modes, antialias, no silent fallbacks
+- [x] G activations-misc: Gelu approximate, Clip opset-6 attrs, Cast truncate+saturate, Mod floored, Bitwise value-preserving, Reduce noop_with_empty_axes, ArgMax select_last_index, Shape start/end, Equal exact, Dropout mask, GroupNorm per-group scale
+- [x] H ml-ops: TreeEnsemble cycle guard + NaN routing + MIN/MAX aggregates, TfIdf ngram_counts + batching, SVM Platt scaling, ML 1-D input shape, LabelEncoder
+- [x] I rnn-attention: GRU linear_before_reset default fix, LSTM/GRU clip + layout, SDPA mask broadcast, Attention is_causal, GridSample string attrs, RoiAlign coord mode
+- [x] J control-flow-dsp: Loop scan-output stacking, Scan output axes/directions, DFT axis, STFT errors, NMS max_boxes=0
+- [x] K optimizer: fusion soundness (multi-consumer/graph-output guards), CSE non-commutative + fingerprint, Conv+Clip input bounds, constant-fold guards, OptLevel gating
+- [x] L session-run: unknown-op = typed error (no silent skip), parallel-path outer_scope/mixed-precision, capture lifetimes, shape-resolution race, run_typed weight clone
+- [x] M gpu-dispatch: decline-to-CPU gating (batch matmul, softmax axis, reduce keepdims, elementwise shapes, fused conv), unified support lists
+- [x] N gpu-backend: 65535-workgroup clamping, buffer-size limits, error scopes -> CPU fallback, LeakyRelu alpha, readback timeout
+- [x] O cuda: reduce >256 fix, batch matmul, softmax axis, attrs, Gemm bias broadcast, OXIONNX_CUDA_VERIFY shadow gate
+- [x] P core-hardening: topo-sort underflow, no_std repair, CSPRNG nonces, `Tensor::try_new` (unconditional data/shape validation, including release builds; `Tensor::new` itself is unchanged and still `debug_assert`-only, by design, for callers who can guarantee the invariant statically), deny.toml
+
+### Wave 2 — Hard features + performance — COMPLETE (2026-08-06)
+
+> Stitch wave (between W1/W2) landed: STRINGS/TENSORS/GRAPHS attr wiring, streaming fallible decode,
+> static-0 dims, external-data base_path through subgraphs, no_std repair for oxionnx-core,
+> opset plumbing (OpContext carries model opset; pre-13 Softmax/Hardmax), shape-inference/kernel
+> consistency (auto_pad/ceil_mode/output_shape/keep_aspect_ratio), Pad registry rewiring,
+> GridSample align_corners, GRU clip/layout wiring, Gelu simd cross-path parity.
+- [x] Register implemented-but-unregistered ops (QLinear* family, RNN); OpKind wiring
+- [x] Conv1D/Conv3D real support (`conv::conv`/`conv::conv_transpose` are now rank-generic N-D entry points; the 2D fast path is unchanged and still the common case)
+- [x] Opset-version plumbing into OpContext (pre-13 Softmax/Hardmax semantics)
+- [x] run_async / cancellation / streaming: reconcile claims vs implementation
+- [x] Einsum ellipsis + performance
+- [x] Missing-op batch: LRN, CastLike, Upsample, LpPool, GlobalLpPool, MaxUnpool, MaxRoiPool, Col2Im, BitShift, Random*/Multinomial
+- [x] CPU perf package: small-M matmul via sgemm, attention/flash parallelism + sgemm, KV-cache in-place append, broadcast without materialization, conv threading, winograd filter cache, stride-walk transpose/reduce, hashbrown maps, run-loop clone elimination
+- [x] GPU perf: adapter limits, softmax workgroup reduction, pool byte budget, conv buffer reuse; wasm32 readback
+- [x] Rank-0 scalar representation design fix
+
+### Wave 3 — Tests, docs, release polish — COMPLETE (2026-08-06)
+- [x] Test gaps: axes-as-input forms, IoBinding pointer identity, TreeEnsemble/SVM modes, typed dispatch, rank-0 broadcast, SIMD-vs-scalar equivalence, negative/panic-safety tests
+- [x] `#[non_exhaustive]` on public error enums -- landed on `OnnxError` (`oxionnx-core`), `CoreMLError`, `CudaError`, the DirectML error type, `oxionnx-proto`'s reader-error type, and the execution-provider enum (`src/execution_providers.rs`)
+- [ ] `missing_docs` warnings -- `#![warn(missing_docs)]` landed on `oxionnx-cuda`, `oxionnx-directml`, `oxionnx-coreml`; not yet confirmed on `oxionnx-core`/`oxionnx-ops`/`oxionnx-proto`/`oxionnx-gpu`/root
+- [x] README/CHANGELOG/TODO reconciliation (claims == reality) -- this pass (T8-docs-release)
+- [x] Tracing on load path -- `src/session/loading.rs` carries `tracing::debug_span!`/`info_span!` for parse/build/optimize/shape-inference plus `debug!`/`info!` events
+- [x] Final gates: full nextest, clippy -D warnings, cargo doc, cargo deny check bans, fmt
+
+### Program result (2026-08-06) — COMPLETE
+
+Final gates: **2946 workspace tests / 2946 passed** (15 skipped: hardware-gated + perf probes),
+`clippy --all-features --all-targets -D warnings` clean, `cargo fmt --check` clean,
+`cargo deny check bans` ok, `cargo doc --no-deps` zero warnings.
+Two extra fix waves beyond the plan (final-fixes + micro-close) closed every bug the Wave-3
+test authors pinned (DepthToSpace/SpaceToDepth blocksize guards incl. slot paths + negative-attr
+boundary, Cast unknown-dtype, RNN/LSTM/GRU direction validation, ArgMax/Reduce axis validation,
+Einsum slot-shape masking, PROBIT precision, TreeEnsemble SOFTMAX_ZERO ordering, SVM kernel/
+post_transform enum validation + Platt-mode label selection, load_mmap metadata, typed integer
+exactness for Neg/Ceil/Floor/Round/Sign/Abs incl. a Round tie-detection epsilon bug, MHA typed
+out_shape broadcast, rank-0 full-reduce completion CPU/GPU/DirectML-consistent).
+
+Known documented micro-residuals (deliberate, low-impact): `is_full_reduction` tolerates
+out-of-range axes (unreachable — every reduce entry point now validates first); LogOp
+`default_typed_via_f32` F32-tagging vs ExpOp's dtype-preserving cast (cosmetic inconsistency);
+missing_docs backlog (250–592 undocumented public items per crate — measured, deferred);
+one stale comment pointer in shape/spatial.rs.
+
+## 18. Post-Hardening GPU/async_run Crash-Hang Fix (2026-08-06) — COMPLETE
+
+Found only once a real Vulkan adapter was actually reachable in the dev sandbox (the Wave-3 gates
+above ran with no adapter present, so this class of bug was invisible to them): `run_async`/
+`spawn_run` worker threads could end up holding the session's last `Arc`, running `GpuContext`'s
+`Drop` (a live `wgpu::Device`/`Queue`/`Instance`) as the worker's last act before the OS thread
+exited. NVIDIA's Vulkan ICD shares thread-affine state with its EGL/GLSI core for at least some
+teardown paths; destroying on a different thread than the one that created it produced a `SIGSEGV`
+inside the driver, sometimes while holding a global driver mutex the process's own `exit()` path
+then blocked on forever (presenting as a hang, not a crash). A second, independent shape of the
+same root cause: even with creation/destruction pinned to one thread, process exit could still race
+a still-in-flight teardown against the driver's own `atexit`-registered `dlclose()`.
+- [x] `src/session/async_run.rs`: `Shared::_session_keepalive` — an independent `Arc<Session>`
+      clone held by `Shared` itself, so a worker thread's own capture is (almost) never the last
+      reference standing
+- [x] `src/session/gpu_owner.rs` (new): routes **both** `GpuContext` creation and destruction
+      through one dedicated, process-lifetime thread, so a given context's creation and destruction
+      are always on the same thread as each other (a "destruction-only" dedicated thread was tried
+      first and made things categorically worse — 30/30 reproducible `SIGSEGV` — because it turned
+      an occasional creator/destroyer mismatch into a guaranteed one; documented in-code so it is
+      not retried)
+- [x] `atexit`-registered quiescence hook (LIFO-ordered ahead of the driver's own handler), with a
+      debounced re-check (`ACTIVE_WORKERS` + `IN_FLIGHT`, not a single-instant sample) closing a
+      TOCTOU gap the first, undebounced version had
+- [x] `oxionnx-gpu/src/context/types.rs`: `impl Drop for GpuContext` polls the device before its
+      fields' automatic drops
+- [x] Verification: the 3 originally-hanging tests at 90/90 and 150/150 clean across repeated
+      stress runs; full `oxionnx` crate suite at 1014/1014 with the fix in, versus 1012–1013/1014
+      before it (residual native-driver crashes/hangs, non-deterministic across which specific test
+      in the same module they landed on)
+- [x] `tests/w2_session_cache.rs::loading_a_cache_is_measurably_cheaper_than_optimizing_from_scratch`
+      stabilized against scheduler jitter (batched `RUNS`-per-round timing + a real margin instead
+      of a bare `<` — see the sibling defense already in `tests/w2_cancellation.rs`) — this did
+      **not** fix the deeper issue logged as item 19 below, which surfaced afterward once a real
+      adapter was consistently present for this test too
+- [ ] Not yet investigated: whether this same cross-thread teardown hazard reaches `oxionnx-cuda`'s
+      `CudaContext`/`oxicuda-driver` path the same way `oxionnx-gpu`'s `GpuContext` did — that stack
+      is opt-in gated (`OXIONNX_CUDA=1`) and off in every gate run so far, so it has never been
+      exercised against a real device long enough to say either way
+
+## 19. Deferred — GPU Context Caching/Pooling Across Sessions
+
+Discovered while re-diagnosing item 18's timing test with a real adapter finally in place:
+`Session::build_from_graph` (the function both `Session::from_graph` and
+`Session::from_optimized_bytes` funnel through) unconditionally calls `gpu_owner::try_new()` —
+a full `wgpu::Device`/`Queue`/`Instance` acquisition plus rebuilding 20+ cached compute pipelines —
+on **every single session construction**, whether built fresh or loaded from a cache, with no
+reuse or sharing of a `GpuContext` across `Session` instances. This is not new in v0.1.5; it was
+already true of the original `crate::gpu::GpuContext::try_new()` call site before item 18's
+`gpu_owner` indirection existed. It went unnoticed because every prior gate run either had no
+adapter reachable (fast `None` path) or didn't happen to time repeated session construction under
+`--all-features`.
+
+Confirmed causally (not just suspected) by rerunning the cache-timing test with `--no-default-features`:
+build 23.4ms / load 2.5ms, 9.3x speed-up — versus build 1.70s / load 1.78s, 0.95x with `gpu`
+enabled and a real adapter present, i.e. GPU context acquisition cost dominates and is paid equally
+by both the "build" and "load" paths, erasing the actual signal either is meant to measure.
+
+Likely a genuine production cost too, not just a test artifact: any application that constructs
+more than one `Session` with the `gpu` feature on pays this full device+pipeline-rebuild cost per
+session, unconditionally.
+
+- [ ] Decide the caching unit: process-wide singleton `GpuContext` shared (`Arc`) across every
+      `Session`, vs. a bounded pool keyed by adapter/feature requirements, vs. explicit
+      opt-in reuse via a builder option — needs a decision on whether two `Session`s with
+      different runtime knobs (mixed-precision, memory pool, etc.) can safely share one
+      `GpuContext`, since pipelines are currently built assuming exclusive ownership
+      by whichever `Session` created them
+- [ ] If sharing an `Arc<GpuContext>`, `gpu_owner`'s one-context-per-owner-thread-round-trip
+      model needs revisiting — reference counting means "destroy" is no longer 1:1 with
+      "the `Session` that requested creation," which item 18's create/destroy-same-thread
+      invariant assumed
+- [ ] Re-benchmark `tests/w2_session_cache.rs`'s timing test (and any other session-construction
+      timing assumptions elsewhere in the suite) once pooling lands — the current stabilized
+      version (item 18) has a loose enough margin to survive either outcome, but should be
+      revisited to assert something meaningful again once GPU context creation is no longer the
+      dominant cost

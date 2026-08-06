@@ -16,16 +16,51 @@ tree minimal and fully Pure Rust.
 - **`parse_with_weight_filter`** -- Streaming parser that selectively loads weights matching a filter predicate.
 - **Schema validation** -- `validate_schemas` checks nodes against built-in `OpSchema` definitions for input/output arity and attribute correctness.
 - **Supported opset range** -- Opsets 7 through 21.
+- **ONNX local function inlining** -- `ModelProto.functions` (function calls) are resolved by inlining into the graph before `load`, `parse_streaming`, and `parse_with_weight_filter` all return; a model that calls a local function loads identically through every entry point. (Before 0.1.5 only `load`'s eager path did this -- the streaming path failed such models with `UnsupportedOp`.)
+
+## Hardening against untrusted models
+
+`.onnx` files are untrusted input by construction, so both the eager and
+streaming parsers are defensive by default:
+
+- Length-delimited reads are bounds-checked (`pos + len` against the buffer)
+  everywhere -- including a previously fully-unguarded slice in the
+  streaming reader -- instead of panicking on truncated or malformed bytes.
+- Nested subgraph attributes are depth-limited instead of recursing without
+  bound, closing a stack-overflow-on-a-crafted-model path.
+- Lengths read from the model are clamped before sizing an allocation, so a
+  hostile length can no longer OOM-abort the process.
+- `TensorProto` typed-data fields use the correct field numbers and element
+  encodings; non-packed (unpacked) repeated numeric fields are read instead
+  of silently dropped; protobuf group wire types are skipped instead of
+  aborting the parse; the varint decoder no longer truncates bits above 64
+  on a 10-byte varint.
+- `GraphProto.sparse_initializer`/`value_info` and `AttributeProto.tensors`/
+  `graphs`/`sparse_tensor`/`type_proto`/`ref_attr_name` are parsed instead
+  of silently dropped.
+- Weight decode covers uint8/int8/bool/double/bfloat16 initializers without
+  zero-filling, and negative or overflowing `dims` are rejected with a typed
+  error instead of being cast to a huge `usize`.
+- External-data `location` paths are canonicalized and checked against the
+  model directory (sandboxed against path traversal and absolute-path
+  reads), with checked offset/length arithmetic instead of panicking on a
+  reversed or overflowing range.
+- `AttributeProto.strings` (`repeated bytes`, field 9) is read verbatim
+  instead of being re-parsed as a nested protobuf message -- the old
+  behavior corrupted ONNX-ML `TreeEnsemble` models whose `nodes_modes`
+  values (e.g. `"BRANCH_GTE"`) happen to decode as a plausible tag+length
+  prefix, raising a spurious `length-delimited: EOF` error (issue #3,
+  regression-tested).
 
 ## Usage
 
 ```toml
 [dependencies]
-oxionnx-proto = "0.1.4"
+oxionnx-proto = "0.1.5"
 ```
 
 ```rust
-use oxionnx_proto::{load, parse_model};
+use oxionnx_proto::load;
 
 let bytes = std::fs::read("model.onnx").expect("read model");
 let (graph, weights) = load(&bytes).expect("parse model");
@@ -36,17 +71,30 @@ println!("Loaded {} weight tensors", weights.len());
 
 ### Streaming parser for large models
 
+`StreamingParser` reads incrementally from any `Read` source and calls back
+per event -- nodes, weights, and metadata are never all buffered in memory
+at once, unlike the convenience `parse_streaming`/`parse_with_weight_filter`
+wrappers (which read the whole model but return an already-assembled graph
+and weight map for callers that don't need the low-level event stream):
+
 ```rust
-use oxionnx_proto::{parse_streaming, ParseEvent};
+use std::io::Cursor;
+use oxionnx_proto::{ParseEvent, StreamingParser};
 
 let bytes = std::fs::read("large_model.onnx").expect("read model");
-for event in parse_streaming(&bytes).expect("parse") {
-    match event {
-        ParseEvent::Node(node) => println!("op: {:?}", node.op_type),
-        ParseEvent::Initializer(name, _tensor) => println!("weight: {name}"),
-        _ => {}
-    }
-}
+let mut parser = StreamingParser::new(Cursor::new(bytes));
+parser
+    .parse(|event| {
+        match event {
+            ParseEvent::Node(node) => println!("op: {:?}", node.op_type),
+            ParseEvent::Weight { name, tensor } => {
+                println!("weight: {name} ({} elements)", tensor.data.len());
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+    .expect("parse");
 ```
 
 ## Feature Flags

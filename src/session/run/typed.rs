@@ -1,6 +1,7 @@
 use crate::tensor::Tensor;
 use crate::OnnxError;
-use oxionnx_core::{TensorStorage, TypedOpContext, TypedTensor};
+use oxionnx_core::{DType, TensorStorage, TypedOpContext, TypedTensor};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::super::Session;
@@ -40,86 +41,146 @@ impl Session {
     /// Carries `TypedTensor` intermediates per node and dispatches through
     /// `execute_typed` when the operator natively handles all input dtypes.
     /// Falls back to surgical f32 casting for unsupported ops.
+    ///
+    /// # Weights are borrowed, never seeded
+    ///
+    /// This used to open with
+    ///
+    /// ```ignore
+    /// for (name, tensor) in &self.weights {
+    ///     state.insert(name.clone(), TypedTensor::new(
+    ///         TensorStorage::F32(tensor.data.clone()), tensor.shape.clone()));
+    /// }
+    /// ```
+    ///
+    /// — a deep copy of **every model parameter on every call**.  A 500 MB model
+    /// allocated and memcpy'd 500 MB before the first node ran, and then copied
+    /// each weight *again* at its point of use.  `Session::run`'s own contract is
+    /// the opposite ("weights are borrowed (not cloned) to avoid copying hundreds
+    /// of MB of model parameters on every inference call"), and the typed path now
+    /// honours it: initializers are resolved at lookup time straight out of
+    /// `self.weights`, and on the f32 fallback path — the path every operator
+    /// without a `native_dtypes()` set takes — they are borrowed with **no copy at
+    /// all**.
     pub(crate) fn run_internal_typed(
         &self,
         inputs: &HashMap<String, TypedTensor>,
     ) -> Result<HashMap<String, TypedTensor>, OnnxError> {
+        // Version-sensitive operators read this off their `OpContext` /
+        // `TypedOpContext`; it must be bound before the first node executes.
+        self.bind_registry_opset();
+
         let mut state = TypedSessionRunState::new();
 
-        // Seed state with user-provided inputs
+        // Seed state with user-provided inputs only.
         for (name, tensor) in inputs {
             state.insert(name.clone(), tensor.clone());
         }
 
-        // Seed state with model weights (converted to TypedTensor::F32)
-        for (name, tensor) in &self.weights {
-            let typed = TypedTensor::new(
-                TensorStorage::F32(tensor.data.clone()),
-                tensor.shape.clone(),
-            );
-            state.insert(name.clone(), typed);
-        }
-
         // Topological execution
         for node in &self.sorted_nodes {
-            if let crate::graph::OpKind::Unknown(_) = &node.op {
-                continue;
-            }
+            // No `OpKind::Unknown => continue`: the registry lookup below is the
+            // gate.  See `super::unsupported_op_error`.
             let op_name = node.op.as_str();
-            let operator = self.registry.get(op_name).ok_or_else(|| {
-                OnnxError::UnknownOp(format!("No operator registered for '{op_name}'"))
-            })?;
+            let operator = self
+                .registry
+                .get(op_name)
+                .ok_or_else(|| super::unsupported_op_error(node))?;
 
-            // Resolve typed inputs from state
-            let typed_inputs: Vec<Option<TypedTensor>> = node
+            // Where does each input slot come from?  Deciding this once, without
+            // materialising anything, is what lets the f32 path borrow weights.
+            let sources: Vec<InputSource> = node
                 .inputs
                 .iter()
                 .map(|name| {
                     if name.is_empty() {
-                        None
+                        InputSource::Absent
+                    } else if state.get(name).is_some() {
+                        InputSource::Intermediate
+                    } else if self.weights.contains_key(name) {
+                        InputSource::Weight
                     } else {
-                        state.get(name).cloned()
+                        InputSource::Absent
                     }
                 })
                 .collect();
 
-            // Check whether all non-empty inputs are in the op's native_dtypes set
+            // Are all present inputs in the op's native_dtypes set?  An
+            // initializer is f32 storage, so it contributes `DType::F32`.
             let native_dtypes = operator.native_dtypes();
             let all_native = !native_dtypes.is_empty()
-                && typed_inputs
-                    .iter()
-                    .filter_map(|o| o.as_ref())
-                    .all(|t| native_dtypes.contains(&t.dtype()));
+                && node.inputs.iter().zip(&sources).all(|(name, source)| {
+                    let dtype = match source {
+                        InputSource::Absent => return true,
+                        InputSource::Weight => DType::F32,
+                        InputSource::Intermediate => match state.get(name) {
+                            Some(t) => t.dtype(),
+                            None => return true,
+                        },
+                    };
+                    native_dtypes.contains(&dtype)
+                });
 
             let results: Vec<TypedTensor> = if all_native {
-                // Native typed dispatch — no f32 round-trip
+                // Native typed dispatch — no f32 round-trip.  Intermediates are
+                // borrowed out of the run state; only the initializers this node
+                // actually reads are materialised as `TypedTensor`.
+                let owned: Vec<Option<Cow<'_, TypedTensor>>> = node
+                    .inputs
+                    .iter()
+                    .zip(&sources)
+                    .map(|(name, source)| match source {
+                        InputSource::Absent => None,
+                        InputSource::Intermediate => state.get(name).map(Cow::Borrowed),
+                        InputSource::Weight => self.weights.get(name).map(|w| {
+                            Cow::Owned(TypedTensor::new(
+                                TensorStorage::F32(w.data.clone()),
+                                w.shape.clone(),
+                            ))
+                        }),
+                    })
+                    .collect();
                 let input_refs: Vec<Option<&TypedTensor>> =
-                    typed_inputs.iter().map(|o| o.as_ref()).collect();
+                    owned.iter().map(|o| o.as_deref()).collect();
                 let typed_ctx = TypedOpContext {
                     node,
                     inputs: input_refs,
-                    outer_scope: None,
+                    // The live typed run state *is* the enclosing scope; passing
+                    // `None` left `If`/`Loop`/`Scan` bodies unable to resolve any
+                    // captured tensor at all.
+                    outer_scope: Some(state.slots()),
                     registry: Some(&self.registry),
                 };
                 operator.execute_typed(&typed_ctx)?
             } else {
-                // Surgical f32 cast: convert typed inputs to f32 Tensors, call execute
-                let f32_tensors: Vec<Option<Tensor>> = typed_inputs
+                // Surgical f32 cast.  Initializers are already f32 tensors, so
+                // they are borrowed verbatim — no copy, whatever their size.
+                let f32_inputs: Vec<Option<Cow<'_, Tensor>>> = node
+                    .inputs
                     .iter()
-                    .map(|opt| {
-                        opt.as_ref().map(|tt| {
-                            let data = tt.storage.to_f32_vec();
-                            Tensor::new(data, tt.shape.clone())
-                        })
+                    .zip(&sources)
+                    .map(|(name, source)| match source {
+                        InputSource::Absent => None,
+                        InputSource::Weight => self.weights.get(name).map(Cow::Borrowed),
+                        InputSource::Intermediate => state.get(name).map(|tt| {
+                            Cow::Owned(Tensor::new(tt.storage.to_f32_vec(), tt.shape.clone()))
+                        }),
                     })
                     .collect();
                 let f32_refs: Vec<Option<&Tensor>> =
-                    f32_tensors.iter().map(|o| o.as_ref()).collect();
+                    f32_inputs.iter().map(|o| o.as_deref()).collect();
+
+                // Subgraph bodies capture outer-scope tensors implicitly by name.
+                // Only the captured names are materialised as f32 — projecting the
+                // whole run state would cost a full copy of every live
+                // intermediate, per control-flow node.
+                let captured_scope = self.typed_capture_scope(node, &state);
+
                 let ctx = oxionnx_core::OpContext {
                     node,
                     inputs: f32_refs,
-                    outer_scope: None,
-                    weights: None,
+                    outer_scope: captured_scope.as_ref(),
+                    weights: Some(&self.weights),
                     registry: Some(&self.registry),
                 };
                 let f32_results = operator.execute(&ctx)?;
@@ -140,7 +201,7 @@ impl Session {
         }
 
         // Collect raw outputs
-        let mut raw_outputs = state.take_outputs(&self.output_names);
+        let mut raw_outputs = state.take_outputs(&self.output_names, &self.weights)?;
 
         // Reconcile output dtypes against output_infos metadata.
         // When an op fell back to the f32 path, its output will be F32 even if
@@ -170,4 +231,41 @@ impl Session {
 
         Ok(raw_outputs)
     }
+
+    /// The f32 projection of the outer-scope tensors `node`'s subgraphs capture.
+    ///
+    /// `None` for an ordinary node, so the common case pays one
+    /// `HashMap::is_empty`.  Weights are deliberately absent: they reach the
+    /// subgraph through `OpContext::weights` without a copy.
+    fn typed_capture_scope(
+        &self,
+        node: &crate::graph::Node,
+        state: &TypedSessionRunState,
+    ) -> Option<HashMap<String, Tensor>> {
+        if node.attrs.graphs.is_empty() {
+            return None;
+        }
+        let mut scope: HashMap<String, Tensor> = HashMap::new();
+        for name in super::scheduling::subgraph_captures(node) {
+            if let Some(tt) = state.get(name) {
+                scope.insert(
+                    name.to_string(),
+                    Tensor::new(tt.storage.to_f32_vec(), tt.shape.clone()),
+                );
+            }
+        }
+        Some(scope)
+    }
+}
+
+/// Where one of a node's input slots resolves from, decided before anything is
+/// materialised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputSource {
+    /// An elided input, or a name nothing provides.
+    Absent,
+    /// An intermediate produced earlier in this run.
+    Intermediate,
+    /// A model initializer, borrowed from `Session::weights`.
+    Weight,
 }

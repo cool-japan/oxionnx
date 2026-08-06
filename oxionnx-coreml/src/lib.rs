@@ -57,8 +57,15 @@
 //!
 //! ## Platform support
 //!
-//! The runtime is functional on macOS only.  On every other target the
-//! crate compiles to a stub that surfaces
+//! The `objc2`-backed runtime is gated in for every Apple platform CoreML
+//! itself ships on — macOS, iOS, tvOS, and visionOS — behind a single
+//! `cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "visionos"))`.
+//! macOS and iOS builds (`aarch64-apple-ios`) are compile-validated by this
+//! crate directly; tvOS/visionOS are Rust tier-3 targets (nightly +
+//! `-Zbuild-std`) sharing the identical CoreML API surface, so the gate
+//! includes them, but they are not independently compile-validated here —
+//! see `TODO.md` for the exact validation matrix.  On every other target
+//! (Linux, Windows, wasm, …) the crate compiles to a stub that surfaces
 //! [`CoreMLError::UnsupportedPlatform`] from every entry point — so
 //! downstream code that conditionally enables this provider does not need
 //! to fence its own code paths.
@@ -74,4 +81,4 @@ pub mod package;
 
 pub use compute::{ComputePlanSummary, MlComputeUnits};
 pub use error::{CoreMLError, Result};
-pub use package::MlPackageModel;
+pub use package::{FeatureOutput, MlArrayDtype, MlPackageModel, RawArray, SequenceValue};

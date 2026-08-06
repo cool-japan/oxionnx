@@ -109,6 +109,31 @@ jobs:
       - name: Run SIMD tests
         run: cargo test --features simd
 
+  # oxionnx-directml is a Windows-only execution provider (#[cfg(target_os = "windows")]
+  # FFI to D3D12/DirectML). windows-latest is the only runner in the `test` matrix above
+  # that can actually build and link its Win32 code, so this job builds and tests the
+  # `directml` feature in isolation, separate from the broader --all-features matrix run.
+  directml:
+    name: DirectML (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (directml feature)
+        run: cargo build --features directml
+      # DirectML GPU dispatch is opt-in behind OXIONNX_DIRECTML=1, and hosted
+      # windows-latest runners have no GPU -- so we deliberately do NOT set
+      # OXIONNX_DIRECTML=1 here. These tests still exercise the neutral core plus the
+      # documented "no device -> DirectMLContext::try_new() returns None -> CPU
+      # fallback" contract, which proves the crate's Windows FFI actually compiles,
+      # links, and behaves correctly with no adapter present. The software (WARP)
+      # adapter escape hatch, OXIONNX_DIRECTML_ALLOW_WARP=1, is not reliably available
+      # on hosted runners and is deliberately left off; real GPU dispatch can only be
+      # verified on real hardware, not in CI.
+      - name: Test (directml feature)
+        run: cargo test --features directml
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

@@ -1,15 +1,23 @@
 //! MatMul + Transpose → transposed Gemm fusion pass.
 
 use crate::graph::{Attributes, Node, OpKind};
+use crate::optimizer::graph_utils::TensorUsage;
 use std::collections::{HashMap, HashSet};
 
-/// MatMul + Transpose → Transposed MatMul fusion.
-/// Pattern: MatMul(A, B) → Transpose(perm swaps last two dims)
-/// Fused: MatMul(B^T, A^T) with a single Transpose that swaps the last two dims
-/// For 2-D inputs this is exact since (A·B)^T = B^T·A^T.
-/// We emit a Gemm(B, A) with transA=1, transB=1 to get the transposed result
-/// directly, avoiding a separate Transpose node.
-pub fn fuse_matmul_transpose(nodes: Vec<Node>) -> Vec<Node> {
+/// MatMul + Transpose → transposed Gemm fusion.
+///
+/// Pattern: `MatMul(A, B) → Transpose(perm = [1, 0])`.
+/// Fused: `Gemm(B, A, transA=1, transB=1)`, which computes `(A·B)^T = B^T·A^T`
+/// directly and removes the Transpose node.
+///
+/// Restricted to the **2-D** case: ONNX `Gemm` is defined only for 2-D operands,
+/// and the typed / quantized kernels read `(m, k)` straight out of `a_shape[0..2]`,
+/// so a batched (rank ≥ 3) MatMul must keep its explicit Transpose.  A rank-2
+/// permutation attribute implies both operands are 2-D.
+///
+/// The MatMul output must have exactly one consumer (the Transpose) and must not
+/// be a declared graph output.
+pub fn fuse_matmul_transpose(nodes: Vec<Node>, output_names: &[String]) -> Vec<Node> {
     if nodes.len() < 2 {
         return nodes;
     }
@@ -21,14 +29,7 @@ pub fn fuse_matmul_transpose(nodes: Vec<Node>) -> Vec<Node> {
         }
     }
 
-    let mut consumer_count: HashMap<String, usize> = HashMap::new();
-    for node in &nodes {
-        for inp in &node.inputs {
-            if !inp.is_empty() {
-                *consumer_count.entry(inp.clone()).or_insert(0) += 1;
-            }
-        }
-    }
+    let usage = TensorUsage::new(&nodes, output_names);
 
     let mut skip: HashSet<usize> = HashSet::new();
     let mut replacements: HashMap<usize, Node> = HashMap::new();
@@ -44,25 +45,17 @@ pub fn fuse_matmul_transpose(nodes: Vec<Node>) -> Vec<Node> {
             continue;
         }
 
-        // Check that the transpose only swaps the last two dimensions
+        // Only the 2-D case: `Gemm` cannot express a batched transpose.
         let perm = match node.attrs.int_lists.get("perm") {
-            Some(p) if p.len() >= 2 => p,
+            Some(p) if p.len() == 2 => p,
             _ => continue,
         };
-        let ndim = perm.len();
-        // All dims except the last two must be identity
-        let prefix_identity = perm[..ndim - 2]
-            .iter()
-            .enumerate()
-            .all(|(j, &v)| v == j as i64);
-        let swaps_last_two =
-            perm[ndim - 2] == (ndim - 1) as i64 && perm[ndim - 1] == (ndim - 2) as i64;
-        if !prefix_identity || !swaps_last_two {
+        if perm[0] != 1 || perm[1] != 0 {
             continue;
         }
 
         let matmul_out = &node.inputs[0];
-        if consumer_count.get(matmul_out).copied().unwrap_or(0) != 1 {
+        if !usage.is_fusable_intermediate(matmul_out) {
             continue;
         }
 
@@ -70,7 +63,7 @@ pub fn fuse_matmul_transpose(nodes: Vec<Node>) -> Vec<Node> {
             Some(&idx) => idx,
             None => continue,
         };
-        if skip.contains(&matmul_idx) {
+        if skip.contains(&matmul_idx) || replacements.contains_key(&matmul_idx) {
             continue;
         }
         if !matches!(nodes[matmul_idx].op, OpKind::MatMul) {

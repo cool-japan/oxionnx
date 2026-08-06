@@ -109,7 +109,10 @@ pub fn generate_coverage_report() -> Vec<OpCoverage> {
         ("GlobalAveragePool", 1, "conv"),
         ("GlobalMaxPool", 1, "conv"),
         ("Pad", 1, "conv"),
-        ("Resize", 10, "conv"),
+        // Resize implements the opset-19 contract: `antialias`, `axes`,
+        // `keep_aspect_ratio_policy`, `half_pixel_symmetric` and the full
+        // `nearest_mode` / cubic attribute set (see oxionnx-ops/src/resize.rs).
+        ("Resize", 19, "conv"),
         // Shape
         ("Reshape", 1, "shape"),
         ("Transpose", 1, "shape"),

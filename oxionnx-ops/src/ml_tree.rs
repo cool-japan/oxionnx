@@ -1,421 +1,583 @@
 //! ONNX-ML tree ensemble operator implementations.
 //!
 //! Covers TreeEnsembleClassifier and TreeEnsembleRegressor.
+//!
+//! The node tables (`nodes_treeids`, `nodes_nodeids`, `nodes_featureids`,
+//! `nodes_values`, `nodes_truenodeids`, `nodes_falsenodeids`, `nodes_modes`,
+//! `nodes_missing_value_tracks_true`) are parallel arrays. They are validated
+//! once up front, so the traversal can index them without further checks, and
+//! every traversal is bounded by the number of nodes in its tree — a malformed
+//! model with a cycle (or a self-referencing leaf) yields
+//! [`OnnxError::InvalidModel`] instead of hanging the process.
 
+use std::collections::HashMap;
+
+use oxionnx_core::graph::Attributes;
 use oxionnx_core::{OnnxError, OpContext, Tensor};
 
-use crate::ml::{apply_post_transform, PostTransform};
+use crate::ml::{apply_post_transform, batch_dims, PostTransform};
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Node modes ─────────────────────────────────────────────────────────────
 
-/// Node traversal mode constants.
-const MODE_BRANCH_LEQ: u8 = 0;
-const MODE_BRANCH_LT: u8 = 1;
-const MODE_BRANCH_GTE: u8 = 2;
-const MODE_BRANCH_GT: u8 = 3;
-const MODE_BRANCH_EQ: u8 = 4;
-const MODE_BRANCH_NEQ: u8 = 5;
-const MODE_LEAF: u8 = 6;
+/// Node traversal mode (`nodes_modes` entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeMode {
+    BranchLeq,
+    BranchLt,
+    BranchGte,
+    BranchGt,
+    BranchEq,
+    BranchNeq,
+    Leaf,
+}
 
-/// Parse a mode string into its numeric encoding.
-fn parse_mode(s: &str) -> u8 {
-    match s {
-        "BRANCH_LEQ" => MODE_BRANCH_LEQ,
-        "BRANCH_LT" => MODE_BRANCH_LT,
-        "BRANCH_GTE" => MODE_BRANCH_GTE,
-        "BRANCH_GT" => MODE_BRANCH_GT,
-        "BRANCH_EQ" => MODE_BRANCH_EQ,
-        "BRANCH_NEQ" => MODE_BRANCH_NEQ,
-        "LEAF" => MODE_LEAF,
-        _ => MODE_BRANCH_LEQ, // default
+impl NodeMode {
+    /// Parse a `nodes_modes` string entry.
+    fn parse(s: &str, op: &str) -> Result<Self, OnnxError> {
+        match s.trim() {
+            "BRANCH_LEQ" => Ok(Self::BranchLeq),
+            "BRANCH_LT" => Ok(Self::BranchLt),
+            "BRANCH_GTE" => Ok(Self::BranchGte),
+            "BRANCH_GT" => Ok(Self::BranchGt),
+            "BRANCH_EQ" => Ok(Self::BranchEq),
+            "BRANCH_NEQ" => Ok(Self::BranchNeq),
+            "LEAF" => Ok(Self::Leaf),
+            other => Err(OnnxError::InvalidModel(format!(
+                "{op}: unknown nodes_modes entry '{other}'"
+            ))),
+        }
+    }
+
+    /// Parse the numeric encoding accepted through `nodes_modes_int`.
+    fn from_i64(value: i64, op: &str) -> Result<Self, OnnxError> {
+        match value {
+            0 => Ok(Self::BranchLeq),
+            1 => Ok(Self::BranchLt),
+            2 => Ok(Self::BranchGte),
+            3 => Ok(Self::BranchGt),
+            4 => Ok(Self::BranchEq),
+            5 => Ok(Self::BranchNeq),
+            6 => Ok(Self::Leaf),
+            other => Err(OnnxError::InvalidModel(format!(
+                "{op}: unknown nodes_modes_int entry {other}"
+            ))),
+        }
+    }
+
+    /// Evaluate the branch comparison. NaN feature values make every ordered
+    /// comparison false and `BRANCH_NEQ` true, exactly as in onnxruntime.
+    #[inline]
+    fn branch_true(self, value: f32, threshold: f32) -> bool {
+        match self {
+            Self::BranchLeq => value <= threshold,
+            Self::BranchLt => value < threshold,
+            Self::BranchGte => value >= threshold,
+            Self::BranchGt => value > threshold,
+            Self::BranchEq => value == threshold,
+            Self::BranchNeq => value != threshold,
+            Self::Leaf => false,
+        }
     }
 }
 
-/// Evaluate whether the branch comparison is true.
-#[inline]
-fn branch_true(mode: u8, feature_val: f32, threshold: f32) -> bool {
-    match mode {
-        MODE_BRANCH_LEQ => feature_val <= threshold,
-        MODE_BRANCH_LT => feature_val < threshold,
-        MODE_BRANCH_GTE => feature_val >= threshold,
-        MODE_BRANCH_GT => feature_val > threshold,
-        MODE_BRANCH_EQ => (feature_val - threshold).abs() < f32::EPSILON,
-        MODE_BRANCH_NEQ => (feature_val - threshold).abs() >= f32::EPSILON,
-        _ => false, // LEAF - should not be called
+// ── Aggregation ────────────────────────────────────────────────────────────
+
+/// `aggregate_function` of TreeEnsembleRegressor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Aggregate {
+    Sum,
+    Average,
+    Min,
+    Max,
+}
+
+impl Aggregate {
+    fn parse(s: &str) -> Result<Self, OnnxError> {
+        match s {
+            "" | "SUM" => Ok(Self::Sum),
+            "AVERAGE" => Ok(Self::Average),
+            "MIN" => Ok(Self::Min),
+            "MAX" => Ok(Self::Max),
+            other => Err(OnnxError::InvalidModel(format!(
+                "TreeEnsembleRegressor: unknown aggregate_function '{other}' \
+                 (expected SUM, AVERAGE, MIN or MAX)"
+            ))),
+        }
+    }
+
+    /// Fold one leaf weight into the running per-target accumulator.
+    #[inline]
+    fn fold(self, acc: &mut f32, seen: &mut bool, weight: f32) {
+        match self {
+            Self::Sum | Self::Average => {
+                *acc += weight;
+            }
+            Self::Min => {
+                if !*seen || weight < *acc {
+                    *acc = weight;
+                }
+            }
+            Self::Max => {
+                if !*seen || weight > *acc {
+                    *acc = weight;
+                }
+            }
+        }
+        *seen = true;
     }
 }
 
-/// Build a lookup from (tree_id, node_id) -> flat index for efficient traversal.
-fn build_node_index(
-    tree_ids: &[i64],
-    node_ids: &[i64],
-) -> std::collections::HashMap<(i64, i64), usize> {
-    let mut map = std::collections::HashMap::new();
-    for (idx, (&tid, &nid)) in tree_ids.iter().zip(node_ids.iter()).enumerate() {
-        map.insert((tid, nid), idx);
+// ── Node tables ────────────────────────────────────────────────────────────
+
+/// Root of one tree of the ensemble.
+struct TreeRoot {
+    tree_id: i64,
+    /// Flat index of the root node.
+    index: usize,
+    /// Number of nodes belonging to this tree; doubles as the traversal cap.
+    node_count: usize,
+}
+
+/// Validated parallel node tables shared by both tree ensemble operators.
+struct TreeEnsemble<'a> {
+    feature_ids: &'a [i64],
+    thresholds: &'a [f32],
+    node_ids: &'a [i64],
+    true_ids: &'a [i64],
+    false_ids: &'a [i64],
+    modes: Vec<NodeMode>,
+    missing_tracks_true: Vec<bool>,
+    node_index: HashMap<(i64, i64), usize>,
+    roots: Vec<TreeRoot>,
+}
+
+impl<'a> TreeEnsemble<'a> {
+    /// Read and validate every `nodes_*` attribute.
+    fn parse(attrs: &'a Attributes, op: &str) -> Result<Self, OnnxError> {
+        let tree_ids = attrs.ints("nodes_treeids");
+        let node_ids = attrs.ints("nodes_nodeids");
+        let feature_ids = attrs.ints("nodes_featureids");
+        let true_ids = attrs.ints("nodes_truenodeids");
+        let false_ids = attrs.ints("nodes_falsenodeids");
+        let thresholds = attrs
+            .float_lists
+            .get("nodes_values")
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+
+        let n_nodes = tree_ids.len();
+        let modes = parse_modes(attrs, n_nodes, op)?;
+
+        // One validation pass over every parallel array: the traversal below
+        // indexes all of them with the same node index.
+        check_len("nodes_nodeids", node_ids.len(), n_nodes, op)?;
+        check_len("nodes_featureids", feature_ids.len(), n_nodes, op)?;
+        check_len("nodes_truenodeids", true_ids.len(), n_nodes, op)?;
+        check_len("nodes_falsenodeids", false_ids.len(), n_nodes, op)?;
+        check_len("nodes_values", thresholds.len(), n_nodes, op)?;
+        check_len("nodes_modes", modes.len(), n_nodes, op)?;
+
+        for (i, &feature) in feature_ids.iter().enumerate() {
+            if feature < 0 {
+                return Err(OnnxError::InvalidModel(format!(
+                    "{op}: nodes_featureids[{i}] is negative ({feature})"
+                )));
+            }
+        }
+
+        let missing = attrs.ints("nodes_missing_value_tracks_true");
+        let missing_tracks_true = if missing.is_empty() {
+            vec![false; n_nodes]
+        } else {
+            check_len(
+                "nodes_missing_value_tracks_true",
+                missing.len(),
+                n_nodes,
+                op,
+            )?;
+            missing.iter().map(|&v| v != 0).collect()
+        };
+
+        // (tree_id, node_id) -> flat index, plus per-tree roots and sizes.
+        let mut node_index: HashMap<(i64, i64), usize> = HashMap::with_capacity(n_nodes);
+        let mut tree_slots: HashMap<i64, usize> = HashMap::new();
+        let mut roots: Vec<TreeRoot> = Vec::new();
+        for (idx, (&tid, &nid)) in tree_ids.iter().zip(node_ids.iter()).enumerate() {
+            node_index.entry((tid, nid)).or_insert(idx);
+            match tree_slots.get(&tid) {
+                Some(&slot) => {
+                    if let Some(root) = roots.get_mut(slot) {
+                        root.node_count += 1;
+                    }
+                }
+                None => {
+                    tree_slots.insert(tid, roots.len());
+                    roots.push(TreeRoot {
+                        tree_id: tid,
+                        index: idx,
+                        node_count: 1,
+                    });
+                }
+            }
+        }
+        // Node id 0 is the conventional root; fall back to the first node of
+        // the tree in array order when it is absent.
+        for root in roots.iter_mut() {
+            if let Some(&idx) = node_index.get(&(root.tree_id, 0)) {
+                root.index = idx;
+            }
+        }
+
+        Ok(Self {
+            feature_ids,
+            thresholds,
+            node_ids,
+            true_ids,
+            false_ids,
+            modes,
+            missing_tracks_true,
+            node_index,
+            roots,
+        })
     }
-    map
+
+    /// Walk one tree for one sample and return the flat index of the leaf.
+    ///
+    /// Returns `Ok(None)` when a branch points at a node that does not exist
+    /// (the tree contributes nothing), and [`OnnxError::InvalidModel`] when the
+    /// walk exceeds the node count of the tree, which can only happen when the
+    /// node table contains a cycle.
+    fn leaf_of(&self, tree: &TreeRoot, row: &[f32], op: &str) -> Result<Option<usize>, OnnxError> {
+        let mut idx = tree.index;
+        let mut steps = 0usize;
+
+        loop {
+            // Safe: every parallel array was checked to have `modes.len()`
+            // entries, and `idx` always comes from `node_index`.
+            let mode = self.modes[idx];
+            if mode == NodeMode::Leaf {
+                return Ok(Some(idx));
+            }
+            if steps >= tree.node_count {
+                return Err(OnnxError::InvalidModel(format!(
+                    "{op}: traversal of tree {} exceeded its {} nodes; \
+                     the node table contains a cycle",
+                    tree.tree_id, tree.node_count
+                )));
+            }
+            steps += 1;
+
+            let feature = self.feature_ids[idx] as usize;
+            let value = row.get(feature).copied().unwrap_or(0.0);
+            let threshold = self.thresholds[idx];
+            let go_true = mode.branch_true(value, threshold)
+                || (self.missing_tracks_true[idx] && value.is_nan());
+            let next_id = if go_true {
+                self.true_ids[idx]
+            } else {
+                self.false_ids[idx]
+            };
+
+            match self.node_index.get(&(tree.tree_id, next_id)) {
+                Some(&next) => idx = next,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Node id of a flat node index (leaf lookup key).
+    #[inline]
+    fn node_id(&self, idx: usize) -> i64 {
+        self.node_ids[idx]
+    }
+}
+
+/// Read `nodes_modes` from the STRINGS attribute, the numeric fallback, or a
+/// single comma separated string.
+fn parse_modes(attrs: &Attributes, n_nodes: usize, op: &str) -> Result<Vec<NodeMode>, OnnxError> {
+    let mode_strings = attrs.string_list("nodes_modes");
+    if !mode_strings.is_empty() {
+        return mode_strings
+            .iter()
+            .map(|s| NodeMode::parse(s, op))
+            .collect();
+    }
+
+    let mode_ints = attrs.ints("nodes_modes_int");
+    if !mode_ints.is_empty() {
+        return mode_ints
+            .iter()
+            .map(|&v| NodeMode::from_i64(v, op))
+            .collect();
+    }
+
+    let mode_str = attrs.s("nodes_modes");
+    if !mode_str.is_empty() {
+        return mode_str
+            .split(',')
+            .map(|s| NodeMode::parse(s, op))
+            .collect();
+    }
+
+    if n_nodes == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Defaulting to BRANCH_LEQ would turn every leaf into a branch whose
+    // children are node 0, i.e. an infinite loop back to the root.
+    Err(OnnxError::InvalidModel(format!(
+        "{op}: required attribute 'nodes_modes' is missing for {n_nodes} nodes"
+    )))
+}
+
+/// Reject a parallel array whose length differs from the node count.
+fn check_len(name: &str, actual: usize, expected: usize, op: &str) -> Result<(), OnnxError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(OnnxError::InvalidModel(format!(
+            "{op}: '{name}' has {actual} entries but the ensemble declares {expected} nodes"
+        )))
+    }
+}
+
+/// Leaf weights of the ensemble: `(tree_id, node_id) -> [(target_id, weight)]`.
+type LeafTable = HashMap<(i64, i64), Vec<(usize, f32)>>;
+
+/// Build the leaf weight table from the `class_*` / `target_*` attributes.
+fn build_leaf_table(attrs: &Attributes, prefix: &str, op: &str) -> Result<LeafTable, OnnxError> {
+    let ids = attrs.ints(&format!("{prefix}_ids"));
+    let node_ids = attrs.ints(&format!("{prefix}_nodeids"));
+    let tree_ids = attrs.ints(&format!("{prefix}_treeids"));
+    let weights = attrs
+        .float_lists
+        .get(&format!("{prefix}_weights"))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    let count = ids.len();
+    check_len(&format!("{prefix}_nodeids"), node_ids.len(), count, op)?;
+    check_len(&format!("{prefix}_treeids"), tree_ids.len(), count, op)?;
+    check_len(&format!("{prefix}_weights"), weights.len(), count, op)?;
+
+    let mut table: LeafTable = HashMap::new();
+    for i in 0..count {
+        let id = ids[i];
+        if id < 0 {
+            return Err(OnnxError::InvalidModel(format!(
+                "{op}: '{prefix}_ids[{i}]' is negative ({id})"
+            )));
+        }
+        table
+            .entry((tree_ids[i], node_ids[i]))
+            .or_default()
+            .push((id as usize, weights[i]));
+    }
+    Ok(table)
 }
 
 // ── TreeEnsembleClassifier ─────────────────────────────────────────────────
 
 /// ONNX-ML TreeEnsembleClassifier operator.
 ///
-/// Input 0: X \[N, features\] (2D tensor)
+/// Input 0: X \[N, features\] (a 1-D \[C\] input is one sample with C features)
 /// Output 0: predicted labels \[N\] (as f32)
 /// Output 1: class scores \[N, num_classes\]
 pub fn tree_ensemble_classifier(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+    const OP: &str = "TreeEnsembleClassifier";
+
     let x = ctx.input(0)?;
     let attrs = ctx.attrs();
 
-    // Parse tree structure from attributes
-    let feature_ids = attrs.ints("nodes_featureids");
-    let thresholds = attrs
-        .float_lists
-        .get("nodes_values")
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
-    let tree_ids = attrs.ints("nodes_treeids");
-    let node_ids = attrs.ints("nodes_nodeids");
-    let false_ids = attrs.ints("nodes_falsenodeids");
-    let true_ids = attrs.ints("nodes_truenodeids");
+    let ensemble = TreeEnsemble::parse(attrs, OP)?;
+    let leaf_table = build_leaf_table(attrs, "class", OP)?;
 
-    // Parse modes: either from string_lists or int_lists
-    let mode_strings = attrs.string_list("nodes_modes");
-    let mode_ints = attrs.ints("nodes_modes_int");
-    let modes: Vec<u8> = if !mode_strings.is_empty() {
-        mode_strings.iter().map(|s| parse_mode(s)).collect()
-    } else if !mode_ints.is_empty() {
-        mode_ints.iter().map(|&v| v as u8).collect()
-    } else {
-        // Fallback: try string attribute (comma-separated) or default all to BRANCH_LEQ
-        let mode_str = attrs.s("nodes_modes");
-        if !mode_str.is_empty() {
-            mode_str.split(',').map(|s| parse_mode(s.trim())).collect()
-        } else {
-            vec![MODE_BRANCH_LEQ; tree_ids.len()]
-        }
-    };
-
-    // Parse leaf info
-    let class_ids = attrs.ints("class_ids");
-    let class_node_ids = attrs.ints("class_nodeids");
-    let class_tree_ids = attrs.ints("class_treeids");
-    let class_weights = attrs
-        .float_lists
-        .get("class_weights")
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
-
-    let post_transform_str = attrs.s("post_transform");
-    let post_transform = PostTransform::parse(post_transform_str);
-
+    let post_transform = PostTransform::parse(attrs.s("post_transform"), OP)?;
     let base_values = attrs
         .float_lists
         .get("base_values")
-        .cloned()
-        .unwrap_or_default();
-
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
     let class_labels = attrs.ints("classlabels_int64s");
 
-    // Determine dimensions
-    let n = x.shape[0];
-    let features = if x.shape.len() > 1 {
-        x.shape[1]
-    } else {
-        x.numel() / n
-    };
+    let (n, features) = batch_dims(x, OP)?;
 
-    // Determine number of classes
+    // Number of classes: labels if present, otherwise the largest class id + 1.
     let num_classes = if !class_labels.is_empty() {
         class_labels.len()
     } else {
-        // Infer from max class_id + 1
-        let max_class = class_ids.iter().copied().max().unwrap_or(0);
-        (max_class + 1) as usize
-    };
-
-    // Determine number of trees
-    let num_trees = tree_ids.iter().copied().max().map(|m| m + 1).unwrap_or(0) as usize;
-
-    // Build node index for efficient lookup
-    let node_index = build_node_index(tree_ids, node_ids);
-
-    // Build leaf lookup: (tree_id, node_id) -> list of (class_id, weight)
-    let mut leaf_lookup: std::collections::HashMap<(i64, i64), Vec<(usize, f32)>> =
-        std::collections::HashMap::new();
-    for i in 0..class_node_ids.len() {
-        if i < class_tree_ids.len() && i < class_ids.len() && i < class_weights.len() {
-            leaf_lookup
-                .entry((class_tree_ids[i], class_node_ids[i]))
-                .or_default()
-                .push((class_ids[i] as usize, class_weights[i]));
+        let label_strings = attrs.string_list("classlabels_strings").len();
+        if label_strings > 0 {
+            label_strings
+        } else {
+            let max_class = attrs.ints("class_ids").iter().copied().max().unwrap_or(0);
+            // onnxruntime caps the class count at 65535; an inferred count
+            // beyond that comes from a corrupt `class_ids` list.
+            if max_class >= 65535 {
+                return Err(OnnxError::InvalidModel(format!(
+                    "{OP}: inferred class count {} exceeds the supported maximum",
+                    max_class as i128 + 1
+                )));
+            }
+            max_class.max(0) as usize + 1
         }
+    };
+    if num_classes == 0 {
+        return Err(OnnxError::InvalidModel(format!("{OP}: zero classes")));
     }
 
-    // Allocate output scores
-    let mut all_scores = vec![0.0f32; n * num_classes];
+    let use_base_values = base_values.len() == num_classes;
+    let score_count = n.checked_mul(num_classes).ok_or_else(|| {
+        OnnxError::ShapeMismatch(format!("{OP}: score buffer size overflows usize"))
+    })?;
+    let mut all_scores = vec![0.0f32; score_count];
 
-    // Process each sample
     for sample_idx in 0..n {
-        let x_offset = sample_idx * features;
+        let row = &x.data[sample_idx * features..sample_idx * features + features];
         let score_offset = sample_idx * num_classes;
 
-        // Initialize with base values
-        for c in 0..num_classes {
-            if c < base_values.len() {
-                all_scores[score_offset + c] = base_values[c];
+        for tree in &ensemble.roots {
+            let Some(leaf) = ensemble.leaf_of(tree, row, OP)? else {
+                continue;
+            };
+            if let Some(weights) = leaf_table.get(&(tree.tree_id, ensemble.node_id(leaf))) {
+                for &(class_id, weight) in weights {
+                    if class_id < num_classes {
+                        // Classification always accumulates (SUM).
+                        all_scores[score_offset + class_id] += weight;
+                    }
+                }
             }
         }
 
-        // Traverse each tree
-        for tree_id in 0..num_trees {
-            let tid = tree_id as i64;
-
-            // Find root node (nodeids == 0) for this tree
-            let root_idx = match node_index.get(&(tid, 0)) {
-                Some(&idx) => idx,
-                None => continue, // Skip trees with no root
-            };
-
-            // Traverse the tree
-            let mut current_idx = root_idx;
-            loop {
-                if current_idx >= modes.len() {
-                    break;
-                }
-
-                let mode = modes[current_idx];
-                if mode == MODE_LEAF {
-                    // Accumulate leaf weights
-                    if let Some(leaves) = leaf_lookup.get(&(tid, node_ids[current_idx])) {
-                        for &(class_id, weight) in leaves {
-                            if class_id < num_classes {
-                                all_scores[score_offset + class_id] += weight;
-                            }
-                        }
-                    }
-                    break;
-                }
-
-                // Non-leaf: get feature value and compare
-                let feat_idx = feature_ids[current_idx] as usize;
-                let feature_val = if feat_idx < features {
-                    x.data[x_offset + feat_idx]
-                } else {
-                    0.0
-                };
-                let threshold = if current_idx < thresholds.len() {
-                    thresholds[current_idx]
-                } else {
-                    0.0
-                };
-
-                let next_node_id = if branch_true(mode, feature_val, threshold) {
-                    true_ids[current_idx]
-                } else {
-                    false_ids[current_idx]
-                };
-
-                // Look up the next node index
-                match node_index.get(&(tid, next_node_id)) {
-                    Some(&idx) => current_idx = idx,
-                    None => break, // Could not find next node
-                }
+        if use_base_values {
+            for c in 0..num_classes {
+                all_scores[score_offset + c] += base_values[c];
             }
         }
     }
 
-    // Apply post-transform
+    // onnxruntime's `TreeAggregatorClassifier::FinalizeScores` picks the
+    // predicted label from the raw aggregated scores (`get_max_weight` then
+    // `*Y = class_labels_[...]`) and only afterwards calls `write_scores` to
+    // apply `post_transform` to the score output. SOFTMAX/LOGISTIC/PROBIT are
+    // monotonic and would not change the label either way, but SOFTMAX_ZERO
+    // is deliberately not rank-order-preserving between a class that never
+    // received a leaf contribution (left at raw `0.0`) and one that did (so
+    // labels must be decided before, not after, it runs). This also matches
+    // the convention `svm_classifier` already follows: its label comes from
+    // `votes` over the raw decision values, computed before
+    // `apply_post_transform` touches the score buffer.
+    let labels = argmax_labels(&all_scores, n, num_classes, class_labels);
+
     apply_post_transform(&mut all_scores, n, num_classes, post_transform);
 
-    // Compute predicted labels via argmax
+    Ok(vec![
+        Tensor::new(labels, vec![n]),
+        Tensor::new(all_scores, vec![n, num_classes]),
+    ])
+}
+
+/// Pick the highest scoring class per row and map it through the label list.
+fn argmax_labels(scores: &[f32], n: usize, num_classes: usize, class_labels: &[i64]) -> Vec<f32> {
     let mut labels = vec![0.0f32; n];
     for (i, label) in labels.iter_mut().enumerate() {
         let row_offset = i * num_classes;
         let mut best_idx = 0usize;
         let mut best_val = f32::NEG_INFINITY;
         for j in 0..num_classes {
-            if all_scores[row_offset + j] > best_val {
-                best_val = all_scores[row_offset + j];
+            let value = scores[row_offset + j];
+            if value > best_val {
+                best_val = value;
                 best_idx = j;
             }
         }
-        if !class_labels.is_empty() && best_idx < class_labels.len() {
-            *label = class_labels[best_idx] as f32;
-        } else {
-            *label = best_idx as f32;
-        }
+        *label = match class_labels.get(best_idx) {
+            Some(&l) => l as f32,
+            None => best_idx as f32,
+        };
     }
-
-    let label_tensor = Tensor::new(labels, vec![n]);
-    let score_tensor = Tensor::new(all_scores, vec![n, num_classes]);
-
-    Ok(vec![label_tensor, score_tensor])
+    labels
 }
 
 // ── TreeEnsembleRegressor ──────────────────────────────────────────────────
 
 /// ONNX-ML TreeEnsembleRegressor operator.
 ///
-/// Input 0: X \[N, features\] (2D tensor)
+/// Input 0: X \[N, features\] (a 1-D \[C\] input is one sample with C features)
 /// Output 0: Y \[N, n_targets\]
 pub fn tree_ensemble_regressor(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
+    const OP: &str = "TreeEnsembleRegressor";
+
     let x = ctx.input(0)?;
     let attrs = ctx.attrs();
 
-    // Parse tree structure from attributes
-    let feature_ids = attrs.ints("nodes_featureids");
-    let thresholds = attrs
-        .float_lists
-        .get("nodes_values")
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
-    let tree_ids = attrs.ints("nodes_treeids");
-    let node_ids = attrs.ints("nodes_nodeids");
-    let false_ids = attrs.ints("nodes_falsenodeids");
-    let true_ids = attrs.ints("nodes_truenodeids");
+    let ensemble = TreeEnsemble::parse(attrs, OP)?;
+    let leaf_table = build_leaf_table(attrs, "target", OP)?;
 
-    // Parse modes
-    let mode_strings = attrs.string_list("nodes_modes");
-    let mode_ints = attrs.ints("nodes_modes_int");
-    let modes: Vec<u8> = if !mode_strings.is_empty() {
-        mode_strings.iter().map(|s| parse_mode(s)).collect()
-    } else if !mode_ints.is_empty() {
-        mode_ints.iter().map(|&v| v as u8).collect()
-    } else {
-        let mode_str = attrs.s("nodes_modes");
-        if !mode_str.is_empty() {
-            mode_str.split(',').map(|s| parse_mode(s.trim())).collect()
-        } else {
-            vec![MODE_BRANCH_LEQ; tree_ids.len()]
-        }
-    };
-
-    // Parse target info (regressor uses target_* instead of class_*)
-    let target_ids = attrs.ints("target_ids");
-    let target_node_ids = attrs.ints("target_nodeids");
-    let target_tree_ids = attrs.ints("target_treeids");
-    let target_weights = attrs
-        .float_lists
-        .get("target_weights")
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
-
-    let post_transform_str = attrs.s("post_transform");
-    let post_transform = PostTransform::parse(post_transform_str);
-
+    let post_transform = PostTransform::parse(attrs.s("post_transform"), OP)?;
     let base_values = attrs
         .float_lists
         .get("base_values")
-        .cloned()
-        .unwrap_or_default();
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let aggregate = Aggregate::parse(attrs.s("aggregate_function"))?;
 
-    let n_targets = attrs.i("n_targets", 1) as usize;
-    let aggregate_function = attrs.s("aggregate_function");
-
-    // Determine dimensions
-    let n = x.shape[0];
-    let features = if x.shape.len() > 1 {
-        x.shape[1]
-    } else {
-        x.numel() / n
-    };
-
-    let num_trees = tree_ids.iter().copied().max().map(|m| m + 1).unwrap_or(0) as usize;
-
-    // Build node index
-    let node_index = build_node_index(tree_ids, node_ids);
-
-    // Build leaf lookup: (tree_id, node_id) -> list of (target_id, weight)
-    let mut leaf_lookup: std::collections::HashMap<(i64, i64), Vec<(usize, f32)>> =
-        std::collections::HashMap::new();
-    for i in 0..target_node_ids.len() {
-        if i < target_tree_ids.len() && i < target_ids.len() && i < target_weights.len() {
-            leaf_lookup
-                .entry((target_tree_ids[i], target_node_ids[i]))
-                .or_default()
-                .push((target_ids[i] as usize, target_weights[i]));
-        }
+    let n_targets = attrs.i("n_targets", 1);
+    if n_targets <= 0 {
+        return Err(OnnxError::InvalidModel(format!(
+            "{OP}: n_targets must be positive, got {n_targets}"
+        )));
     }
+    let n_targets = n_targets as usize;
 
-    // Allocate output
-    let mut output = vec![0.0f32; n * n_targets];
+    let (n, features) = batch_dims(x, OP)?;
+    let num_trees = ensemble.roots.len();
+    let use_base_values = base_values.len() == n_targets;
 
-    // Process each sample
+    let output_count = n.checked_mul(n_targets).ok_or_else(|| {
+        OnnxError::ShapeMismatch(format!("{OP}: output buffer size overflows usize"))
+    })?;
+    let mut output = vec![0.0f32; output_count];
+    let mut seen = vec![false; n_targets];
+
     for sample_idx in 0..n {
-        let x_offset = sample_idx * features;
+        let row = &x.data[sample_idx * features..sample_idx * features + features];
         let out_offset = sample_idx * n_targets;
+        seen.iter_mut().for_each(|s| *s = false);
 
-        // Initialize with base values
-        for t in 0..n_targets {
-            if t < base_values.len() {
-                output[out_offset + t] = base_values[t];
-            }
-        }
-
-        // Traverse each tree
-        for tree_id in 0..num_trees {
-            let tid = tree_id as i64;
-
-            let root_idx = match node_index.get(&(tid, 0)) {
-                Some(&idx) => idx,
-                None => continue,
+        for tree in &ensemble.roots {
+            let Some(leaf) = ensemble.leaf_of(tree, row, OP)? else {
+                continue;
             };
-
-            let mut current_idx = root_idx;
-            loop {
-                if current_idx >= modes.len() {
-                    break;
-                }
-
-                let mode = modes[current_idx];
-                if mode == MODE_LEAF {
-                    if let Some(leaves) = leaf_lookup.get(&(tid, node_ids[current_idx])) {
-                        for &(target_id, weight) in leaves {
-                            if target_id < n_targets {
-                                output[out_offset + target_id] += weight;
-                            }
-                        }
+            if let Some(weights) = leaf_table.get(&(tree.tree_id, ensemble.node_id(leaf))) {
+                for &(target_id, weight) in weights {
+                    if target_id < n_targets {
+                        aggregate.fold(
+                            &mut output[out_offset + target_id],
+                            &mut seen[target_id],
+                            weight,
+                        );
                     }
-                    break;
-                }
-
-                let feat_idx = feature_ids[current_idx] as usize;
-                let feature_val = if feat_idx < features {
-                    x.data[x_offset + feat_idx]
-                } else {
-                    0.0
-                };
-                let threshold = if current_idx < thresholds.len() {
-                    thresholds[current_idx]
-                } else {
-                    0.0
-                };
-
-                let next_node_id = if branch_true(mode, feature_val, threshold) {
-                    true_ids[current_idx]
-                } else {
-                    false_ids[current_idx]
-                };
-
-                match node_index.get(&(tid, next_node_id)) {
-                    Some(&idx) => current_idx = idx,
-                    None => break,
                 }
             }
         }
 
-        // Apply aggregate function (AVERAGE divides by number of trees)
-        if aggregate_function == "AVERAGE" && num_trees > 0 {
-            let divisor = num_trees as f32;
-            for t in 0..n_targets {
-                output[out_offset + t] /= divisor;
+        // onnxruntime finalizes with the aggregation first and adds
+        // `base_values` afterwards, so the base is never averaged.
+        for t in 0..n_targets {
+            let slot = &mut output[out_offset + t];
+            if !seen[t] {
+                *slot = 0.0;
+            } else if aggregate == Aggregate::Average && num_trees > 0 {
+                *slot /= num_trees as f32;
+            }
+            if use_base_values {
+                *slot += base_values[t];
             }
         }
     }
 
-    // Apply post-transform
     apply_post_transform(&mut output, n, n_targets, post_transform);
 
     Ok(vec![Tensor::new(output, vec![n, n_targets])])
@@ -424,200 +586,4 @@ pub fn tree_ensemble_regressor(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxE
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use oxionnx_core::graph::{Attributes, Node, OpKind};
-
-    fn make_context(
-        op: OpKind,
-        inputs: Vec<Option<&Tensor>>,
-        attrs: Attributes,
-    ) -> (Node, Vec<Option<&Tensor>>) {
-        let node = Node {
-            op,
-            name: "test_node".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            attrs,
-        };
-        (node, inputs)
-    }
-
-    fn ctx_from<'a>(node: &'a Node, inputs: &'a [Option<&'a Tensor>]) -> OpContext<'a> {
-        OpContext {
-            node,
-            inputs: inputs.to_vec(),
-            outer_scope: None,
-            weights: None,
-            registry: None,
-        }
-    }
-
-    #[test]
-    fn test_tree_ensemble_classifier_2tree_2class() {
-        // Build a simple 2-tree ensemble for binary classification (2 features).
-        //
-        // Tree 0: if x[0] <= 0.5 -> leaf(class=0, w=1.0) else leaf(class=1, w=1.0)
-        //   Node 0: feature=0, threshold=0.5, true->1, false->2
-        //   Node 1: leaf (class=0, weight=1.0)
-        //   Node 2: leaf (class=1, weight=1.0)
-        //
-        // Tree 1: if x[1] <= 0.5 -> leaf(class=0, w=1.0) else leaf(class=1, w=1.0)
-        //   Node 0: feature=1, threshold=0.5, true->1, false->2
-        //   Node 1: leaf (class=0, weight=1.0)
-        //   Node 2: leaf (class=1, weight=1.0)
-
-        let x = Tensor::new(
-            vec![
-                0.0, 0.0, // sample 0: both features < 0.5 => class 0 (2 votes)
-                1.0, 1.0, // sample 1: both features > 0.5 => class 1 (2 votes)
-                0.0, 1.0, // sample 2: split votes => tied, argmax picks 0
-            ],
-            vec![3, 2],
-        );
-
-        let mut attrs = Attributes::default();
-        // nodes_treeids: tree0 has 3 nodes, tree1 has 3 nodes
-        attrs
-            .int_lists
-            .insert("nodes_treeids".into(), vec![0, 0, 0, 1, 1, 1]);
-        attrs
-            .int_lists
-            .insert("nodes_nodeids".into(), vec![0, 1, 2, 0, 1, 2]);
-        attrs
-            .int_lists
-            .insert("nodes_featureids".into(), vec![0, 0, 0, 1, 0, 0]);
-        attrs
-            .float_lists
-            .insert("nodes_values".into(), vec![0.5, 0.0, 0.0, 0.5, 0.0, 0.0]);
-        attrs
-            .int_lists
-            .insert("nodes_truenodeids".into(), vec![1, 0, 0, 1, 0, 0]);
-        attrs
-            .int_lists
-            .insert("nodes_falsenodeids".into(), vec![2, 0, 0, 2, 0, 0]);
-
-        // Modes: BRANCH_LEQ for node 0 in each tree, LEAF for nodes 1,2
-        attrs.string_lists.insert(
-            "nodes_modes".into(),
-            vec![
-                "BRANCH_LEQ".into(),
-                "LEAF".into(),
-                "LEAF".into(),
-                "BRANCH_LEQ".into(),
-                "LEAF".into(),
-                "LEAF".into(),
-            ],
-        );
-
-        // Leaf info: 4 leaf entries
-        // Tree 0, node 1 -> class 0, weight 1.0
-        // Tree 0, node 2 -> class 1, weight 1.0
-        // Tree 1, node 1 -> class 0, weight 1.0
-        // Tree 1, node 2 -> class 1, weight 1.0
-        attrs
-            .int_lists
-            .insert("class_treeids".into(), vec![0, 0, 1, 1]);
-        attrs
-            .int_lists
-            .insert("class_nodeids".into(), vec![1, 2, 1, 2]);
-        attrs.int_lists.insert("class_ids".into(), vec![0, 1, 0, 1]);
-        attrs
-            .float_lists
-            .insert("class_weights".into(), vec![1.0, 1.0, 1.0, 1.0]);
-
-        attrs
-            .int_lists
-            .insert("classlabels_int64s".into(), vec![0, 1]);
-        attrs.strings.insert("post_transform".into(), "NONE".into());
-
-        let (node, inputs) = make_context(OpKind::TreeEnsembleClassifier, vec![Some(&x)], attrs);
-        let ctx = ctx_from(&node, &inputs);
-        let result = tree_ensemble_classifier(&ctx).expect("tree_ensemble_classifier failed");
-
-        assert_eq!(result.len(), 2);
-
-        let labels = &result[0];
-        assert_eq!(labels.shape, vec![3]);
-        // Sample 0: class 0 gets 2 votes, class 1 gets 0
-        assert!((labels.data[0] - 0.0).abs() < 1e-5);
-        // Sample 1: class 0 gets 0 votes, class 1 gets 2
-        assert!((labels.data[1] - 1.0).abs() < 1e-5);
-        // Sample 2: class 0 gets 1 vote (tree 0), class 1 gets 1 vote (tree 1) -> tie, first wins
-        assert!((labels.data[2] - 0.0).abs() < 1e-5);
-
-        let scores = &result[1];
-        assert_eq!(scores.shape, vec![3, 2]);
-        // Sample 0: [2.0, 0.0]
-        assert!((scores.data[0] - 2.0).abs() < 1e-5);
-        assert!((scores.data[1] - 0.0).abs() < 1e-5);
-        // Sample 1: [0.0, 2.0]
-        assert!((scores.data[2] - 0.0).abs() < 1e-5);
-        assert!((scores.data[3] - 2.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_tree_ensemble_regressor_single_tree() {
-        // Single tree with 2 features:
-        // if x[0] <= 1.0 -> leaf(target=0, weight=10.0)
-        // else -> leaf(target=0, weight=20.0)
-        //
-        // Tree 0:
-        //   Node 0: feature=0, threshold=1.0, true->1, false->2
-        //   Node 1: leaf
-        //   Node 2: leaf
-
-        let x = Tensor::new(
-            vec![
-                0.5, 0.0, // sample 0: x[0] <= 1.0 => 10.0
-                2.0, 0.0, // sample 1: x[0] > 1.0 => 20.0
-            ],
-            vec![2, 2],
-        );
-
-        let mut attrs = Attributes::default();
-        attrs
-            .int_lists
-            .insert("nodes_treeids".into(), vec![0, 0, 0]);
-        attrs
-            .int_lists
-            .insert("nodes_nodeids".into(), vec![0, 1, 2]);
-        attrs
-            .int_lists
-            .insert("nodes_featureids".into(), vec![0, 0, 0]);
-        attrs
-            .float_lists
-            .insert("nodes_values".into(), vec![1.0, 0.0, 0.0]);
-        attrs
-            .int_lists
-            .insert("nodes_truenodeids".into(), vec![1, 0, 0]);
-        attrs
-            .int_lists
-            .insert("nodes_falsenodeids".into(), vec![2, 0, 0]);
-
-        attrs.string_lists.insert(
-            "nodes_modes".into(),
-            vec!["BRANCH_LEQ".into(), "LEAF".into(), "LEAF".into()],
-        );
-
-        attrs.int_lists.insert("target_treeids".into(), vec![0, 0]);
-        attrs.int_lists.insert("target_nodeids".into(), vec![1, 2]);
-        attrs.int_lists.insert("target_ids".into(), vec![0, 0]);
-        attrs
-            .float_lists
-            .insert("target_weights".into(), vec![10.0, 20.0]);
-
-        attrs.ints.insert("n_targets".into(), 1);
-        attrs.strings.insert("post_transform".into(), "NONE".into());
-
-        let (node, inputs) = make_context(OpKind::TreeEnsembleRegressor, vec![Some(&x)], attrs);
-        let ctx = ctx_from(&node, &inputs);
-        let result = tree_ensemble_regressor(&ctx).expect("tree_ensemble_regressor failed");
-
-        assert_eq!(result.len(), 1);
-        let y = &result[0];
-        assert_eq!(y.shape, vec![2, 1]);
-        assert!((y.data[0] - 10.0).abs() < 1e-5);
-        assert!((y.data[1] - 20.0).abs() < 1e-5);
-    }
-}
+mod tests;

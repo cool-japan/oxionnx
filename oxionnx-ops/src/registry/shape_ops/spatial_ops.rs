@@ -1,8 +1,32 @@
 //! Operator implementations for tile, depth/space reordering, and reverse-sequence.
 
-use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
+use oxionnx_core::{Attributes, OnnxError, OpContext, Operator, Tensor};
 
 use crate::shape;
+
+/// Read the `blocksize` attribute for `DepthToSpace`/`SpaceToDepth`, requiring
+/// `>= 1`.
+///
+/// `attrs.i("blocksize", 1) as usize` on its own is unsound for two reasons:
+/// a `blocksize` of `0` reaches `shape::depth_to_space`/`shape::space_to_depth`
+/// as `0` and hits their `blocksize == 0` guard there, but a *negative*
+/// `blocksize` (e.g. `-1`) wraps under `as usize` into a huge value instead
+/// (two's-complement reinterpretation), which is not `0` and therefore slips
+/// past that guard — the `c_total % (r * r)` / `h % r` checks then run with an
+/// astronomically large `r`, overflowing the `r * r` multiplication and/or
+/// attempting an allocation of `n * c * oh * ow` elements. Validating the raw
+/// `i64` before the cast catches both `0` and negative values here, at the
+/// single source both `execute()` and `execute_into_slots()` (for both ops)
+/// read the attribute from.
+fn read_blocksize(attrs: &Attributes, op: &str) -> Result<usize, OnnxError> {
+    let blocksize = attrs.i("blocksize", 1);
+    if blocksize < 1 {
+        return Err(OnnxError::ShapeMismatch(format!(
+            "{op}: blocksize must be >= 1, got {blocksize}"
+        )));
+    }
+    Ok(blocksize as usize)
+}
 
 // ── Tile ─────────────────────────────────────────────────────────────────────
 
@@ -85,7 +109,7 @@ impl Operator for DepthToSpaceOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let attrs = ctx.attrs();
-        let blocksize = attrs.i("blocksize", 1) as usize;
+        let blocksize = read_blocksize(attrs, "DepthToSpace")?;
         let mode = attrs.s("mode");
         let mode = if mode.is_empty() { "DCR" } else { mode };
         Ok(vec![shape::depth_to_space(ctx.input(0)?, blocksize, mode)?])
@@ -103,7 +127,7 @@ impl Operator for DepthToSpaceOp {
         }
         let x = ctx.input(0)?;
         let attrs = ctx.attrs();
-        let blocksize = attrs.i("blocksize", 1) as usize;
+        let blocksize = read_blocksize(attrs, "DepthToSpace")?;
         let mode_str = attrs.s("mode");
         let mode = if mode_str.is_empty() { "DCR" } else { mode_str };
         if x.ndim() != 4 {
@@ -160,7 +184,7 @@ impl Operator for SpaceToDepthOp {
         "SpaceToDepth"
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
-        let blocksize = ctx.attrs().i("blocksize", 1) as usize;
+        let blocksize = read_blocksize(ctx.attrs(), "SpaceToDepth")?;
         Ok(vec![shape::space_to_depth(ctx.input(0)?, blocksize)?])
     }
     fn supports_output_slots(&self) -> bool {
@@ -175,7 +199,7 @@ impl Operator for SpaceToDepthOp {
             return Ok(());
         }
         let x = ctx.input(0)?;
-        let blocksize = ctx.attrs().i("blocksize", 1) as usize;
+        let blocksize = read_blocksize(ctx.attrs(), "SpaceToDepth")?;
         if x.ndim() != 4 {
             return Err(OnnxError::ShapeMismatch(
                 "SpaceToDepth: input must be 4D [N,C,H,W]".into(),

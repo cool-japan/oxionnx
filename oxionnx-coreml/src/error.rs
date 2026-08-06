@@ -17,7 +17,13 @@ use thiserror::Error;
 pub type Result<T> = core::result::Result<T, CoreMLError>;
 
 /// Failure modes returned by the CoreML runtime.
+///
+/// `#[non_exhaustive]`: new failure modes may be added as more of the
+/// CoreML/MLPackage surface (feature types, pixel formats, …) is covered.
+/// Downstream `match`es need a wildcard arm; existing variants remain
+/// constructible as before.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CoreMLError {
     /// File-system error — usually the supplied `.mlpackage` path is missing,
     /// not readable or not a directory.
@@ -76,6 +82,23 @@ pub enum CoreMLError {
     /// `predict`.
     #[error("CoreML compute-plan introspection failed: {0}")]
     ComputePlan(String),
+
+    /// [`MlPackageModel::predict_features`](crate::MlPackageModel::predict_features)
+    /// encountered an `MLFeatureType` it does not decode — either
+    /// `MLFeatureTypeInvalid`, `MLFeatureTypeState` (no portable
+    /// representation exists for either), or (for `MLFeatureTypeSequence`)
+    /// an `MLSequence` element type other than `Int64`/`String`.
+    #[error("CoreML unsupported feature type: {0}")]
+    UnsupportedFeatureType(String),
+
+    /// [`MlPackageModel::predict_features`](crate::MlPackageModel::predict_features)'s
+    /// image decoder does not recognize a `CVPixelBuffer`'s
+    /// `pixelFormatType` — either because it is a planar layout, or
+    /// because it is a packed format outside the standard set
+    /// (`OneComponent8`, `32BGRA`, `OneComponent16Half`,
+    /// `OneComponent32Float`) that decoder supports.
+    #[error("CoreML unsupported CVPixelBuffer format: {0}")]
+    UnsupportedPixelFormat(String),
 
     /// Catch-all for invariant violations — unreachable in normal use, but
     /// surfaced rather than panicking so callers always get a `Result`.

@@ -18,7 +18,10 @@ fn test_fuse_matmul_add() {
     weights.insert("w".to_string(), Tensor::new(vec![1.0; 4], vec![2, 2]));
     weights.insert("bias".to_string(), Tensor::new(vec![0.5, 0.5], vec![2]));
 
-    let result = fuse_matmul_add(nodes, &weights);
+    let mut shapes = HashMap::new();
+    shapes.insert("x".to_string(), vec![2, 2]);
+
+    let result = fuse_matmul_add(nodes, &weights, &shapes, &[]);
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::Gemm));
     assert_eq!(result[0].outputs[0], "add_out");
@@ -37,7 +40,7 @@ fn test_fuse_matmul_add_single_node() {
         vec!["mm_out"],
     )];
     let weights = HashMap::new();
-    let result = fuse_matmul_add(nodes, &weights);
+    let result = fuse_matmul_add(nodes, &weights, &HashMap::new(), &[]);
     assert_eq!(result.len(), 1);
 }
 
@@ -50,7 +53,9 @@ fn test_fuse_matmul_add_bias_not_1d() {
     let mut weights = HashMap::new();
     weights.insert("w".to_string(), Tensor::new(vec![1.0; 4], vec![2, 2]));
     weights.insert("bias".to_string(), Tensor::new(vec![0.5; 4], vec![2, 2]));
-    let result = fuse_matmul_add(nodes, &weights);
+    let mut shapes = HashMap::new();
+    shapes.insert("x".to_string(), vec![2, 2]);
+    let result = fuse_matmul_add(nodes, &weights, &shapes, &[]);
     assert_eq!(result.len(), 2);
 }
 
@@ -68,27 +73,29 @@ fn test_no_fusion_when_multiple_consumers() {
         w
     };
 
-    let result = fuse_matmul_add(nodes, &weights);
+    let mut shapes = HashMap::new();
+    shapes.insert("x".to_string(), vec![2, 2]);
+    let result = fuse_matmul_add(nodes, &weights, &shapes, &[]);
     assert_eq!(result.len(), 3);
 }
 
+/// `LayerNormOp` requires a scale input, so the bare normalisation pattern
+/// (no trailing `Mul(scale)`) must be left as-is rather than fused into a node
+/// that cannot execute.
 #[test]
-fn test_fuse_layer_norm_basic() {
+fn test_fuse_layer_norm_without_scale_is_not_fused() {
     let (nodes, weights) = make_layer_norm_pattern(false);
-    let result = fuse_layer_norm(nodes, &weights);
+    let original_len = nodes.len();
+    let result = fuse_layer_norm(nodes, &weights, &HashMap::new(), &[]);
 
-    assert_eq!(result.len(), 1);
-    assert!(matches!(result[0].op, OpKind::LayerNorm));
-    assert_eq!(result[0].inputs[0], "X");
-    assert_eq!(result[0].outputs[0], "normalized");
-    let eps = result[0].attrs.f("epsilon", 0.0);
-    assert!((eps - 1e-5).abs() < 1e-8);
+    assert_eq!(result.len(), original_len);
+    assert!(!result.iter().any(|n| matches!(n.op, OpKind::LayerNorm)));
 }
 
 #[test]
 fn test_fuse_layer_norm_with_scale_bias() {
     let (nodes, weights) = make_layer_norm_pattern(true);
-    let result = fuse_layer_norm(nodes, &weights);
+    let result = fuse_layer_norm(nodes, &weights, &HashMap::new(), &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::LayerNorm));
@@ -105,7 +112,7 @@ fn test_fuse_layer_norm_no_match_wrong_pow() {
     weights.insert("pow_exp".to_string(), Tensor::new(vec![3.0], vec![1]));
 
     let original_len = nodes.len();
-    let result = fuse_layer_norm(nodes, &weights);
+    let result = fuse_layer_norm(nodes, &weights, &HashMap::new(), &[]);
 
     assert_eq!(result.len(), original_len);
 }
@@ -122,7 +129,7 @@ fn test_fuse_matmul_transpose_2d() {
         .insert("perm".to_string(), vec![1, 0]);
 
     let nodes = vec![matmul, transpose];
-    let result = fuse_matmul_transpose(nodes);
+    let result = fuse_matmul_transpose(nodes, &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::Gemm));
@@ -134,8 +141,10 @@ fn test_fuse_matmul_transpose_2d() {
     assert_eq!(result[0].outputs[0], "t_out");
 }
 
+/// A batched (rank-3) MatMul+Transpose cannot become a `Gemm`: ONNX defines
+/// `Gemm` only for 2-D operands.
 #[test]
-fn test_fuse_matmul_transpose_3d_last_two() {
+fn test_fuse_matmul_transpose_3d_last_two_is_not_fused() {
     let matmul = make_node(OpKind::MatMul, "mm", vec!["a", "b"], vec!["mm_out"]);
     let mut transpose = make_node(OpKind::Transpose, "t", vec!["mm_out"], vec!["t_out"]);
     transpose
@@ -144,10 +153,10 @@ fn test_fuse_matmul_transpose_3d_last_two() {
         .insert("perm".to_string(), vec![0, 2, 1]);
 
     let nodes = vec![matmul, transpose];
-    let result = fuse_matmul_transpose(nodes);
+    let result = fuse_matmul_transpose(nodes, &[]);
 
-    assert_eq!(result.len(), 1);
-    assert!(matches!(result[0].op, OpKind::Gemm));
+    assert_eq!(result.len(), 2);
+    assert!(matches!(result[0].op, OpKind::MatMul));
 }
 
 #[test]
@@ -161,7 +170,7 @@ fn test_fuse_matmul_transpose_no_fusion_wrong_perm() {
         .insert("perm".to_string(), vec![2, 0, 1]);
 
     let nodes = vec![matmul, transpose];
-    let result = fuse_matmul_transpose(nodes);
+    let result = fuse_matmul_transpose(nodes, &[]);
 
     assert_eq!(result.len(), 2);
 }
@@ -177,7 +186,7 @@ fn test_fuse_matmul_transpose_no_fusion_multiple_consumers() {
     let relu = make_node(OpKind::Relu, "relu", vec!["mm_out"], vec!["relu_out"]);
 
     let nodes = vec![matmul, transpose, relu];
-    let result = fuse_matmul_transpose(nodes);
+    let result = fuse_matmul_transpose(nodes, &[]);
 
     assert_eq!(result.len(), 3);
 }
@@ -198,7 +207,9 @@ fn test_fuse_add_matmul_to_gemm() {
         Tensor::new(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], vec![2, 3]),
     );
 
-    let result = fuse_add_matmul_to_gemm(nodes, &mut weights);
+    let mut shapes = HashMap::new();
+    shapes.insert("x".to_string(), vec![2, 2]);
+    let result = fuse_add_matmul_to_gemm(nodes, &mut weights, &shapes, &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::Gemm));
@@ -234,7 +245,9 @@ fn test_fuse_add_matmul_to_gemm_bias_first_input() {
         Tensor::new(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]),
     );
 
-    let result = fuse_add_matmul_to_gemm(nodes, &mut weights);
+    let mut shapes = HashMap::new();
+    shapes.insert("x".to_string(), vec![2, 2]);
+    let result = fuse_add_matmul_to_gemm(nodes, &mut weights, &shapes, &[]);
 
     assert_eq!(result.len(), 1);
     assert!(matches!(result[0].op, OpKind::Gemm));
@@ -251,7 +264,9 @@ fn test_fuse_add_matmul_no_fusion_bias_not_1d() {
     weights.insert("bias".to_string(), Tensor::new(vec![1.0; 4], vec![2, 2]));
     weights.insert("w".to_string(), Tensor::new(vec![1.0; 4], vec![2, 2]));
 
-    let result = fuse_add_matmul_to_gemm(nodes, &mut weights);
+    let mut shapes = HashMap::new();
+    shapes.insert("x".to_string(), vec![2, 2]);
+    let result = fuse_add_matmul_to_gemm(nodes, &mut weights, &shapes, &[]);
     assert_eq!(result.len(), 2);
 }
 
@@ -265,7 +280,9 @@ fn test_fuse_add_matmul_no_fusion_w_not_in_weights() {
     weights.insert("bias".to_string(), Tensor::new(vec![1.0, 2.0], vec![2]));
     // w not in weights
 
-    let result = fuse_add_matmul_to_gemm(nodes, &mut weights);
+    let mut shapes = HashMap::new();
+    shapes.insert("x".to_string(), vec![2, 2]);
+    let result = fuse_add_matmul_to_gemm(nodes, &mut weights, &shapes, &[]);
     assert_eq!(result.len(), 2);
 }
 
@@ -283,6 +300,8 @@ fn test_fuse_add_matmul_no_fusion_shape_mismatch() {
     );
     weights.insert("w".to_string(), Tensor::new(vec![1.0; 4], vec![2, 2]));
 
-    let result = fuse_add_matmul_to_gemm(nodes, &mut weights);
+    let mut shapes = HashMap::new();
+    shapes.insert("x".to_string(), vec![2, 2]);
+    let result = fuse_add_matmul_to_gemm(nodes, &mut weights, &shapes, &[]);
     assert_eq!(result.len(), 2);
 }

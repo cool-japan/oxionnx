@@ -1,9 +1,25 @@
 //! Typed error returned by all public oxionnx methods.
 
-use std::fmt;
+// `core::fmt` (not `std::fmt`): this crate supports `no_std` (`alloc`-only)
+// builds via the `std` feature (default-on). `core::fmt::{Display, Debug,
+// Formatter, Result}` are the exact same items `std::fmt` re-exports, so
+// this works identically in both std and no_std builds -- no `#[cfg(...)]`
+// needed for this import specifically.
+use core::fmt;
+
+// `alloc::string::String`: every `OnnxError` variant carries a message
+// string. `alloc` is always linked by the crate root (see lib.rs), so this
+// resolves to the same `String` as `std::string::String` in std builds too.
+use alloc::string::String;
 
 /// Typed error returned by all public `Session` methods.
+///
+/// `#[non_exhaustive]`: new failure modes are added to this enum as the
+/// engine grows (e.g. new dispatch backends, new validation checks).
+/// Downstream `match`es must carry a wildcard arm so those additions are
+/// non-breaking; construction of existing variants is unaffected.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum OnnxError {
     /// ONNX protobuf parsing or decoding failure.
     Parse(String),
@@ -47,6 +63,11 @@ impl fmt::Display for OnnxError {
     }
 }
 
+// `core::error::Error` only became stable in Rust 1.81; this crate's MSRV is
+// 1.75 (see workspace `rust-version`), so the trait impl is only provided
+// under the `std` feature rather than attempting a `core::error::Error`
+// impl that would raise the effective MSRV for `no_std` users.
+#[cfg(feature = "std")]
 impl std::error::Error for OnnxError {}
 
 impl From<String> for OnnxError {

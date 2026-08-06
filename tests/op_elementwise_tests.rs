@@ -369,7 +369,11 @@ fn test_bitwise_xor() {
 // test_bitwise_not
 #[test]
 fn test_bitwise_not() {
-    // !0u32 = 4294967295 (u32::MAX)
+    // [a0-14] BitwiseNot(0) = -1 (two's-complement all-ones, read as a signed
+    // value). The previous expectation here, u32::MAX == 4294967295, encoded
+    // the bug: a `v as u32` cast saturates any negative operand to 0 and
+    // reports the NOT result as an unsigned bit pattern that isn't even
+    // exactly representable in f32 (unlike -1.0, which is exact).
     let x = Tensor::new(vec![0.0], vec![1]);
     let outputs = run_single_op(
         OpKind::BitwiseNot,
@@ -382,8 +386,8 @@ fn test_bitwise_not() {
     );
     let out = outputs.get("out").unwrap();
     assert_eq!(
-        out.data[0] as u32, !0u32,
-        "bitwise_not(0) should be u32::MAX as u32"
+        out.data[0], -1.0,
+        "bitwise_not(0) should be -1 (two's-complement all-ones, signed)"
     );
 }
 

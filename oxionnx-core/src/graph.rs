@@ -1,4 +1,29 @@
-use std::collections::HashMap;
+// `alloc`-backed types/macros, imported unconditionally: `alloc` is always
+// linked by the crate root (see lib.rs), and `alloc::vec::Vec` /
+// `alloc::string::String` are the exact same items as `std::vec::Vec` /
+// `std::string::String`, so this resolves identically whether or not the
+// `std` feature is enabled. `alloc::collections::VecDeque` is likewise
+// alloc-only (no hasher involved, unlike HashMap/HashSet below), so it needs
+// no per-feature split either.
+use alloc::{
+    collections::VecDeque,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+
+// `HashMap`/`HashSet` need a per-feature split (unlike the alloc-only types
+// above): `std::collections::HashMap` is part of this crate's existing
+// public API (`Attributes` fields are typed `HashMap<String, _>`), so `std`
+// builds must keep resolving to the exact same type downstream crates
+// already construct values of. `no_std` builds fall back to `hashbrown`
+// (already a non-optional dependency of this crate) with its own default
+// hasher.
+#[cfg(not(feature = "std"))]
+use hashbrown::{HashMap, HashSet};
+#[cfg(feature = "std")]
+use std::collections::{HashMap, HashSet};
 
 use crate::Tensor;
 
@@ -81,6 +106,12 @@ pub enum OpKind {
     // Quantization
     QuantizeLinear,
     DequantizeLinear,
+    // Quantization (int8/uint8 operator family, ORT static/dynamic quantizers)
+    QLinearConv,
+    QLinearMatMul,
+    MatMulInteger,
+    ConvInteger,
+    DynamicQuantizeLinear,
     // Passthrough / misc
     Identity,
     Cast,
@@ -158,6 +189,7 @@ pub enum OpKind {
     // RNN ops
     LSTM,
     GRU,
+    RNN,
     // Attention ops
     Attention,
     MultiHeadAttention,
@@ -204,6 +236,27 @@ pub enum OpKind {
     // Neural network (J-phase additions)
     Hardmax,
     Shrink,
+    // Classic CNN / vision ops (model-zoo coverage)
+    LRN,
+    LpPool,
+    GlobalLpPool,
+    MaxUnpool,
+    MaxRoiPool,
+    Upsample,
+    CastLike,
+    // Linear algebra / tensor reconstruction / cropping (W2 registry lane B)
+    Det,
+    Col2Im,
+    CenterCropPad,
+    // Random generators + Multinomial (W2 registry lane B)
+    RandomNormal,
+    RandomUniform,
+    RandomNormalLike,
+    RandomUniformLike,
+    Multinomial,
+    // Loss ops (W2 registry lane B)
+    NegativeLogLikelihoodLoss,
+    SoftmaxCrossEntropyLoss,
     // Fused ops (optimizer-generated)
     ConvAddRelu,
     // Unknown (logged but skipped gracefully)
@@ -280,6 +333,11 @@ impl OpKind {
             "GlobalMaxPool" => Self::GlobalMaxPool,
             "QuantizeLinear" => Self::QuantizeLinear,
             "DequantizeLinear" => Self::DequantizeLinear,
+            "QLinearConv" => Self::QLinearConv,
+            "QLinearMatMul" => Self::QLinearMatMul,
+            "MatMulInteger" => Self::MatMulInteger,
+            "ConvInteger" => Self::ConvInteger,
+            "DynamicQuantizeLinear" => Self::DynamicQuantizeLinear,
             "Ceil" => Self::Ceil,
             "Floor" => Self::Floor,
             "Round" => Self::Round,
@@ -340,6 +398,7 @@ impl OpKind {
             "NonMaxSuppression" => Self::NonMaxSuppression,
             "LSTM" => Self::LSTM,
             "GRU" => Self::GRU,
+            "RNN" => Self::RNN,
             "Attention" => Self::Attention,
             "MultiHeadAttention" => Self::MultiHeadAttention,
             "RotaryEmbedding" => Self::RotaryEmbedding,
@@ -387,6 +446,27 @@ impl OpKind {
             // Neural network (J-phase additions)
             "Hardmax" => Self::Hardmax,
             "Shrink" => Self::Shrink,
+            // Classic CNN / vision ops
+            "LRN" => Self::LRN,
+            "LpPool" => Self::LpPool,
+            "GlobalLpPool" => Self::GlobalLpPool,
+            "MaxUnpool" => Self::MaxUnpool,
+            "MaxRoiPool" => Self::MaxRoiPool,
+            "Upsample" => Self::Upsample,
+            "CastLike" => Self::CastLike,
+            // Linear algebra / tensor reconstruction / cropping
+            "Det" => Self::Det,
+            "Col2Im" => Self::Col2Im,
+            "CenterCropPad" => Self::CenterCropPad,
+            // Random generators + Multinomial
+            "RandomNormal" => Self::RandomNormal,
+            "RandomUniform" => Self::RandomUniform,
+            "RandomNormalLike" => Self::RandomNormalLike,
+            "RandomUniformLike" => Self::RandomUniformLike,
+            "Multinomial" => Self::Multinomial,
+            // Loss ops
+            "NegativeLogLikelihoodLoss" => Self::NegativeLogLikelihoodLoss,
+            "SoftmaxCrossEntropyLoss" => Self::SoftmaxCrossEntropyLoss,
             // Fused ops (optimizer-generated)
             "ConvAddRelu" => Self::ConvAddRelu,
             other => Self::Unknown(other.to_string()),
@@ -455,6 +535,11 @@ impl OpKind {
             Self::GlobalMaxPool => "GlobalMaxPool",
             Self::QuantizeLinear => "QuantizeLinear",
             Self::DequantizeLinear => "DequantizeLinear",
+            Self::QLinearConv => "QLinearConv",
+            Self::QLinearMatMul => "QLinearMatMul",
+            Self::MatMulInteger => "MatMulInteger",
+            Self::ConvInteger => "ConvInteger",
+            Self::DynamicQuantizeLinear => "DynamicQuantizeLinear",
             Self::Identity => "Identity",
             Self::Cast => "Cast",
             Self::Shape => "Shape",
@@ -523,6 +608,7 @@ impl OpKind {
             Self::NonMaxSuppression => "NonMaxSuppression",
             Self::LSTM => "LSTM",
             Self::GRU => "GRU",
+            Self::RNN => "RNN",
             Self::Attention => "Attention",
             Self::MultiHeadAttention => "MultiHeadAttention",
             Self::RotaryEmbedding => "RotaryEmbedding",
@@ -565,6 +651,27 @@ impl OpKind {
             // Neural network (J-phase additions)
             Self::Hardmax => "Hardmax",
             Self::Shrink => "Shrink",
+            // Classic CNN / vision ops
+            Self::LRN => "LRN",
+            Self::LpPool => "LpPool",
+            Self::GlobalLpPool => "GlobalLpPool",
+            Self::MaxUnpool => "MaxUnpool",
+            Self::MaxRoiPool => "MaxRoiPool",
+            Self::Upsample => "Upsample",
+            Self::CastLike => "CastLike",
+            // Linear algebra / tensor reconstruction / cropping
+            Self::Det => "Det",
+            Self::Col2Im => "Col2Im",
+            Self::CenterCropPad => "CenterCropPad",
+            // Random generators + Multinomial
+            Self::RandomNormal => "RandomNormal",
+            Self::RandomUniform => "RandomUniform",
+            Self::RandomNormalLike => "RandomNormalLike",
+            Self::RandomUniformLike => "RandomUniformLike",
+            Self::Multinomial => "Multinomial",
+            // Loss ops
+            Self::NegativeLogLikelihoodLoss => "NegativeLogLikelihoodLoss",
+            Self::SoftmaxCrossEntropyLoss => "SoftmaxCrossEntropyLoss",
             // Fused ops (optimizer-generated)
             Self::ConvAddRelu => "ConvAddRelu",
             Self::Unknown(s) => s.as_str(),
@@ -775,7 +882,7 @@ impl TensorInfo {
                 self.dim_params
                     .iter()
                     .map(Some)
-                    .chain(std::iter::repeat(None)),
+                    .chain(core::iter::repeat(None)),
             )
             .map(|(static_dim, param_opt)| match static_dim {
                 Some(n) => Dim::Static(*n),
@@ -855,7 +962,7 @@ impl Graph {
             }
         }
 
-        let known_set: std::collections::HashSet<&str> = known.iter().map(|s| s.as_str()).collect();
+        let known_set: HashSet<&str> = known.iter().map(|s| s.as_str()).collect();
 
         for (i, node) in self.nodes.iter().enumerate() {
             for inp in &node.inputs {
@@ -868,25 +975,42 @@ impl Graph {
             }
         }
 
-        // Track which nodes each node's outputs feed into
+        // Track which nodes each node's outputs feed into.
+        // IMPORTANT: use the exact same `!known_set.contains(inp)` guard as the
+        // in_degree loop above. If an input is already in `known_set`, its
+        // in_degree was never incremented for that edge, so the dependents map
+        // must not record it either -- otherwise the matching `in_degree[dep] -= 1`
+        // below would decrement a count that was never incremented, underflowing
+        // (this happens for real when a Loop/Scan body's node output shadows an
+        // outer_scope name, or when a Shape node's output is later hoisted into
+        // `weights` while the node itself stays in the graph).
         let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
         for (i, node) in self.nodes.iter().enumerate() {
             for inp in &node.inputs {
+                if inp.is_empty() {
+                    continue;
+                } // optional input
+                if known_set.contains(inp.as_str()) {
+                    continue;
+                }
                 if let Some(&prod_idx) = producer.get(inp.as_str()) {
                     dependents.entry(prod_idx).or_default().push(i);
                 }
             }
         }
 
-        let mut queue: std::collections::VecDeque<usize> =
-            (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut queue: VecDeque<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
         let mut order = Vec::with_capacity(n);
 
         while let Some(idx) = queue.pop_front() {
             order.push(idx);
             if let Some(deps) = dependents.get(&idx) {
                 for &dep in deps {
-                    in_degree[dep] -= 1;
+                    // Defensive backstop: with the guard above this should never
+                    // underflow, but a malformed graph (e.g. a duplicate output
+                    // name) must degrade to "node stays in the fallback append"
+                    // rather than panic.
+                    in_degree[dep] = in_degree[dep].saturating_sub(1);
                     if in_degree[dep] == 0 {
                         queue.push_back(dep);
                     }

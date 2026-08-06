@@ -61,67 +61,131 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     C[row * params.N + col] = sum;
 }
 "#;
-/// Softmax WGSL shader — two-pass approach.
+/// Softmax WGSL shader — one workgroup per row, shared-memory tree reduction.
 ///
-/// Pass 1 (`pass1_exp`): For each row, find max, compute exp(x - max), store result.
-/// Pass 2 (`pass2_normalize`): For each row, compute sum of exps, divide each element.
+/// [a7-18] The previous kernel gave one *thread* to each row and ran two
+/// dispatches over it: a serial max scan plus an exp write, then a serial sum
+/// plus a normalize. Because `SOFTMAX_DIM_THRESHOLD` is 1000, the GPU was only
+/// ever used when every thread had to make at least 1000 strided, dependent
+/// global-memory accesses — adjacent lanes read addresses `row_len` apart, so
+/// essentially every access touched its own cache line. A
+/// `[1, 32, 1024, 1024]` attention softmax was 32_768 threads each walking
+/// ~4096 elements four times.
 ///
-/// Layout: input[num_rows * row_len], output[num_rows * row_len], params = { num_rows, row_len }.
-/// Each workgroup thread handles one row.
+/// This version assigns one 256-thread *workgroup* to each row and fuses both
+/// passes into a single dispatch, mirroring `LAYER_NORM_SHADER`:
+///
+/// 1. each thread scans its strided slice for a local max, then a shared-memory
+///    tree reduction produces the row max;
+/// 2. each thread writes `exp(x - row_max)` for its slice and accumulates a
+///    local sum, then a second tree reduction produces the row sum;
+/// 3. each thread scales its own slice by `1 / sum`.
+///
+/// Adjacent lanes now read adjacent addresses, so the accesses coalesce, and
+/// the row is traversed three times instead of four across one dispatch
+/// instead of two.
+///
+/// Layout: input[num_rows * row_len], output[num_rows * row_len],
+/// params = { num_rows, row_len, wg_per_row, _pad }.
+///
+/// `wg_per_row` is the grid's X extent: more rows than the device allows along
+/// a single dimension are dispatched as a 2-D grid and the row index is rebuilt
+/// as `wid.y * wg_per_row + wid.x`, exactly like the LayerNorm kernel. The old
+/// kernel indexed rows with `gid.x` alone and had to decline outright whenever
+/// a second dimension was needed.
 pub(super) const SOFTMAX_SHADER: &str = r#"
 struct Params {
     num_rows: u32,
     row_len: u32,
+    wg_per_row: u32,
+    _pad: u32,
 }
+
+const WG_SIZE: u32 = 256u;
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-@compute @workgroup_size(64)
-fn pass1_exp(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= params.num_rows) { return; }
-    let base = row * params.row_len;
+var<workgroup> shared_data: array<f32, 256>;
 
-    // Find row max for numerical stability.
-    var max_val: f32 = input[base];
-    for (var i: u32 = 1u; i < params.row_len; i++) {
+@compute @workgroup_size(256)
+fn softmax_rows(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let row = wid.y * params.wg_per_row + wid.x;
+    if (row >= params.num_rows) { return; }
+    let tid = lid.x;
+    let n = params.row_len;
+    let base = row * n;
+
+    // Phase 1: row max. Seeding every thread with element 0 (always present —
+    // the host declines rows shorter than SOFTMAX_DIM_THRESHOLD) keeps threads
+    // with no slice of their own from contributing a sentinel, and matches the
+    // old kernel's `v > max_val` comparison so NaNs are dropped identically.
+    var local_max: f32 = input[base];
+    for (var i: u32 = tid; i < n; i = i + WG_SIZE) {
         let v = input[base + i];
-        if (v > max_val) { max_val = v; }
+        if (v > local_max) { local_max = v; }
+    }
+    shared_data[tid] = local_max;
+    workgroupBarrier();
+
+    for (var s: u32 = WG_SIZE / 2u; s > 0u; s = s / 2u) {
+        if (tid < s) {
+            let other = shared_data[tid + s];
+            if (other > shared_data[tid]) { shared_data[tid] = other; }
+        }
+        workgroupBarrier();
     }
 
-    // Compute exp(x - max).
-    for (var i: u32 = 0u; i < params.row_len; i++) {
-        output[base + i] = exp(input[base + i] - max_val);
+    let row_max = shared_data[0];
+    // Every thread has read shared_data[0]; the barrier keeps the phase-2
+    // writes below from racing ahead of a slower lane's read.
+    workgroupBarrier();
+
+    // Phase 2: exp(x - row_max) into the output, accumulating the row sum.
+    var local_sum: f32 = 0.0;
+    for (var i: u32 = tid; i < n; i = i + WG_SIZE) {
+        let e = exp(input[base + i] - row_max);
+        output[base + i] = e;
+        local_sum = local_sum + e;
     }
-}
+    shared_data[tid] = local_sum;
+    workgroupBarrier();
 
-@compute @workgroup_size(64)
-fn pass2_normalize(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= params.num_rows) { return; }
-    let base = row * params.row_len;
-
-    // Sum of exps.
-    var sum_val: f32 = 0.0;
-    for (var i: u32 = 0u; i < params.row_len; i++) {
-        sum_val += output[base + i];
+    for (var s: u32 = WG_SIZE / 2u; s > 0u; s = s / 2u) {
+        if (tid < s) {
+            shared_data[tid] = shared_data[tid] + shared_data[tid + s];
+        }
+        workgroupBarrier();
     }
 
-    // Normalize.
-    let inv_sum = 1.0 / sum_val;
-    for (var i: u32 = 0u; i < params.row_len; i++) {
+    let inv_sum = 1.0 / shared_data[0];
+    workgroupBarrier();
+
+    // Phase 3: normalize. Each thread touches exactly the indices it wrote in
+    // phase 2, so no cross-thread ordering is involved.
+    for (var i: u32 = tid; i < n; i = i + WG_SIZE) {
         output[base + i] = output[base + i] * inv_sum;
     }
 }
 "#;
 /// Element-wise WGSL shader — relu, sigmoid, gelu, tanh, exp, sqrt, abs, neg, log, silu, leaky_relu.
 ///
-/// Layout: input[len], output[len], params = { len, _pad }.
+/// Layout: input[len], output[len], params = { len, alpha, row_threads, _pad }.
+///
+/// `row_threads` is `grid_x * 256`: dispatches wider than
+/// `max_compute_workgroups_per_dimension` are issued as a 2-D grid and the flat
+/// element index is rebuilt as `gid.y * row_threads + gid.x` (which degenerates
+/// to `gid.x` for the common single-row case). `alpha` carries the LeakyRelu
+/// slope from the node's attribute instead of baking a constant into the kernel.
 pub(super) const ELEMENTWISE_SHADER: &str = r#"
 struct Params {
     len: u32,
+    alpha: f32,
+    row_threads: u32,
     _pad: u32,
 }
 
@@ -129,23 +193,27 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
+fn flat_index(gid: vec3<u32>) -> u32 {
+    return gid.y * params.row_threads + gid.x;
+}
+
 @compute @workgroup_size(256)
 fn relu(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = max(input[idx], 0.0);
 }
 
 @compute @workgroup_size(256)
 fn sigmoid(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = 1.0 / (1.0 + exp(-input[idx]));
 }
 
 @compute @workgroup_size(256)
 fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     let x = input[idx];
     // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -156,49 +224,49 @@ fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn op_tanh(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = tanh(input[idx]);
 }
 
 @compute @workgroup_size(256)
 fn op_exp(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = exp(input[idx]);
 }
 
 @compute @workgroup_size(256)
 fn op_sqrt(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = sqrt(input[idx]);
 }
 
 @compute @workgroup_size(256)
 fn op_abs(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = abs(input[idx]);
 }
 
 @compute @workgroup_size(256)
 fn op_neg(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = -input[idx];
 }
 
 @compute @workgroup_size(256)
 fn op_log(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = log(input[idx]);
 }
 
 @compute @workgroup_size(256)
 fn silu(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     let x = input[idx];
     output[idx] = x / (1.0 + exp(-x));
@@ -206,10 +274,10 @@ fn silu(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn leaky_relu(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     let x = input[idx];
-    output[idx] = select(0.01 * x, x, x >= 0.0);
+    output[idx] = select(params.alpha * x, x, x >= 0.0);
 }
 "#;
 /// Reduction WGSL shader — reduce_sum and reduce_max along an axis.
@@ -222,18 +290,22 @@ struct Params {
     outer_size: u32,
     axis_len: u32,
     inner_size: u32,
-    _pad: u32,
+    row_threads: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
+fn flat_index(gid: vec3<u32>) -> u32 {
+    return gid.y * params.row_threads + gid.x;
+}
+
 @compute @workgroup_size(256)
 fn reduce_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat_idx = gid.x;
+    let flat_idx = flat_index(gid);
     let total_out = params.outer_size * params.inner_size;
-    if (flat_idx >= total_out) { return; }
+    if (flat_idx >= total_out || params.axis_len == 0u || params.inner_size == 0u) { return; }
 
     let outer = flat_idx / params.inner_size;
     let inner = flat_idx % params.inner_size;
@@ -248,9 +320,9 @@ fn reduce_sum(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn reduce_max(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat_idx = gid.x;
+    let flat_idx = flat_index(gid);
     let total_out = params.outer_size * params.inner_size;
-    if (flat_idx >= total_out) { return; }
+    if (flat_idx >= total_out || params.axis_len == 0u || params.inner_size == 0u) { return; }
 
     let outer = flat_idx / params.inner_size;
     let inner = flat_idx % params.inner_size;
@@ -266,9 +338,9 @@ fn reduce_max(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn reduce_min(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat_idx = gid.x;
+    let flat_idx = flat_index(gid);
     let total_out = params.outer_size * params.inner_size;
-    if (flat_idx >= total_out) { return; }
+    if (flat_idx >= total_out || params.axis_len == 0u || params.inner_size == 0u) { return; }
 
     let outer = flat_idx / params.inner_size;
     let inner = flat_idx % params.inner_size;
@@ -284,9 +356,9 @@ fn reduce_min(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn reduce_mean(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let flat_idx = gid.x;
+    let flat_idx = flat_index(gid);
     let total_out = params.outer_size * params.inner_size;
-    if (flat_idx >= total_out) { return; }
+    if (flat_idx >= total_out || params.axis_len == 0u || params.inner_size == 0u) { return; }
 
     let outer = flat_idx / params.inner_size;
     let inner = flat_idx % params.inner_size;
@@ -301,10 +373,15 @@ fn reduce_mean(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 /// Binary element-wise WGSL shader — add, mul.
 ///
-/// Layout: a[len], b[len], output[len], params = { len, _pad }.
+/// Layout: a[len], b[len], output[len], params = { len, alpha (unused), row_threads, _pad }.
+///
+/// Shares the [`EwParams`](crate::shaders) uniform layout with the unary kernels;
+/// `row_threads` reconstructs the flat index for 2-D dispatch grids.
 pub(super) const BINARY_ELEMENTWISE_SHADER: &str = r#"
 struct Params {
     len: u32,
+    alpha: f32,
+    row_threads: u32,
     _pad: u32,
 }
 
@@ -313,16 +390,20 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
+fn flat_index(gid: vec3<u32>) -> u32 {
+    return gid.y * params.row_threads + gid.x;
+}
+
 @compute @workgroup_size(256)
 fn op_add(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = a[idx] + b[idx];
 }
 
 @compute @workgroup_size(256)
 fn op_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = flat_index(gid);
     if (idx >= params.len) { return; }
     output[idx] = a[idx] * b[idx];
 }
@@ -409,7 +490,7 @@ struct Params {
     n_elements: u32,
     batch_count: u32,
     eps: f32,
-    _pad: u32,
+    wg_per_row: u32,
 }
 
 const WG_SIZE: u32 = 256u;
@@ -427,7 +508,10 @@ fn layer_norm(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
-    let instance = wid.x;
+    // One workgroup per normalization instance. More instances than the device
+    // allows along a single dimension are dispatched as a 2-D grid, so rebuild
+    // the instance index from both components (`wg_per_row` is the X extent).
+    let instance = wid.y * params.wg_per_row + wid.x;
     if (instance >= params.batch_count) { return; }
     let tid = lid.x;
     let n = params.n_elements;
@@ -435,7 +519,6 @@ fn layer_norm(
 
     // Phase 1: parallel sum for mean
     var local_sum: f32 = 0.0;
-    var idx: u32 = tid;
     for (var step: u32 = 0u; step < n; step = step + WG_SIZE) {
         let i = tid + step;
         if (i < n) {
@@ -500,6 +583,10 @@ struct Params {
     channels: u32,
     spatial_size: u32,
     eps: f32,
+    row_threads: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
@@ -512,8 +599,9 @@ struct Params {
 
 @compute @workgroup_size(256)
 fn batch_norm(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+    let idx = gid.y * params.row_threads + gid.x;
     if (idx >= params.total_elements) { return; }
+    if (params.spatial_size == 0u || params.channels == 0u) { return; }
 
     // Determine channel: layout [N, C, spatial_size]
     let channel = (idx / params.spatial_size) % params.channels;
@@ -536,7 +624,7 @@ pub(super) const TRANSPOSE_SHADER: &str = r#"
 struct Params {
     total_elements: u32,
     ndim: u32,
-    _pad0: u32,
+    row_threads: u32,
     _pad1: u32,
 }
 
@@ -547,7 +635,7 @@ struct Params {
 
 @compute @workgroup_size(256)
 fn transpose_op(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let out_idx = gid.x;
+    let out_idx = gid.y * params.row_threads + gid.x;
     if (out_idx >= params.total_elements) { return; }
 
     let ndim = params.ndim;
@@ -559,6 +647,9 @@ fn transpose_op(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     for (var d: u32 = 0u; d < ndim; d = d + 1u) {
         let out_stride = perm_data[ndim + d];
+        // The host validates that every dimension is non-zero, so strides are
+        // always >= 1; guard anyway so a corrupt buffer cannot divide by zero.
+        if (out_stride == 0u) { return; }
         let coord = remaining / out_stride;
         remaining = remaining % out_stride;
 

@@ -53,15 +53,6 @@ fn node_with_int_attrs(op: OpKind, pairs: &[(&str, i64)]) -> Node {
     n
 }
 
-#[allow(dead_code)]
-fn node_with_float_attrs(op: OpKind, pairs: &[(&str, f32)]) -> Node {
-    let mut n = dummy_node(op);
-    for &(k, v) in pairs {
-        n.attrs.floats.insert(k.to_string(), v);
-    }
-    n
-}
-
 fn assert_tensor_eq(a: &Tensor, b: &Tensor, label: &str) {
     assert_eq!(a.shape, b.shape, "{label}: shape mismatch");
     assert_eq!(a.data.len(), b.data.len(), "{label}: data len mismatch");

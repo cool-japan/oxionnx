@@ -113,12 +113,13 @@ fn test_transpose_2d() -> Result<(), OnnxError> {
 }
 
 #[test]
-fn test_squeeze_unsqueeze() {
+fn test_squeeze_unsqueeze() -> Result<(), OnnxError> {
     let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![1, 3, 1]);
-    let sq = squeeze(&x, &[]);
+    let sq = squeeze(&x, &[])?;
     assert_eq!(sq.shape, vec![3]);
-    let un = unsqueeze(&sq, &[0, 2]);
+    let un = unsqueeze(&sq, &[0, 2])?;
     assert_eq!(un.shape, vec![1, 3, 1]);
+    Ok(())
 }
 
 #[test]

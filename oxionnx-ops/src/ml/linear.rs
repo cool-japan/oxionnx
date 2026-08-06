@@ -3,10 +3,11 @@
 use oxionnx_core::{OnnxError, OpContext, Tensor};
 
 use super::post_transform::{logistic_inplace, probit_inplace, softmax_rows};
+use super::shape::batch_dims;
 
 /// ONNX-ML LinearClassifier operator.
 ///
-/// Input 0: X \[N, features\]
+/// Input 0: X \[N, features\] (a 1-D \[C\] input is one sample with C features)
 /// Output 0: predicted labels (as f32)
 /// Output 1: class scores \[N, num_classes\]
 pub fn linear_classifier(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
@@ -29,12 +30,12 @@ pub fn linear_classifier(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> 
     let post_transform = attrs.s("post_transform");
 
     // Determine dimensions
-    let n = x.shape[0];
-    let features = if x.shape.len() > 1 {
-        x.shape[1]
-    } else {
-        x.numel() / n
-    };
+    let (n, features) = batch_dims(x, "LinearClassifier")?;
+    if features == 0 {
+        return Err(OnnxError::ShapeMismatch(
+            "LinearClassifier: input has zero features".into(),
+        ));
+    }
 
     // Number of classes: from class labels or inferred from coefficients
     let num_classes = if !class_labels_ints.is_empty() {
@@ -65,7 +66,11 @@ pub fn linear_classifier(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> 
             let w_offset = j * features;
             let x_offset = i * features;
             for f in 0..features {
-                val += x.data[x_offset + f] * coefficients[w_offset + f];
+                // Coefficient lists shorter than num_targets * features are
+                // malformed; treat the missing weights as zero rather than
+                // indexing out of bounds.
+                val +=
+                    x.data[x_offset + f] * coefficients.get(w_offset + f).copied().unwrap_or(0.0);
             }
             if j < intercepts.len() {
                 val += intercepts[j];
@@ -125,7 +130,7 @@ pub fn linear_classifier(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> 
 
 /// ONNX-ML LinearRegressor operator.
 ///
-/// Input 0: X \[N, features\]
+/// Input 0: X \[N, features\] (a 1-D \[C\] input is one sample with C features)
 /// Output 0: Y \[N, targets\]
 pub fn linear_regressor(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
     let x = ctx.input(0)?;
@@ -144,12 +149,12 @@ pub fn linear_regressor(ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
 
     let post_transform = attrs.s("post_transform");
 
-    let n = x.shape[0];
-    let features = if x.shape.len() > 1 {
-        x.shape[1]
-    } else {
-        x.numel() / n
-    };
+    let (n, features) = batch_dims(x, "LinearRegressor")?;
+    if features == 0 {
+        return Err(OnnxError::ShapeMismatch(
+            "LinearRegressor: input has zero features".into(),
+        ));
+    }
 
     // Number of targets
     let targets_attr = attrs.i("targets", 0);

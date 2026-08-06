@@ -98,12 +98,22 @@ impl Operator for TransposeOp {
     }
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let x = ctx.input(0)?;
-        let perm: Vec<usize> = ctx
-            .attrs()
-            .ints("perm")
+        let ndim = x.ndim();
+        let raw_perm = ctx.attrs().ints("perm");
+        // Validate before casting: a raw negative i64 cast straight to `usize` wraps to a huge
+        // value, which then indexes `x.shape`/strides out of bounds inside `shape::transpose`.
+        let perm: Vec<usize> = raw_perm
             .iter()
-            .map(|&v| v as usize)
-            .collect();
+            .map(|&v| {
+                if v < 0 || v >= ndim as i64 {
+                    Err(OnnxError::ShapeMismatch(format!(
+                        "Transpose: perm entry {v} out of range for {ndim}D tensor"
+                    )))
+                } else {
+                    Ok(v as usize)
+                }
+            })
+            .collect::<Result<_, _>>()?;
         Ok(vec![shape::transpose(x, &perm)?])
     }
     fn supports_output_slots(&self) -> bool {
@@ -125,7 +135,7 @@ impl Operator for SqueezeOp {
         } else {
             ctx.attrs().ints("axes").to_vec()
         };
-        Ok(vec![shape::squeeze(x, &axes)])
+        Ok(vec![shape::squeeze(x, &axes)?])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -139,43 +149,14 @@ impl Operator for SqueezeOp {
             return Ok(());
         }
         let x = ctx.input(0)?;
-        let ndim = x.ndim();
         let raw_axes: Vec<i64> = if let Some(t) = ctx.optional_input(1) {
             t.data.iter().map(|&v| v as i64).collect()
         } else {
             ctx.attrs().ints("axes").to_vec()
         };
-        let resolved_axes: Vec<usize> = if raw_axes.is_empty() {
-            (0..ndim).filter(|&i| x.shape[i] == 1).collect()
-        } else {
-            raw_axes
-                .iter()
-                .map(|&a| {
-                    if a < 0 {
-                        (a + ndim as i64) as usize
-                    } else {
-                        a as usize
-                    }
-                })
-                .collect()
-        };
-        let new_shape: Vec<usize> = x
-            .shape
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &d)| {
-                if resolved_axes.contains(&i) && d == 1 {
-                    None
-                } else {
-                    Some(d)
-                }
-            })
-            .collect();
-        let new_shape = if new_shape.is_empty() {
-            vec![1]
-        } else {
-            new_shape
-        };
+        // Delegate to the same validated axis-resolution logic `execute()` uses via
+        // `shape::squeeze`, rather than re-deriving (and risking re-diverging) it here.
+        let new_shape = shape::basic::resolve_squeeze_shape(&x.shape, &raw_axes)?;
         let slot = &mut slots[0];
         if slot.data.len() != x.data.len() {
             slot.data.resize(x.data.len(), 0.0_f32);
@@ -200,7 +181,7 @@ impl Operator for UnsqueezeOp {
         } else {
             ctx.attrs().ints("axes").to_vec()
         };
-        Ok(vec![shape::unsqueeze(x, &axes)])
+        Ok(vec![shape::unsqueeze(x, &axes)?])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -219,17 +200,10 @@ impl Operator for UnsqueezeOp {
         } else {
             ctx.attrs().ints("axes").to_vec()
         };
-        let mut new_shape = x.shape.clone();
-        let mut sorted_axes = raw_axes.clone();
-        sorted_axes.sort();
-        for &ax in &sorted_axes {
-            let ax = if ax < 0 {
-                (ax + new_shape.len() as i64 + 1) as usize
-            } else {
-                ax as usize
-            };
-            new_shape.insert(ax, 1);
-        }
+        // Delegate to the same validated axis-resolution logic `execute()` uses via
+        // `shape::unsqueeze` (normalizes negative axes against the OUTPUT rank, bounds-checks,
+        // and rejects duplicates), rather than re-deriving it here against the growing shape.
+        let new_shape = shape::basic::resolve_unsqueeze_shape(&x.shape, &raw_axes)?;
         let slot = &mut slots[0];
         if slot.data.len() != x.data.len() {
             slot.data.resize(x.data.len(), 0.0_f32);
@@ -265,14 +239,11 @@ impl Operator for FlattenOp {
         }
         let x = ctx.input(0)?;
         let axis = ctx.attrs().i("axis", 1);
-        let ndim = x.ndim();
-        let ax = if axis < 0 {
-            (axis + ndim as i64) as usize
-        } else {
-            axis as usize
-        };
-        let outer: usize = x.shape[..ax].iter().product::<usize>().max(1);
-        let inner: usize = x.shape[ax..].iter().product::<usize>().max(1);
+        // Delegate to the same validated (outer, inner) resolution `execute()` uses via
+        // `shape::flatten`: correct for both the inclusive `[-r, r]` axis range Flatten allows
+        // and for genuinely zero-size dims (no `.max(1)` clamp corrupting the shape/data
+        // invariant).
+        let (outer, inner) = shape::basic::resolve_flatten_shape(&x.shape, axis)?;
         let new_shape = vec![outer, inner];
         let slot = &mut slots[0];
         if slot.data.len() != x.data.len() {

@@ -163,34 +163,52 @@ pub fn cached_flash_attention(
         let scale = 1.0 / (head_dim as f32).sqrt();
         let mut output = vec![0.0f32; batch * num_heads * d_v];
 
-        let mut scores = vec![0.0f32; full_seq];
-        let mut out_row = vec![0.0f32; d_v];
+        // Every (batch, head) pair is independent — for a 32-head model with a
+        // few thousand cached keys that is enough work to be worth rayon.
+        // Causal mask: for new_seq=1 the query sits at position full_seq-1 and
+        // all cached keys 0..full_seq are valid, so no masking is needed in the
+        // standard autoregressive case.
+        let head_step = |bh: usize, scores: &mut [f32], out_row: &mut [f32]| {
+            let q_off = bh * head_dim; // new_seq=1
+            let k_off = bh * full_seq * head_dim;
+            let v_off = bh * full_seq * d_v;
 
-        for b in 0..batch {
-            for h in 0..num_heads {
-                let bh = b * num_heads + h;
-                let q_off = bh * head_dim; // new_seq=1
-                let k_off = bh * full_seq * head_dim;
-                let v_off = bh * full_seq * d_v;
+            // scores[j] = dot(q, k_j) * scale — SIMD via compute_qk_scores
+            let q_row = &q.data[q_off..q_off + head_dim];
+            let k_mat = &full_k.data[k_off..k_off + full_seq * head_dim];
+            compute_scores(q_row, k_mat, scale, head_dim, full_seq, scores);
 
-                // scores[j] = dot(q, k_j) * scale  — SIMD via compute_qk_scores
-                let q_row = &q.data[q_off..q_off + head_dim];
-                let k_mat = &full_k.data[k_off..k_off + full_seq * head_dim];
-                compute_scores(q_row, k_mat, scale, head_dim, full_seq, &mut scores);
+            // softmax in-place — SIMD via softmax_inplace
+            apply_softmax(scores);
 
-                // Causal mask: for new_seq=1 the query sits at position
-                // full_seq-1 and all cached keys 0..full_seq are valid, so no
-                // masking needed in the standard autoregressive case.
+            // output = scores @ full_v — SIMD via weighted_sum_v
+            let v_mat = &full_v.data[v_off..v_off + full_seq * d_v];
+            accumulate_v(scores, v_mat, d_v, full_seq, out_row);
+        };
 
-                // softmax in-place — SIMD via softmax_inplace
-                apply_softmax(&mut scores);
-
-                // output = scores @ full_v  — SIMD via weighted_sum_v
-                let v_mat = &full_v.data[v_off..v_off + full_seq * d_v];
-                accumulate_v(&scores, v_mat, d_v, full_seq, &mut out_row);
-
-                let o_off = bh * d_v;
-                output[o_off..o_off + d_v].copy_from_slice(&out_row);
+        if d_v != 0 {
+            #[cfg(not(target_arch = "wasm32"))]
+            if crate::attention::gemm::should_parallelize(
+                batch * num_heads,
+                full_seq * (head_dim + d_v),
+            ) {
+                use rayon::prelude::*;
+                output.par_chunks_mut(d_v).enumerate().for_each_init(
+                    || vec![0.0f32; full_seq],
+                    |scores, (bh, out_row)| head_step(bh, scores, out_row),
+                );
+            } else {
+                let mut scores = vec![0.0f32; full_seq];
+                for (bh, out_row) in output.chunks_mut(d_v).enumerate() {
+                    head_step(bh, &mut scores, out_row);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let mut scores = vec![0.0f32; full_seq];
+                for (bh, out_row) in output.chunks_mut(d_v).enumerate() {
+                    head_step(bh, &mut scores, out_row);
+                }
             }
         }
 

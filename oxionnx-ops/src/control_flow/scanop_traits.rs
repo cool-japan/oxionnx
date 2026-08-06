@@ -13,7 +13,7 @@ use oxionnx_core::operator::{OpContext, Operator};
 use oxionnx_core::tensor::Tensor;
 use std::collections::HashMap;
 
-use super::functions::{execute_subgraph, slice_along_axis, stack_tensors_axis0};
+use super::functions::{execute_subgraph, move_axis0_to, slice_along_axis, stack_tensors_axis0};
 use super::types::ScanOp;
 
 impl Operator for ScanOp {
@@ -43,12 +43,30 @@ impl Operator for ScanOp {
         for i in num_state..total_inputs {
             scan_inputs.push(ctx.input(i)?);
         }
+        // scan_input_axes: ONNX spec allows negative values ("counting
+        // dimensions from the back", range [-r, r-1] where r = rank of that
+        // *specific* scan input -- ranks may differ across scan inputs, so
+        // each entry is normalized against its own tensor's rank rather than
+        // cast blindly with `as usize` (which would wrap a negative value to
+        // near-usize::MAX and always fail the bounds check downstream).
         let scan_input_axes_attr = ctx.attrs().ints("scan_input_axes");
-        let scan_input_axes: Vec<usize> = if scan_input_axes_attr.is_empty() {
-            vec![0; num_scan_inputs]
-        } else {
-            scan_input_axes_attr.iter().map(|&x| x as usize).collect()
-        };
+        let mut scan_input_axes: Vec<usize> = Vec::with_capacity(num_scan_inputs);
+        for (si, scan_tensor) in scan_inputs.iter().enumerate() {
+            let raw_axis = scan_input_axes_attr.get(si).copied().unwrap_or(0);
+            let rank = scan_tensor.shape.len() as i64;
+            let normalized = if raw_axis < 0 {
+                raw_axis + rank
+            } else {
+                raw_axis
+            };
+            if normalized < 0 || normalized >= rank {
+                return Err(OnnxError::InvalidModel(format!(
+                    "Scan: scan_input_axis {} out of range for scan input {} (rank {})",
+                    raw_axis, si, rank
+                )));
+            }
+            scan_input_axes.push(normalized as usize);
+        }
         let scan_input_dirs_attr = ctx.attrs().ints("scan_input_directions");
         let scan_input_dirs: Vec<i64> = if scan_input_dirs_attr.is_empty() {
             vec![0; num_scan_inputs]
@@ -58,14 +76,9 @@ impl Operator for ScanOp {
         let first_scan = scan_inputs
             .first()
             .ok_or_else(|| OnnxError::InvalidModel("Scan: no scan inputs".into()))?;
-        let scan_axis = scan_input_axes.first().copied().unwrap_or(0);
-        if scan_axis >= first_scan.shape.len() {
-            return Err(OnnxError::InvalidModel(format!(
-                "Scan: scan_input_axis {} >= rank {}",
-                scan_axis,
-                first_scan.shape.len()
-            )));
-        }
+        // scan_input_axes[0] was already validated above against
+        // scan_inputs[0]'s (== first_scan's) own rank.
+        let scan_axis = scan_input_axes[0];
         let seq_len = first_scan.shape[scan_axis];
         let body = ctx
             .attrs()
@@ -132,14 +145,49 @@ impl Operator for ScanOp {
                 accumulator.push(scan_out.clone());
             }
         }
+        // scan_output_axes: the axis (per output, default 0) at which the new
+        // "iteration" axis is inserted into the stacked result. Negative
+        // values count from the back of the *output* rank (per-iteration
+        // rank + 1), per spec range [-r, r-1].
+        //
+        // scan_output_directions: 0 = append (forward iteration order), 1 =
+        // prepend (each iteration's value is placed before the previous
+        // ones, i.e. the accumulated order is reversed relative to
+        // iteration order) -- default 0 for every scan output.
+        let scan_output_axes_attr = ctx.attrs().ints("scan_output_axes");
+        let scan_output_dirs_attr = ctx.attrs().ints("scan_output_directions");
+
         let mut final_outputs = states;
-        for accumulator in scan_accumulators {
+        for (i, mut accumulator) in scan_accumulators.into_iter().enumerate() {
             if accumulator.is_empty() {
                 final_outputs.push(Tensor::new(vec![], vec![0]));
-            } else {
-                let stacked = stack_tensors_axis0(&accumulator)?;
-                final_outputs.push(stacked);
+                continue;
             }
+            let direction = scan_output_dirs_attr.get(i).copied().unwrap_or(0);
+            if direction != 0 {
+                accumulator.reverse();
+            }
+            let stacked = stack_tensors_axis0(&accumulator)?;
+
+            let raw_axis = scan_output_axes_attr.get(i).copied().unwrap_or(0);
+            let out_rank = stacked.shape.len() as i64;
+            let normalized_axis = if raw_axis < 0 {
+                raw_axis + out_rank
+            } else {
+                raw_axis
+            };
+            if normalized_axis < 0 || normalized_axis >= out_rank {
+                return Err(OnnxError::InvalidModel(format!(
+                    "Scan: scan_output_axis {} out of range for scan output {} (rank {})",
+                    raw_axis, i, out_rank
+                )));
+            }
+            let placed = if normalized_axis == 0 {
+                stacked
+            } else {
+                move_axis0_to(&stacked, normalized_axis as usize)?
+            };
+            final_outputs.push(placed);
         }
         Ok(final_outputs)
     }

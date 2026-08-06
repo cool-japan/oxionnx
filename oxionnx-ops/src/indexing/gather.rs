@@ -1,5 +1,7 @@
 use oxionnx_core::Tensor;
 
+use super::index_util::{normalize_axis, normalize_index};
+
 /// Gather elements from `data` along `axis` using `indices`.
 ///
 /// For axis=0 (embedding lookup):
@@ -9,14 +11,7 @@ use oxionnx_core::Tensor;
 ///   output[i, j, k, ...] = data[i, indices[i, j, k, ...], k, ...]
 pub fn gather(data: &Tensor, indices: &Tensor, axis: i64) -> Result<Tensor, String> {
     let ndim = data.ndim();
-    let ax = if axis < 0 {
-        (axis + ndim as i64) as usize
-    } else {
-        axis as usize
-    };
-    if ax >= ndim {
-        return Err(format!("gather: axis {ax} out of range for {ndim}D tensor"));
-    }
+    let ax = normalize_axis(axis, ndim, "gather")?;
 
     // Output shape = data.shape[:ax] + indices.shape + data.shape[ax+1:]
     let out_shape: Vec<usize> = data.shape[..ax]
@@ -35,17 +30,7 @@ pub fn gather(data: &Tensor, indices: &Tensor, axis: i64) -> Result<Tensor, Stri
 
     for o in 0..outer {
         for (ii, &idx_val) in indices.data.iter().enumerate() {
-            let idx = idx_val as i64;
-            let idx = if idx < 0 {
-                (idx + axis_size as i64) as usize
-            } else {
-                idx as usize
-            };
-            if idx >= axis_size {
-                return Err(format!(
-                    "gather: index {idx} out of bounds for axis size {axis_size}"
-                ));
-            }
+            let idx = normalize_index(idx_val, axis_size, "gather")?;
             let src_base = o * axis_size * inner + idx * inner;
             let dst_base = o * idx_n * inner + ii * inner;
             out[dst_base..dst_base + inner].copy_from_slice(&data.data[src_base..src_base + inner]);
@@ -59,11 +44,7 @@ pub fn gather(data: &Tensor, indices: &Tensor, axis: i64) -> Result<Tensor, Stri
 /// `output[i][j][k] = input[index[i][j][k]]` for axis=0
 pub fn gather_elements(data: &Tensor, indices: &Tensor, axis: i64) -> Result<Tensor, String> {
     let ndim = data.ndim();
-    let ax = if axis < 0 {
-        (axis + ndim as i64) as usize
-    } else {
-        axis as usize
-    };
+    let ax = normalize_axis(axis, ndim, "gather_elements")?;
 
     if data.shape.len() != indices.shape.len() {
         return Err("gather_elements: data and indices must have same rank".into());
@@ -86,6 +67,7 @@ pub fn gather_elements(data: &Tensor, indices: &Tensor, axis: i64) -> Result<Ten
         s *= indices.shape[i];
     }
 
+    let axis_size = data.shape[ax];
     for (flat, out_val) in out.iter_mut().enumerate() {
         // Decode flat index in indices tensor
         let mut rem = flat;
@@ -94,14 +76,19 @@ pub fn gather_elements(data: &Tensor, indices: &Tensor, axis: i64) -> Result<Ten
             let coord = rem / idx_strides[d];
             rem %= idx_strides[d];
             if d == ax {
-                let idx_val = indices.data[flat] as i64;
-                let idx_val = if idx_val < 0 {
-                    (idx_val + data.shape[ax] as i64) as usize
-                } else {
-                    idx_val as usize
-                };
+                let idx_val = normalize_index(indices.data[flat], axis_size, "gather_elements")?;
                 data_flat += idx_val * data_strides[d];
             } else {
+                // `indices` need only match `data`'s rank, not its exact
+                // per-dimension sizes; a malformed model could still supply
+                // a non-axis dimension larger than `data`'s, which would
+                // otherwise read past the end of `data.data`.
+                if coord >= data.shape[d] {
+                    return Err(format!(
+                        "gather_elements: indices shape {:?} exceeds data shape {:?} on non-axis dim {d}",
+                        indices.shape, data.shape
+                    ));
+                }
                 data_flat += coord * data_strides[d];
             }
         }
@@ -115,6 +102,11 @@ pub fn gather_elements(data: &Tensor, indices: &Tensor, axis: i64) -> Result<Ten
 /// data: any shape, indices: [..., K] where K <= data.ndim - batch_dims
 /// output shape: indices.shape[:-1] + data.shape[batch_dims + K:]
 pub fn gather_nd(data: &Tensor, indices: &Tensor, batch_dims: i64) -> Result<Tensor, String> {
+    if batch_dims < 0 {
+        return Err(format!(
+            "gather_nd: batch_dims must be non-negative, got {batch_dims}"
+        ));
+    }
     let bd = batch_dims as usize;
     let ind_ndim = indices.ndim();
     if ind_ndim == 0 {
@@ -122,7 +114,10 @@ pub fn gather_nd(data: &Tensor, indices: &Tensor, batch_dims: i64) -> Result<Ten
     }
     let last_dim = indices.shape[ind_ndim - 1]; // K
 
-    if bd + last_dim > data.ndim() {
+    let combined_dims = bd.checked_add(last_dim).ok_or_else(|| {
+        format!("gather_nd: batch_dims ({bd}) + last_index_dim ({last_dim}) overflows")
+    })?;
+    if combined_dims > data.ndim() {
         return Err(format!(
             "gather_nd: batch_dims ({bd}) + last_index_dim ({last_dim}) exceeds data ndim ({})",
             data.ndim()
@@ -144,9 +139,10 @@ pub fn gather_nd(data: &Tensor, indices: &Tensor, batch_dims: i64) -> Result<Ten
         out_shape.push(data.shape[d]);
     }
 
-    if out_shape.is_empty() {
-        out_shape.push(1);
-    }
+    // No `[1]` promotion when all three contributions above are empty: `indices.shape[:-1] +
+    // data.shape[batch_dims + K:]` working out empty means every index addresses one whole
+    // element, which ONNX specifies as a rank-0 output. `out_numel` below is unaffected — the
+    // empty shape's product is the empty product 1, the single element such a gather yields.
 
     let slice_size: usize = if bd + last_dim < data.ndim() {
         data.shape[bd + last_dim..].iter().product()
@@ -201,8 +197,22 @@ pub fn gather_nd(data: &Tensor, indices: &Tensor, batch_dims: i64) -> Result<Ten
 
 /// Core Gather loop: writes gathered values into a pre-allocated `out` buffer.
 ///
-/// Caller must ensure `out.len() == out_shape.iter().product()`.
-pub(crate) fn gather_into(data: &Tensor, indices_data: &[f32], axis: usize, out: &mut [f32]) {
+/// Caller must ensure `out.len() == out_shape.iter().product()`. Returns an
+/// error for any out-of-range axis or index (instead of clamping to the
+/// last row), so this output-slot dispatch path agrees with `gather`'s
+/// error behavior rather than silently substituting the wrong element.
+pub(crate) fn gather_into(
+    data: &Tensor,
+    indices_data: &[f32],
+    axis: usize,
+    out: &mut [f32],
+) -> Result<(), String> {
+    if axis >= data.shape.len() {
+        return Err(format!(
+            "gather: axis {axis} out of range for {}D tensor",
+            data.shape.len()
+        ));
+    }
     let outer: usize = data.shape[..axis].iter().product::<usize>().max(1);
     let axis_size = data.shape[axis];
     let inner: usize = data.shape[axis + 1..].iter().product::<usize>().max(1);
@@ -210,18 +220,11 @@ pub(crate) fn gather_into(data: &Tensor, indices_data: &[f32], axis: usize, out:
 
     for o in 0..outer {
         for (ii, &idx_val) in indices_data.iter().enumerate() {
-            let idx = idx_val as i64;
-            let idx = if idx < 0 {
-                (idx + axis_size as i64) as usize
-            } else {
-                idx as usize
-            };
-            // Clamp to bounds to avoid panics; callers that need error detection
-            // should use `gather` instead.
-            let idx = idx.min(axis_size.saturating_sub(1));
+            let idx = normalize_index(idx_val, axis_size, "gather")?;
             let src_base = o * axis_size * inner + idx * inner;
             let dst_base = o * idx_n * inner + ii * inner;
             out[dst_base..dst_base + inner].copy_from_slice(&data.data[src_base..src_base + inner]);
         }
     }
+    Ok(())
 }

@@ -14,43 +14,72 @@ fn grid_to_pixel(grid_val: f32, size: usize, align_corners: bool) -> f32 {
 }
 
 /// Apply padding mode to a coordinate.
-fn apply_padding(coord: f32, size: usize, padding_mode: &str) -> f32 {
+///
+/// `align_corners` only changes `"reflection"`. PyTorch's
+/// `grid_sampler_compute_source_index` reflects about `[0, size-1]` when
+/// `align_corners` is true, but about the pixel-*edge* interval
+/// `[-0.5, size-0.5]` when it is false (`reflect_coordinates` with
+/// `twice_low = -1, twice_high = 2*size - 1`), and then **unconditionally**
+/// clamps the reflected value into `[0, size-1]` before it is used as a
+/// sample coordinate — the fold alone can still leave a value in `[-0.5, 0)`
+/// or `(size-1, size-0.5]` when `align_corners` is false. That trailing
+/// clamp is a no-op for `align_corners = true` (the fold already lands in
+/// `[0, size-1]` there — verified: the two reflect formulas agree on every
+/// input) but is load-bearing for `align_corners = false`: bilinear/nearest
+/// happen to self-heal without it (their one or two candidate indices near
+/// the boundary all clamp to the same pixel in `get()` below regardless), but
+/// bicubic's four-tap window does not, and silently mis-weights the result.
+fn apply_padding(coord: f32, size: usize, padding_mode: &str, align_corners: bool) -> f32 {
     let s = size as f32;
     match padding_mode {
         "border" => coord.clamp(0.0, s - 1.0),
         "reflection" => {
-            let max_val = if size <= 1 { 0.0 } else { s - 1.0 };
-            if max_val == 0.0 {
+            if size <= 1 {
                 return 0.0;
             }
-            // Reflect: map into [0, 2*max_val], then fold back
-            let mut c = coord;
+            let (lo, hi) = if align_corners {
+                (0.0, s - 1.0)
+            } else {
+                (-0.5, s - 0.5)
+            };
+            // Reflect: map into [lo, lo + 2*span], then fold back to [lo, hi].
+            let span = hi - lo;
+            let period = 2.0 * span;
+            let mut c = (coord - lo) % period;
             if c < 0.0 {
-                c = -c;
+                c += period;
             }
-            let period = 2.0 * max_val;
-            c %= period;
-            if c > max_val {
+            if c > span {
                 c = period - c;
             }
-            c
+            (c + lo).clamp(0.0, s - 1.0)
         }
         _ => coord, // "zeros" - will be handled by bounds check
     }
 }
 
-/// Sample from input using bilinear interpolation.
-fn sample_bilinear(
-    input: &[f32],
+/// Shared read-only context for the three interpolation samplers: the source
+/// feature-map plane plus the padding configuration used to resolve
+/// out-of-bounds coordinates.
+///
+/// Bundled into one struct (rather than threading `input`/`c_offset`/`h_in`/
+/// `w_in`/`padding_mode`/`align_corners` through each sampler individually)
+/// so adding `align_corners` for reflection padding does not push
+/// `sample_bilinear`/`sample_nearest`/`sample_bicubic` over clippy's
+/// `too_many_arguments` threshold.
+struct SampleCtx<'a> {
+    input: &'a [f32],
     c_offset: usize,
     h_in: usize,
     w_in: usize,
-    y: f32,
-    x: f32,
-    padding_mode: &str,
-) -> f32 {
-    let y = apply_padding(y, h_in, padding_mode);
-    let x = apply_padding(x, w_in, padding_mode);
+    padding_mode: &'a str,
+    align_corners: bool,
+}
+
+/// Sample from input using bilinear interpolation.
+fn sample_bilinear(ctx: &SampleCtx<'_>, y: f32, x: f32) -> f32 {
+    let y = apply_padding(y, ctx.h_in, ctx.padding_mode, ctx.align_corners);
+    let x = apply_padding(x, ctx.w_in, ctx.padding_mode, ctx.align_corners);
 
     let y0 = y.floor() as i64;
     let x0 = x.floor() as i64;
@@ -63,17 +92,17 @@ fn sample_bilinear(
     let hx = 1.0 - lx;
 
     let get = |iy: i64, ix: i64| -> f32 {
-        if iy < 0 || iy >= h_in as i64 || ix < 0 || ix >= w_in as i64 {
-            if padding_mode == "zeros" {
+        if iy < 0 || iy >= ctx.h_in as i64 || ix < 0 || ix >= ctx.w_in as i64 {
+            if ctx.padding_mode == "zeros" {
                 0.0
             } else {
                 // border/reflection already clamped
-                let iy_c = iy.clamp(0, h_in as i64 - 1) as usize;
-                let ix_c = ix.clamp(0, w_in as i64 - 1) as usize;
-                input[c_offset + iy_c * w_in + ix_c]
+                let iy_c = iy.clamp(0, ctx.h_in as i64 - 1) as usize;
+                let ix_c = ix.clamp(0, ctx.w_in as i64 - 1) as usize;
+                ctx.input[ctx.c_offset + iy_c * ctx.w_in + ix_c]
             }
         } else {
-            input[c_offset + iy as usize * w_in + ix as usize]
+            ctx.input[ctx.c_offset + iy as usize * ctx.w_in + ix as usize]
         }
     };
 
@@ -81,31 +110,23 @@ fn sample_bilinear(
 }
 
 /// Sample from input using nearest neighbor.
-fn sample_nearest(
-    input: &[f32],
-    c_offset: usize,
-    h_in: usize,
-    w_in: usize,
-    y: f32,
-    x: f32,
-    padding_mode: &str,
-) -> f32 {
-    let y = apply_padding(y, h_in, padding_mode);
-    let x = apply_padding(x, w_in, padding_mode);
+fn sample_nearest(ctx: &SampleCtx<'_>, y: f32, x: f32) -> f32 {
+    let y = apply_padding(y, ctx.h_in, ctx.padding_mode, ctx.align_corners);
+    let x = apply_padding(x, ctx.w_in, ctx.padding_mode, ctx.align_corners);
 
     let iy = y.round() as i64;
     let ix = x.round() as i64;
 
-    if iy < 0 || iy >= h_in as i64 || ix < 0 || ix >= w_in as i64 {
-        if padding_mode == "zeros" {
+    if iy < 0 || iy >= ctx.h_in as i64 || ix < 0 || ix >= ctx.w_in as i64 {
+        if ctx.padding_mode == "zeros" {
             0.0
         } else {
-            let iy_c = iy.clamp(0, h_in as i64 - 1) as usize;
-            let ix_c = ix.clamp(0, w_in as i64 - 1) as usize;
-            input[c_offset + iy_c * w_in + ix_c]
+            let iy_c = iy.clamp(0, ctx.h_in as i64 - 1) as usize;
+            let ix_c = ix.clamp(0, ctx.w_in as i64 - 1) as usize;
+            ctx.input[ctx.c_offset + iy_c * ctx.w_in + ix_c]
         }
     } else {
-        input[c_offset + iy as usize * w_in + ix as usize]
+        ctx.input[ctx.c_offset + iy as usize * ctx.w_in + ix as usize]
     }
 }
 
@@ -123,45 +144,68 @@ fn cubic_weight(x: f32) -> f32 {
 }
 
 /// Sample from input using bicubic interpolation.
-fn sample_bicubic(
-    input: &[f32],
-    c_offset: usize,
-    h_in: usize,
-    w_in: usize,
-    y: f32,
-    x: f32,
-    padding_mode: &str,
-) -> f32 {
-    let y = apply_padding(y, h_in, padding_mode);
-    let x = apply_padding(x, w_in, padding_mode);
+///
+/// Unlike bilinear/nearest — whose 1- or 2-wide tap window always collapses
+/// onto the same clamped border pixel once the *query* coordinate itself has
+/// been folded into `[0, size-1]`, so folding it once up front and then just
+/// clamping an occasional one-pixel-OOB neighbor is exact — bicubic's 4-wide
+/// window can still reach 2 pixels past the boundary even when the query
+/// coordinate is safely in range, with a non-zero weight on that tap. PyTorch
+/// (`get_value_bounded` / `compute_coordinates` in
+/// `aten/src/ATen/native/GridSampler.h`) therefore folds/clamps each of the
+/// 16 taps *independently*, while the interpolation weights come from the
+/// fractional part of the *raw* (un-padded) query coordinate. Folding the
+/// query coordinate once and then merely clamping individual out-of-range
+/// taps — correct for bilinear/nearest — silently mis-weights bicubic near
+/// any border/reflection edge. Verified against `torch.nn.functional.
+/// grid_sample` (bicubic, both padding modes, both `align_corners` values).
+fn sample_bicubic(ctx: &SampleCtx<'_>, y_raw: f32, x_raw: f32) -> f32 {
+    let iy_nw = y_raw.floor();
+    let ix_nw = x_raw.floor();
+    let ty = y_raw - iy_nw;
+    let tx = x_raw - ix_nw;
 
-    let iy = y.floor() as i64;
-    let ix = x.floor() as i64;
-    let fy = y - iy as f32;
-    let fx = x - ix as f32;
-
-    let get = |dy: i64, dx: i64| -> f32 {
-        let py = iy + dy;
-        let px = ix + dx;
-        if py < 0 || py >= h_in as i64 || px < 0 || px >= w_in as i64 {
-            if padding_mode == "zeros" {
+    let tap = |dy: i64, dx: i64| -> f32 {
+        // Fold/clamp this tap's own coordinate (border/reflection); "zeros"
+        // passes it through unchanged and is handled by the bounds check below.
+        let y = apply_padding(
+            iy_nw + dy as f32,
+            ctx.h_in,
+            ctx.padding_mode,
+            ctx.align_corners,
+        );
+        let x = apply_padding(
+            ix_nw + dx as f32,
+            ctx.w_in,
+            ctx.padding_mode,
+            ctx.align_corners,
+        );
+        // Border/reflection already folded `y`/`x` into [0, size-1], where
+        // truncation and floor agree; "zeros" may still be out of range,
+        // handled explicitly below (a saturating cast is fine there — any
+        // out-of-i64-range magnitude is already out of the valid tensor
+        // bounds either way).
+        let iy = y as i64;
+        let ix = x as i64;
+        if iy < 0 || iy >= ctx.h_in as i64 || ix < 0 || ix >= ctx.w_in as i64 {
+            if ctx.padding_mode == "zeros" {
                 0.0
             } else {
-                let py_c = py.clamp(0, h_in as i64 - 1) as usize;
-                let px_c = px.clamp(0, w_in as i64 - 1) as usize;
-                input[c_offset + py_c * w_in + px_c]
+                let iy_c = iy.clamp(0, ctx.h_in as i64 - 1) as usize;
+                let ix_c = ix.clamp(0, ctx.w_in as i64 - 1) as usize;
+                ctx.input[ctx.c_offset + iy_c * ctx.w_in + ix_c]
             }
         } else {
-            input[c_offset + py as usize * w_in + px as usize]
+            ctx.input[ctx.c_offset + iy as usize * ctx.w_in + ix as usize]
         }
     };
 
     let mut val = 0.0f32;
     for dy in -1i64..=2 {
-        let wy = cubic_weight(fy - dy as f32);
+        let wy = cubic_weight(ty - dy as f32);
         for dx in -1i64..=2 {
-            let wx = cubic_weight(fx - dx as f32);
-            val += wy * wx * get(dy, dx);
+            let wx = cubic_weight(tx - dx as f32);
+            val += wy * wx * tap(dy, dx);
         }
     }
     val
@@ -229,14 +273,18 @@ pub fn grid_sample(
                     let c_off = ni * input_batch_stride + ci * input_channel_stride;
                     let out_idx = ni * out_batch_stride + ci * out_channel_stride + ho * w_out + wo;
 
+                    let ctx = SampleCtx {
+                        input: &input.data,
+                        c_offset: c_off,
+                        h_in,
+                        w_in,
+                        padding_mode,
+                        align_corners,
+                    };
                     output[out_idx] = match mode {
-                        "nearest" => {
-                            sample_nearest(&input.data, c_off, h_in, w_in, py, px, padding_mode)
-                        }
-                        "bicubic" => {
-                            sample_bicubic(&input.data, c_off, h_in, w_in, py, px, padding_mode)
-                        }
-                        _ => sample_bilinear(&input.data, c_off, h_in, w_in, py, px, padding_mode),
+                        "nearest" => sample_nearest(&ctx, py, px),
+                        "bicubic" => sample_bicubic(&ctx, py, px),
+                        _ => sample_bilinear(&ctx, py, px),
                     };
                 }
             }

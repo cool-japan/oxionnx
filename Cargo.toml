@@ -3,7 +3,7 @@ members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu", "oxion
 resolver = "2"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
 license = "Apache-2.0"
@@ -13,22 +13,22 @@ homepage = "https://github.com/cool-japan/oxionnx"
 rust-version = "1.75"
 
 [workspace.dependencies]
-oxionnx-core = { path = "oxionnx-core", version = "0.1.4" }
+oxionnx-core = { path = "oxionnx-core", version = "0.1.5" }
 ndarray = { version = "0.17" }
-oxionnx-ops = { path = "oxionnx-ops", version = "0.1.4" }
-oxionnx-proto = { path = "oxionnx-proto", version = "0.1.4" }
-oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.4" }
-oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.4" }
-oxionnx-directml = { path = "oxionnx-directml", version = "0.1.4" }
-oxionnx-coreml = { path = "oxionnx-coreml", version = "0.1.4" }
+oxionnx-ops = { path = "oxionnx-ops", version = "0.1.5" }
+oxionnx-proto = { path = "oxionnx-proto", version = "0.1.5" }
+oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.5" }
+oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.5" }
+oxionnx-directml = { path = "oxionnx-directml", version = "0.1.5" }
+oxionnx-coreml = { path = "oxionnx-coreml", version = "0.1.5" }
 # OxiCUDA stack
-oxifft = "0.3.2"
-oxicuda-driver = { version = "0.1.8" }
-oxicuda-memory = { version = "0.1.8" }
-oxicuda-blas = { version = "0.1.8" }
-oxicuda-dnn = { version = "0.1.8" }
-oxicuda-ptx = { version = "0.1.8" }
-oxicuda-launch = { version = "0.1.8" }
+oxifft = "0.4.2"
+oxicuda-driver = { version = "0.5.3" }
+oxicuda-memory = { version = "0.5.3" }
+oxicuda-blas = { version = "0.5.3" }
+oxicuda-dnn = { version = "0.5.3" }
+oxicuda-ptx = { version = "0.5.3" }
+oxicuda-launch = { version = "0.5.3" }
 thiserror = "2"
 half = "2.7"
 matrixmultiply = "0.3"
@@ -40,11 +40,19 @@ pollster = "0.4"
 tracing = "0.1"
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 memmap2 = "0.9"
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 console_error_panic_hook = "0.1.7"
+# Apple platform FFI (CoreML execution provider + smoke-test examples)
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-ml = "0.3.2"
+objc2-core-video = "0.3.2"
+block2 = "0.6"
+# Windows platform FFI (DirectML execution provider)
+windows = "0.62"
 
 [package]
 name = "oxionnx"
@@ -61,6 +69,13 @@ description = "Pure Rust ONNX inference engine — zero C/C++ dependencies"
 keywords = ["onnx", "inference", "deep-learning", "machine-learning", "pure-rust"]
 categories = ["science", "algorithms"]
 
+# cargo-udeps analyzes the host target; these three are real dependencies of
+# src/wasm.rs but every use is behind `#[cfg(target_arch = "wasm32")]`, so a
+# host-target (e.g. macOS) udeps run never sees them referenced and false-flags
+# them as unused. Confirmed genuinely used (not dead) — see src/wasm.rs.
+[package.metadata.cargo-udeps.ignore]
+normal = ["console_error_panic_hook", "js-sys", "wasm-bindgen"]
+
 [dependencies]
 oxionnx-core = { workspace = true }
 oxionnx-ops = { workspace = true }
@@ -70,6 +85,7 @@ oxionnx-cuda = { workspace = true, optional = true }
 oxionnx-directml = { workspace = true, optional = true }
 oxionnx-coreml = { workspace = true, optional = true }
 half = { workspace = true }
+hashbrown = { workspace = true }
 matrixmultiply = { workspace = true }
 bytemuck = { workspace = true }
 tracing = { workspace = true }
@@ -104,10 +120,10 @@ proptest = { workspace = true }
 ndarray = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-core-ml = "0.3.2"
-block2 = "0.6"
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-core-ml = { workspace = true }
+block2 = { workspace = true }
 
 [[example]]
 name = "coreml_arcface_smoke"

@@ -1,31 +1,39 @@
 # oxionnx-ops
 
-Operator implementations for OxiONNX -- 165 ONNX operators in Pure Rust.
+Operator implementations for OxiONNX -- 188 ONNX operators in Pure Rust (203 including
+`ai.onnx.ml.*` and legacy-name aliases).
 
 This crate contains the actual computation logic for every ONNX operator supported
 by OxiONNX. Each operator implements the `oxionnx_core::Operator` trait and is
-registered via `default_registry()`.
+registered via `default_registry()`. Implementations are checked against ONNX spec edge
+cases rather than just the common case -- e.g. `Slice`'s negative `start`/`end`/`step`,
+`Pad`'s opset-18 `axes` input and `wrap` mode, `GRU`'s default `linear_before_reset=0`
+gate ordering, `ScatterElements`/`ScatterND`'s `reduction` attribute, per-channel
+`QuantizeLinear`/`DequantizeLinear` via the `axis` attribute, and `TreeEnsemble*`'s
+cycle-guard/NaN-routing/MIN-MAX aggregate handling.
 
 ## Operator Categories
 
-- **Math** -- MatMul, Gemm, Add, Sub, Mul, Div, Pow, Sqrt, trig functions, reductions (Sum, Mean, Max, Min, Prod), TopK, CumSum, Einsum, and more.
-- **Neural Network** -- Softmax, Relu, Sigmoid, Tanh, Gelu, SiLU, LayerNorm, BatchNorm, GroupNorm, RMSNorm, HardSigmoid, HardSwish, Dropout, LRN.
-- **Convolution** -- Conv, ConvTranspose, MaxPool, AveragePool, GlobalAveragePool.
-- **Shape** -- Reshape, Transpose, Squeeze, Unsqueeze, Flatten, Concat, Slice, Gather, Scatter, Split, Expand, Tile, Pad, and more.
+- **Math** -- MatMul, Gemm, Add, Sub, Mul, Div, Pow, Sqrt, trig functions, reductions (Sum, Mean, Max, Min, Prod), TopK, CumSum, Einsum, Det, and more.
+- **Neural Network** -- Softmax, Relu, Sigmoid, Tanh, Gelu, SiLU, LayerNorm, BatchNorm, GroupNorm, RMSNorm, HardSigmoid, HardSwish, Dropout, LRN. `Softmax`/`LogSoftmax`/`Hardmax` are opset-aware (pre-13 default-axis-1-plus-flatten-to-2D vs. opset-13+ direct per-axis reduction).
+- **Convolution** -- Conv, ConvTranspose (rank-generic 1D/2D/3D via `conv::conv`/`conv::conv_transpose`, plus a dedicated 2D im2col/Winograd fast path), MaxPool, AveragePool, GlobalAveragePool, LpPool, GlobalLpPool, MaxUnpool, MaxRoiPool, Col2Im, CenterCropPad.
+- **Shape** -- Reshape, Transpose, Squeeze, Unsqueeze, Flatten, Concat, Slice, Gather, Scatter, Split, Expand, Tile, Pad, CastLike, and more.
 - **Comparison** -- Equal, Greater, Less, Where, Not, And, Or, Xor.
 - **Control Flow** -- If, Loop, Scan with subgraph execution.
-- **RNN** -- LSTM, GRU.
+- **RNN** -- LSTM, GRU, RNN.
 - **ML** -- LinearClassifier, LinearRegressor, SVMClassifier, TreeEnsembleClassifier, TreeEnsembleRegressor, Normalizer, Scaler, LabelEncoder, OneHotEncoder.
 - **Attention** -- Multi-head attention (fused).
-- **Quantized** -- QLinearConv, QLinearMatMul, QuantizeLinear, DequantizeLinear.
-- **Resize** -- Resize with nearest/linear/cubic coordinate transforms.
+- **Quantized** -- QLinearConv, QLinearMatMul, MatMulInteger, ConvInteger, QuantizeLinear, DequantizeLinear, DynamicQuantizeLinear.
+- **Resize** -- Resize with nearest/linear/cubic coordinate transforms and multiple `nearest_mode`/`coordinate_transformation_mode` variants; Upsample (legacy predecessor).
 - **NMS** -- NonMaxSuppression.
+- **Generators** -- RandomNormal, RandomUniform, RandomNormalLike, RandomUniformLike, Multinomial.
+- **Loss** -- NegativeLogLikelihoodLoss, SoftmaxCrossEntropyLoss.
 
 ## Usage
 
 ```toml
 [dependencies]
-oxionnx-ops = "0.1.4"
+oxionnx-ops = "0.1.5"
 ```
 
 ```rust
@@ -57,7 +65,7 @@ See `oxionnx_core::TypedOpContext` for the dispatch API.
 
 ## IOBinding Slot Reuse (Phase F)
 
-All 121 operators opt into `supports_output_slots = true`. 53 operators implement hand-coded
+Most operators in the registry opt into `supports_output_slots = true`. 53 operators implement hand-coded
 `execute_into_slots` bodies (no memcpy, writes directly into pre-allocated output buffers):
 shape ops (Squeeze, Unsqueeze, Flatten, Expand, Split, Tile, DepthToSpace, SpaceToDepth,
 ReverseSequence), elementwise NN (Clip, LeakyRelu, PRelu, HardSigmoid, Celu, Elu, Selu,
@@ -65,6 +73,24 @@ ThresholdedRelu, LpNorm, MeanVarianceNorm, Hardmax, Shrink), conv/pool (MaxPool,
 GlobalAveragePool, GlobalMaxPool, Pad, Resize), indexing (Gather, ScatterND, ScatterElements),
 plus the 22-operator Phase D/F pilot set. Use `IoBinding` to bind output buffers; pointer
 identity is preserved across inference runs when the output shape is stable.
+
+## Einsum
+
+The equation parser supports numpy-compatible ellipsis (`...`) tokens (e.g.
+`...ij,...jk->...ik` for broadcast batched matmul), right-aligning and broadcasting each
+operand's ellipsis axes the way numpy does. A named label shared across operands now
+broadcasts when one side's extent is `1`, matching `numpy.einsum`, instead of erroring on
+any extent mismatch. Large contractions lower to `matrixmultiply::sgemm` through a greedy
+pairwise decomposition; contractions at or below a small FLOP threshold still run through
+the allocation-free scalar interpreter, which also serves as the GEMM path's test oracle.
+
+## Performance
+
+Small-`M` `MatMul` and attention/flash-attention are routed through `sgemm`
+(`matrixmultiply`) instead of a scalar loop; KV-cache append is in-place instead of
+reallocating; broadcast operands avoid materializing the expanded tensor; convolution's
+im2col path is threaded and cache-blocked, with a persistent Winograd filter-transform
+cache reused across calls; hot maps use `hashbrown`.
 
 ## Part of [oxionnx](https://github.com/cool-japan/oxionnx)
 

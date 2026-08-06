@@ -16,6 +16,15 @@ fn axes_from_ctx(ctx: &OpContext<'_>) -> Vec<i64> {
     }
 }
 
+/// [a0-15/a11-7] Opset-18 `noop_with_empty_axes`: when set and the resolved
+/// axes list is empty (whether because the axes input was omitted entirely
+/// or provided as an explicitly empty tensor -- both collapse to the same
+/// empty `Vec` from `axes_from_ctx`, and the spec treats them identically),
+/// the op is Identity rather than "reduce every dimension".
+fn noop_with_empty_axes(ctx: &OpContext<'_>) -> bool {
+    ctx.attrs().i("noop_with_empty_axes", 0) != 0
+}
+
 macro_rules! reduce_op {
     ($name:ident, $op_type:expr, $func:path, $func_into:path) => {
         pub struct $name;
@@ -26,7 +35,11 @@ macro_rules! reduce_op {
             fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
                 let axes = axes_from_ctx(ctx);
                 let keepdims = ctx.attrs().i("keepdims", 1) != 0;
-                Ok(vec![$func(ctx.input(0)?, &axes, keepdims)?])
+                let x = ctx.input(0)?;
+                if axes.is_empty() && noop_with_empty_axes(ctx) {
+                    return Ok(vec![x.clone()]);
+                }
+                Ok(vec![$func(x, &axes, keepdims)?])
             }
             fn supports_output_slots(&self) -> bool {
                 true
@@ -42,7 +55,19 @@ macro_rules! reduce_op {
                 let axes = axes_from_ctx(ctx);
                 let keepdims = ctx.attrs().i("keepdims", 1) != 0;
                 let x = ctx.input(0)?;
-                let (_, out_len) = math::reduce_output_shape(x, &axes, keepdims);
+                if axes.is_empty() && noop_with_empty_axes(ctx) {
+                    let n = x.numel();
+                    if slots[0].data.len() != n {
+                        slots[0].data.resize(n, 0.0_f32);
+                    }
+                    slots[0].data.copy_from_slice(&x.data);
+                    slots[0].shape.clone_from(&x.shape);
+                    return Ok(());
+                }
+                // Must run (and propagate its error) before touching `slots[0]`: `reduce_output_shape`
+                // validates `axes` before it is used to pre-size the output buffer, so an out-of-range
+                // axis is a typed error here instead of sizing the buffer from a silently-wrong shape.
+                let (_, out_len) = math::reduce_output_shape(x, &axes, keepdims)?;
                 if slots[0].data.len() != out_len {
                     slots[0].data.resize(out_len, 0.0_f32);
                 }
@@ -124,7 +149,13 @@ impl Operator for ArgMaxOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let axis = ctx.attrs().i("axis", 0);
         let keepdims = ctx.attrs().i("keepdims", 0) != 0;
-        Ok(vec![math::arg_max(ctx.input(0)?, axis, keepdims)?])
+        let select_last_index = ctx.attrs().i("select_last_index", 0) != 0;
+        Ok(vec![math::arg_max(
+            ctx.input(0)?,
+            axis,
+            keepdims,
+            select_last_index,
+        )?])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -140,11 +171,23 @@ impl Operator for ArgMaxOp {
         let x = ctx.input(0)?;
         let axis = ctx.attrs().i("axis", 0);
         let keepdims = ctx.attrs().i("keepdims", 0) != 0;
-        let (_, out_len) = math::arg_output_shape(x, axis, keepdims);
+        let select_last_index = ctx.attrs().i("select_last_index", 0) != 0;
+        // Must run (and propagate its error) before touching `slots[0]`:
+        // `arg_output_shape` validates `axis` before it indexes/removes it
+        // from the shape, so an out-of-range axis is now a typed error here
+        // instead of a panic inside that shape computation.
+        let (_, out_len) = math::arg_output_shape(x, axis, keepdims)?;
         if slots[0].data.len() != out_len {
             slots[0].data.resize(out_len, 0.0_f32);
         }
-        slots[0].shape = math::arg_reduce_into(x, axis, keepdims, true, &mut slots[0].data)?;
+        slots[0].shape = math::arg_reduce_into(
+            x,
+            axis,
+            keepdims,
+            true,
+            select_last_index,
+            &mut slots[0].data,
+        )?;
         Ok(())
     }
 }
@@ -157,7 +200,13 @@ impl Operator for ArgMinOp {
     fn execute(&self, ctx: &OpContext<'_>) -> Result<Vec<Tensor>, OnnxError> {
         let axis = ctx.attrs().i("axis", 0);
         let keepdims = ctx.attrs().i("keepdims", 0) != 0;
-        Ok(vec![math::arg_min(ctx.input(0)?, axis, keepdims)?])
+        let select_last_index = ctx.attrs().i("select_last_index", 0) != 0;
+        Ok(vec![math::arg_min(
+            ctx.input(0)?,
+            axis,
+            keepdims,
+            select_last_index,
+        )?])
     }
     fn supports_output_slots(&self) -> bool {
         true
@@ -173,11 +222,21 @@ impl Operator for ArgMinOp {
         let x = ctx.input(0)?;
         let axis = ctx.attrs().i("axis", 0);
         let keepdims = ctx.attrs().i("keepdims", 0) != 0;
-        let (_, out_len) = math::arg_output_shape(x, axis, keepdims);
+        let select_last_index = ctx.attrs().i("select_last_index", 0) != 0;
+        // See `ArgMaxOp::execute_into_slots` above: `arg_output_shape` must
+        // run (and its error propagate) before `slots[0]` is touched.
+        let (_, out_len) = math::arg_output_shape(x, axis, keepdims)?;
         if slots[0].data.len() != out_len {
             slots[0].data.resize(out_len, 0.0_f32);
         }
-        slots[0].shape = math::arg_reduce_into(x, axis, keepdims, false, &mut slots[0].data)?;
+        slots[0].shape = math::arg_reduce_into(
+            x,
+            axis,
+            keepdims,
+            false,
+            select_last_index,
+            &mut slots[0].data,
+        )?;
         Ok(())
     }
 }

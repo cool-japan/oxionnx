@@ -82,7 +82,7 @@ fn test_reduce_prod() -> Result<(), OnnxError> {
 #[test]
 fn test_arg_max() -> Result<(), OnnxError> {
     let t = Tensor::new(vec![1.0, 5.0, 3.0, 2.0, 4.0, 0.0], vec![2, 3]);
-    let idx = arg_max(&t, 1, false)?;
+    let idx = arg_max(&t, 1, false, false)?;
     assert_eq!(idx.shape, vec![2]);
     assert_eq!(idx.data[0], 1.0); // max of [1,5,3] is at index 1
     assert_eq!(idx.data[1], 1.0); // max of [2,4,0] is at index 1
@@ -92,7 +92,7 @@ fn test_arg_max() -> Result<(), OnnxError> {
 #[test]
 fn test_arg_min() -> Result<(), OnnxError> {
     let t = Tensor::new(vec![1.0, 5.0, 3.0, 2.0, 4.0, 0.0], vec![2, 3]);
-    let idx = arg_min(&t, 1, false)?;
+    let idx = arg_min(&t, 1, false, false)?;
     assert_eq!(idx.data[0], 0.0); // min of [1,5,3] is at index 0
     assert_eq!(idx.data[1], 2.0); // min of [2,4,0] is at index 2
     Ok(())
@@ -246,13 +246,18 @@ fn test_mod_op_fmod() {
     assert!((r.data[1] - (-1.0)).abs() < 1e-5); // -7 % 3 = -1
 }
 
+// [a0-13] fmod=0 is ONNX's default and specifies numpy.mod semantics (result
+// takes the sign of the divisor), NOT C's truncated modulo (sign of the
+// dividend) -- this test previously asserted the latter, which was the bug.
+// Renamed from `test_mod_op_truncated` to `test_mod_op_floored` to match
+// what fmod=0 actually computes.
 #[test]
-fn test_mod_op_truncated() {
+fn test_mod_op_floored() {
     let a = Tensor::new(vec![7.0, -7.0], vec![2]);
     let b = Tensor::new(vec![3.0], vec![1]);
-    let r = mod_op(&a, &b, 0).expect("mod_op truncated failed");
-    assert!((r.data[0] - 1.0).abs() < 1e-5);
-    assert!((r.data[1] - (-1.0)).abs() < 1e-5);
+    let r = mod_op(&a, &b, 0).expect("mod_op floored failed");
+    assert!((r.data[0] - 1.0).abs() < 1e-5); // 7 mod 3 = 1
+    assert!((r.data[1] - 2.0).abs() < 1e-5); // -7 mod 3 = 2 (sign follows divisor, not dividend)
 }
 
 #[test]
