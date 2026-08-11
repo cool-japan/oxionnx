@@ -29,6 +29,9 @@ pub mod rnn;
 pub(crate) mod rnn_typed;
 pub mod shape;
 pub mod spatial;
+/// Cross-platform wall-clock time (`SystemTime` panics at runtime on
+/// wasm32-unknown-unknown; see the module docs). Internal only.
+mod time_compat;
 pub mod typed_ops;
 
 pub use registry::default_registry;

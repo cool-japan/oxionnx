@@ -18,7 +18,7 @@ use oxionnx_core::{OnnxError, Tensor};
 
 use crate::attention::core::qk_scores_block;
 use crate::attention::gemm::matmul_nn_into;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 use crate::attention::gemm::should_parallelize;
 use crate::attention::scaled_dot_product_attention;
 
@@ -220,7 +220,7 @@ pub fn flash_attention_with_block_size(
     // early return above — with a zero-length output chunk there is nothing to
     // compute, so skip the drivers entirely.
     if bh_stride_o != 0 {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if should_parallelize(
             batch * num_heads,
             seq_q
@@ -265,7 +265,7 @@ pub fn flash_attention_with_block_size(
                 &mut output,
             );
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
         flash_serial(
             q,
             k,

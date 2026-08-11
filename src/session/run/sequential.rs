@@ -506,7 +506,7 @@ impl Session {
             })
             .collect();
 
-        let start = std::time::Instant::now();
+        let start = crate::time_compat::Instant::now();
         let Some(f16_result) =
             super::super::mixed_precision::execute_elementwise_f16(op_name, &input_refs)
         else {
@@ -594,7 +594,7 @@ impl Session {
             return Ok(false);
         };
 
-        let started = std::time::Instant::now();
+        let started = crate::time_compat::Instant::now();
         match oxionnx_cuda::try_cuda_dispatch(node, &self.weights, state.as_map(), cuda_ctx) {
             Ok(Some(results)) => {
                 let elapsed = started.elapsed();
@@ -632,7 +632,7 @@ impl Session {
             return Ok(false);
         };
 
-        let started = std::time::Instant::now();
+        let started = crate::time_compat::Instant::now();
         match oxionnx_directml::try_directml_dispatch(node, &self.weights, state.as_map(), dml_ctx)
         {
             Ok(Some(results)) => {
@@ -681,7 +681,7 @@ impl Session {
             return Ok(false);
         };
 
-        let started = std::time::Instant::now();
+        let started = crate::time_compat::Instant::now();
         let dispatched = super::super::gpu_dispatch::try_gpu_dispatch(
             node,
             &self.weights,

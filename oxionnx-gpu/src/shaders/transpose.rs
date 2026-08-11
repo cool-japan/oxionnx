@@ -1,11 +1,10 @@
 //! GPU-accelerated general Transpose with arbitrary permutation.
 
 use crate::context::GpuContext;
-use wgpu::util::DeviceExt;
 
 use super::common::{
-    checked_storage_bytes, plan_dispatch, read_back_and_recycle, ErrorScope, TransposeParams,
-    TRANSPOSE_GPU_THRESHOLD, WG_SIZE,
+    block_on_gpu, checked_storage_bytes, plan_dispatch, read_back_and_recycle_async, ErrorScope,
+    TransposeParams, TRANSPOSE_GPU_THRESHOLD, WG_SIZE,
 };
 
 // ========================================================================
@@ -37,7 +36,7 @@ fn is_valid_perm(perm: &[usize], ndim: usize) -> bool {
 /// Returns `None` if below threshold, if `perm` is not a permutation of
 /// `0..shape.len()`, or on error — the CPU operator then reports the malformed
 /// attribute as a typed error.
-pub fn gpu_transpose(
+pub async fn gpu_transpose_async(
     ctx: &GpuContext,
     input: &[f32],
     shape: &[usize],
@@ -93,29 +92,39 @@ pub fn gpu_transpose(
         return None;
     }
     let grid = plan_dispatch(&ctx.limits, total as u64, WG_SIZE)?;
+    // Input, output and read-back staging; the stride metadata is negligible.
+    if !ctx.budget_admits(&[out_size, out_size, out_size]) {
+        return None;
+    }
 
     let scope = ErrorScope::begin(ctx);
 
-    let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("tr_input"),
-        contents: bytemuck::cast_slice(&input[..total]),
-        usage: wgpu::BufferUsages::STORAGE,
+    let input_buf = ctx.upload_buffer(
+        "tr_input",
+        bytemuck::cast_slice(&input[..total]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
+
+    let output_buf = ctx.pooled_buffer(
+        out_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    )?;
+    // The pool may hand back a buffer up to 2x `out_size` -- see
+    // `GpuBufferPool::get_buffer` -- and `as_entire_binding()` would then bind
+    // that larger size, which can exceed `max_storage_buffer_binding_size`
+    // even though `out_size` itself was validated. Bind the exact range
+    // instead, as `conv2d::gpu_conv2d_implicit_resident_async`'s `output_binding` does.
+    let output_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &output_buf,
+        offset: 0,
+        size: wgpu::BufferSize::new(out_size),
     });
 
-    let output_buf = {
-        let mut pool = ctx.pool.lock().ok()?;
-        pool.get_buffer(
-            device,
-            out_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        )
-    };
-
-    let meta_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("tr_meta"),
-        contents: bytemuck::cast_slice(&meta_data),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let meta_buf = ctx.upload_buffer(
+        "tr_meta",
+        bytemuck::cast_slice(&meta_data),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
     let params = TransposeParams {
         total_elements: total_u32,
@@ -123,18 +132,13 @@ pub fn gpu_transpose(
         row_threads: grid.threads_per_row,
         _pad1: 0,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("tr_params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "tr_params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("tr_staging"),
-        size: out_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging_buf = ctx.staging_buffer("tr_staging", out_size)?;
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tr_bg"),
@@ -146,7 +150,7 @@ pub fn gpu_transpose(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: output_buf.as_entire_binding(),
+                resource: output_binding,
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -174,9 +178,21 @@ pub fn gpu_transpose(
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    if !scope.finish(ctx) {
+    if !scope.finish_async(ctx).await {
         return None;
     }
 
-    read_back_and_recycle(ctx, &staging_buf, total, output_buf)
+    read_back_and_recycle_async(ctx, &staging_buf, total, output_buf).await
+}
+
+/// Blocking form of [`gpu_transpose_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
+pub fn gpu_transpose(
+    ctx: &GpuContext,
+    data: &[f32],
+    shape: &[usize],
+    perm: &[usize],
+) -> Option<Vec<f32>> {
+    block_on_gpu(gpu_transpose_async(ctx, data, shape, perm))
 }

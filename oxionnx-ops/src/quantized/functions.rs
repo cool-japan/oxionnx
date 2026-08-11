@@ -70,7 +70,7 @@ pub fn quantized_matmul(a: &Tensor, b: &QuantizedTensor) -> Result<Tensor, OnnxE
         let compute = |i: usize, out_row: &mut [f32]| {
             per_tensor_row(&a_data[i * k..(i + 1) * k], b_data, out_row, k, scale, zp);
         };
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if m >= 4 {
             use rayon::prelude::*;
             out.par_chunks_mut(n)
@@ -81,7 +81,7 @@ pub fn quantized_matmul(a: &Tensor, b: &QuantizedTensor) -> Result<Tensor, OnnxE
                 compute(i, row);
             }
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
         for (i, row) in out.chunks_mut(n).enumerate() {
             compute(i, row);
         }
@@ -102,7 +102,7 @@ pub fn quantized_matmul(a: &Tensor, b: &QuantizedTensor) -> Result<Tensor, OnnxE
                 &ch_zp,
             );
         };
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if m >= 4 {
             use rayon::prelude::*;
             out.par_chunks_mut(n)
@@ -113,7 +113,7 @@ pub fn quantized_matmul(a: &Tensor, b: &QuantizedTensor) -> Result<Tensor, OnnxE
                 compute(i, row);
             }
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
         for (i, row) in out.chunks_mut(n).enumerate() {
             compute(i, row);
         }
@@ -204,7 +204,8 @@ fn fully_quantized_row_fast(
 /// Sequential pass over every row for [`fully_quantized_row_fast`], reusing
 /// one `row_acc` scratch buffer across all `m` rows. Used directly when
 /// there's too little row-level work to amortise rayon's dispatch, and
-/// unconditionally on wasm32 (where rayon is not a dependency).
+/// unconditionally on a serial wasm32 build (where rayon is not a
+/// dependency — see the crate's `wasm-threads` feature).
 fn fully_quantized_sequential_fast(
     a_data: &[i8],
     b_data: &[i8],
@@ -333,7 +334,7 @@ pub fn fully_quantized_matmul(
 
     if a_zp == 0 && b_zp == 0 {
         let mut out = vec![0.0f32; m * n];
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if m >= 4 {
             use rayon::prelude::*;
             out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
@@ -350,7 +351,7 @@ pub fn fully_quantized_matmul(
         } else {
             fully_quantized_sequential_fast(a_data, b_data, &mut out, k, n, output_scale);
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
         fully_quantized_sequential_fast(a_data, b_data, &mut out, k, n, output_scale);
         return Ok(Tensor::new(out, vec![m, n]));
     }
@@ -367,7 +368,7 @@ pub fn fully_quantized_matmul(
     let k_zp_product = k as i32 * a_zp * b_zp;
     let mut out = vec![0.0f32; m * n];
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     if m >= 4 {
         use rayon::prelude::*;
         out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
@@ -401,7 +402,7 @@ pub fn fully_quantized_matmul(
             output_scale,
         );
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
     fully_quantized_sequential_corrected(
         a_data,
         b_data,

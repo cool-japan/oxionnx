@@ -33,7 +33,7 @@ cycle-guard/NaN-routing/MIN-MAX aggregate handling.
 
 ```toml
 [dependencies]
-oxionnx-ops = "0.1.5"
+oxionnx-ops = "0.1.6"
 ```
 
 ```rust

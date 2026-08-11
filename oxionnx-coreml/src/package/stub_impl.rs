@@ -2,6 +2,8 @@
 //! [`CoreMLError::UnsupportedPlatform`](crate::error::CoreMLError::UnsupportedPlatform),
 //! preserving the API surface so dependent crates compile portably.
 
+use std::path::PathBuf;
+
 use super::*;
 
 /// Stub that always fails on non-macOS targets.  Present so callers can
@@ -13,6 +15,14 @@ pub struct MlPackageModel {
 impl MlPackageModel {
     /// Always returns [`CoreMLError::UnsupportedPlatform`].
     pub fn load(_path: impl AsRef<Path>, _compute_units: MlComputeUnits) -> Result<Self> {
+        Err(CoreMLError::UnsupportedPlatform)
+    }
+
+    /// Always returns [`CoreMLError::UnsupportedPlatform`] — there is
+    /// no CoreML compiler on this target, so there is nothing to
+    /// compile and nothing to cache.  Present for API parity with the
+    /// Apple-platform pre-warm entry point.
+    pub fn ensure_compiled(_path: impl AsRef<Path>) -> Result<PathBuf> {
         Err(CoreMLError::UnsupportedPlatform)
     }
 

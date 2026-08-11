@@ -259,6 +259,16 @@ pub enum OpKind {
     SoftmaxCrossEntropyLoss,
     // Fused ops (optimizer-generated)
     ConvAddRelu,
+    /// Spatial (per-`(n, c)`) mean/variance normalisation without the affine
+    /// term: `(x - mean) / sqrt(var + epsilon)` over `shape[2..]`.
+    ///
+    /// Emitted by the `fuse_instance_norm` optimizer pass for AdaIN-style
+    /// graphs whose normalisation is exported as a `ReduceMean → Sub → … →
+    /// Sqrt → Div → Mul` chain rather than an `InstanceNormalization` node.
+    /// It is *not* `InstanceNormalization`: that op takes mandatory `scale`
+    /// and `B` operands, whereas here the affine factors are runtime tensors
+    /// (Gemm outputs) that stay as separate `Mul`/`Add` nodes.
+    OxiInstanceNorm,
     // Unknown (logged but skipped gracefully)
     Unknown(String),
 }
@@ -469,6 +479,7 @@ impl OpKind {
             "SoftmaxCrossEntropyLoss" => Self::SoftmaxCrossEntropyLoss,
             // Fused ops (optimizer-generated)
             "ConvAddRelu" => Self::ConvAddRelu,
+            "OxiInstanceNorm" => Self::OxiInstanceNorm,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -674,6 +685,7 @@ impl OpKind {
             Self::SoftmaxCrossEntropyLoss => "SoftmaxCrossEntropyLoss",
             // Fused ops (optimizer-generated)
             Self::ConvAddRelu => "ConvAddRelu",
+            Self::OxiInstanceNorm => "OxiInstanceNorm",
             Self::Unknown(s) => s.as_str(),
         }
     }

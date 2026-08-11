@@ -13,9 +13,20 @@
 //! from the outside — the exact complaint this file exists to fix. Every test
 //! below instead calls [`ctx_or_panic`], which panics with a named message if
 //! no adapter is reachable, so a CI machine that lost its Metal/Vulkan/DX12
-//! adapter reports FAILED for this file, not a quiet 0-signal pass. This is
-//! confirmed reachable in this environment: `GpuContext::try_new()` returns
-//! `Some` here (Apple M3 / Metal — see `adapter_is_reachable_in_this_environment`).
+//! adapter reports FAILED for this file, not a quiet 0-signal pass.
+//!
+//! That loud failure is only worth the noise if the adapter really is meant to
+//! be there, so the requirement is stated rather than assumed: `GpuContext`
+//! asks for `Backends::VULKAN` *only* on Linux (`requested_backends` in
+//! `src/context/types.rs`) — no GL fallback — so a Linux host needs both an ICD
+//! (e.g. `/usr/share/vulkan/icd.d/nvidia_icd.json`, shipped with the driver)
+//! **and** the Vulkan loader `libvulkan.so.1` (Debian/Ubuntu: `libvulkan1`),
+//! which is a separate package the driver does not pull in. Installed driver +
+//! missing loader enumerates zero adapters and fails every test here, which
+//! looks like 17 broken kernels and is not; [`ctx_or_panic`]'s message names
+//! that case. Verified reachable on the current host — Vulkan / NVIDIA RTX
+//! A4000 (discrete), driver 550.144.03 — see
+//! `adapter_is_reachable_in_this_environment`.
 //!
 //! ## Boundary shapes
 //!
@@ -68,7 +79,10 @@ fn ctx_or_panic() -> GpuContext {
         None => panic!(
             "no wgpu adapter available (Vulkan/Metal/DX12) -- this test cannot verify \
              anything without one and is failing loudly rather than silently passing. \
-             See oxionnx-gpu/tests/w3_gpu_kernel_parity.rs module docs."
+             On Linux this crate requests Vulkan only, so a host with a working driver \
+             can still land here with zero adapters when the loader `libvulkan.so.1` \
+             (Debian/Ubuntu package `libvulkan1`) is absent -- the driver's ICD alone \
+             is not enough. See oxionnx-gpu/tests/w3_gpu_kernel_parity.rs module docs."
         ),
     }
 }

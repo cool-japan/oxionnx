@@ -100,6 +100,13 @@ impl Deref for ManagedGpuContext {
 impl Drop for ManagedGpuContext {
     fn drop(&mut self) {
         if let Some(ctx) = self.0.take() {
+            // wasm32: no owner thread exists (see the `#[cfg]` on `mod owner`),
+            // so the context is dropped right here, on the single thread that
+            // created it. That is the property the owner thread exists to buy
+            // on native, and the browser gives it for free.
+            #[cfg(target_arch = "wasm32")]
+            drop(ctx);
+            #[cfg(not(target_arch = "wasm32"))]
             owner::dispose(ctx);
         }
     }
@@ -114,11 +121,91 @@ impl Drop for ManagedGpuContext {
 /// alone — it stays the public, synchronous, single-call entry point
 /// `oxionnx-gpu`'s own tests (and any caller outside a `Session`) use
 /// directly, with no owner thread involved, exactly as before.
+///
+/// # wasm32
+///
+/// Returns `None`: `GpuContext::try_new` is a *blocking* constructor and the
+/// browser cannot block, so there is nothing for an owner thread to own. A
+/// browser caller reaches WebGPU through [`try_new_async`] instead, after the
+/// session has been built.
 pub(crate) fn try_new() -> Option<ManagedGpuContext> {
-    owner::create().map(|ctx| ManagedGpuContext(Some(ctx)))
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        owner::create().map(|ctx| ManagedGpuContext(Some(ctx)))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        GpuContext::try_new().map(|ctx| ManagedGpuContext(Some(ctx)))
+    }
+}
+
+/// Acquire a WebGPU context asynchronously and wrap it for this session.
+///
+/// The browser counterpart of [`try_new`]. There is no owner thread and no
+/// reaper: `wasm32-unknown-unknown` has exactly one thread per module instance,
+/// so the session that creates the context is by construction also the one that
+/// drops it — which is the invariant the native owner thread is built to
+/// restore. Reached through [`super::Session::enable_gpu_async`].
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn try_new_async() -> Option<ManagedGpuContext> {
+    GpuContext::try_new_async()
+        .await
+        .map(|ctx| ManagedGpuContext(Some(ctx)))
+}
+
+impl super::Session {
+    /// Attach a GPU context to this session, acquiring the adapter and device
+    /// asynchronously.
+    ///
+    /// Returns `true` when the session now has a device, `false` when none
+    /// could be acquired — in which case the session is untouched and every run
+    /// stays on the CPU, which is always a correct outcome, never an error.
+    /// Calling this on a session that already has a device is a no-op that
+    /// reports `true`.
+    ///
+    /// # Why a browser session needs this at all
+    ///
+    /// Session construction is synchronous, and acquiring a WebGPU device is
+    /// not: `navigator.gpu.requestAdapter()` is a promise, and a page's only
+    /// thread may not block on one. So a session built in a browser starts
+    /// without a device no matter what [`crate::SessionBuilder`] was told, and
+    /// this is the second step that gives it one. Pair it with
+    /// [`crate::Session::run_gpu_async`] — the synchronous [`crate::Session::run`]
+    /// declines every GPU node on `wasm32` (see
+    /// `crate::session::gpu_dispatch::try_gpu_dispatch`).
+    ///
+    /// # Native
+    ///
+    /// Available for API parity, and it goes through the same dedicated owner
+    /// thread every other native context does (see this module's docs) rather
+    /// than building a device on the caller's thread — so it is `async` in
+    /// signature only and completes without ever yielding. The
+    /// creation-and-destruction-on-one-thread invariant that owner thread
+    /// exists to hold is not something an `async fn` gets to opt out of.
+    pub async fn enable_gpu_async(&mut self) -> bool {
+        if self.gpu.is_some() {
+            return true;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let acquired = try_new_async().await;
+        #[cfg(not(target_arch = "wasm32"))]
+        let acquired = try_new();
+
+        self.gpu = acquired;
+        self.gpu.is_some()
+    }
 }
 
 /// The dedicated thread and the channel protocol that reaches it.
+///
+/// Native only. Every mechanism in here — `std::thread::spawn`,
+/// `std::thread::sleep`, `atexit`, a rendezvous channel between threads — is
+/// either unavailable or an immediate runtime panic on
+/// `wasm32-unknown-unknown`, and none of the hazards it closes (a GPU context
+/// created on one thread and destroyed on another; a driver `atexit` handler
+/// racing an in-flight teardown) can arise on a single-threaded target with no
+/// process exit to speak of.
+#[cfg(not(target_arch = "wasm32"))]
 mod owner {
     use super::GpuContext;
     use std::sync::mpsc::{Sender, SyncSender};
@@ -260,18 +347,23 @@ mod owner {
     /// round-trip?
     ///
     /// Checking [`IN_FLIGHT`] alone is not enough: it is only nonzero
-    /// *during* a round-trip, but a `run_async`/`spawn_run` worker thread
-    /// that has not reached its `Arc<Session>` drop yet — plausible, since
-    /// nothing joins it, so it runs on its own schedule with no relationship
-    /// to when the *test* function that started it returns — has not
-    /// incremented it yet either, and process exit must not race ahead of
-    /// that worker just because it has not started its teardown *yet*.
-    /// [`super::super::async_run::active_worker_count`] closes that gap: it
-    /// counts a worker as live for its *entire* body, not just the narrower
-    /// window a disposal itself takes.
+    /// *during* a round-trip, but on native targets a `run_async`/`spawn_run`
+    /// worker thread that has not reached its `Arc<Session>` drop yet —
+    /// plausible, since nothing joins it, so it runs on its own schedule with
+    /// no relationship to when the *test* function that started it returns —
+    /// has not incremented it yet either, and process exit must not race
+    /// ahead of that worker just because it has not started its teardown
+    /// *yet*. `super::super::async_run::active_worker_count` closes that
+    /// gap: it counts a worker as live for its *entire* body, not just the
+    /// narrower window a disposal itself takes.
+    ///
+    /// `async_run` (all of it: `std::thread::spawn`-backed) does not exist
+    /// on wasm32 — see its module gate in `session/mod.rs` — and neither does
+    /// `atexit`, so this whole module is compiled out there rather than
+    /// carrying a per-call `#[cfg]` for a target that can never reach it.
     fn nothing_pending() -> bool {
-        IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) == 0
-            && super::super::async_run::active_worker_count() == 0
+        let async_workers_idle = super::super::async_run::active_worker_count() == 0;
+        IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) == 0 && async_workers_idle
     }
 
     /// The `atexit`-registered hook itself.
@@ -298,21 +390,22 @@ mod owner {
         const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(50);
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
-        let overall_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let overall_deadline =
+            crate::time_compat::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             // Phase 1: wait for the quiet condition to hold at all.
-            while !nothing_pending() && std::time::Instant::now() < overall_deadline {
+            while !nothing_pending() && crate::time_compat::Instant::now() < overall_deadline {
                 std::thread::sleep(POLL_INTERVAL);
             }
-            if std::time::Instant::now() >= overall_deadline {
+            if crate::time_compat::Instant::now() >= overall_deadline {
                 return;
             }
             // Phase 2: keep re-checking through one debounce window. Any
             // activity during it restarts phase 1 instead of trusting the
             // single instant that happened to be quiet.
-            let debounce_deadline = std::time::Instant::now() + DEBOUNCE;
+            let debounce_deadline = crate::time_compat::Instant::now() + DEBOUNCE;
             let mut stayed_quiet = true;
-            while std::time::Instant::now() < debounce_deadline {
+            while crate::time_compat::Instant::now() < debounce_deadline {
                 std::thread::sleep(POLL_INTERVAL);
                 if !nothing_pending() {
                     stayed_quiet = false;
@@ -322,7 +415,7 @@ mod owner {
             if stayed_quiet {
                 return;
             }
-            if std::time::Instant::now() >= overall_deadline {
+            if crate::time_compat::Instant::now() >= overall_deadline {
                 return;
             }
         }

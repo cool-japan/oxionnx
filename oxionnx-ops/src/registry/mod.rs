@@ -14,6 +14,7 @@ pub mod math_ops;
 pub mod misc_ops;
 pub mod ml_ops;
 pub mod nn_ops;
+pub mod oxi_instance_norm;
 pub mod quant_ops;
 pub mod random_ops;
 pub mod rnn_ops;
@@ -251,6 +252,12 @@ pub fn default_registry() -> OperatorRegistry {
     // Loss ops.
     r.register(Box::new(loss_ops::NegativeLogLikelihoodLossOp));
     r.register(Box::new(loss_ops::SoftmaxCrossEntropyLossOp));
+
+    // ── Fused ops (optimizer-generated) ────────────────────────────────────
+    // `fuse_instance_norm` only rewrites a graph when this lookup succeeds, so
+    // registering the kernel here is what turns the pass on for the default
+    // registry.
+    r.register(Box::new(oxi_instance_norm::OxiInstanceNormOp));
 
     // ── ML ops ──────────────────────────────────────────────────────────────
     r.register(Box::new(ml_ops::LinearClassifierOp));

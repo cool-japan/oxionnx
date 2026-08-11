@@ -143,6 +143,11 @@ pub(crate) fn im2col_blocked(
 #[cfg(feature = "simd")]
 #[inline]
 pub(crate) fn simd_copy_f32(src: &[f32], dst: &mut [f32]) {
+    // Only the two hand-vectorised arms below read this; on every other
+    // target (notably wasm32, where the `simd` feature is still on but this
+    // function has no intrinsic path) the binding would be dead and would
+    // trip `unused_variables` in an otherwise warning-free build.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let len = src.len();
 
     #[cfg(target_arch = "aarch64")]

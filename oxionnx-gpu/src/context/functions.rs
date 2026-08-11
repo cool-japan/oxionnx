@@ -408,12 +408,55 @@ fn op_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     output[idx] = a[idx] * b[idx];
 }
 "#;
-/// Tiled matrix multiply WGSL shader using workgroup shared memory.
+/// Register-blocked tiled matrix multiply WGSL shader.
 ///
-/// Uses 16x16 tiles loaded into shared memory for improved cache locality.
-/// Each workgroup computes a 16x16 tile of the output matrix C by iterating
-/// over tiles along the K dimension, loading A and B tiles into shared memory,
-/// and accumulating partial dot products.
+/// Each workgroup owns a 64(M) x 64(N) macro-tile of the output. Its 256
+/// threads (`@workgroup_size(16, 16)`) each compute a 4x4 register tile
+/// within that macro-tile, iterating over K in `KTILE`-deep chunks staged
+/// through workgroup shared memory. Register blocking does not change the
+/// FLOP count — it changes how many *distinct-address* shared-memory reads
+/// pay for each FMA: the one-thread-one-element predecessor of this kernel
+/// had every shared element re-read (broadcast) by 16 threads before this
+/// change; here each loaded element feeds 4 FMAs before the next shared
+/// read, which is what lets the kernel approach f32 peak instead of being
+/// shared-memory-bandwidth-bound. Bounds handling (ragged M/N/K) is
+/// unconditional zero-padding on load, as the predecessor kernel did.
+///
+/// [register tile: 16 named scalars, not a `[4][4]` array] The 16
+/// accumulators (`acc00`..`acc33`) and the 4+4 per-`kk` operands
+/// (`a_reg0`..`3`, `b_reg0`..`3`) are individually-named `f32` locals, not
+/// `array<f32, 4>` / `array<array<f32, 4>, 4>`. This was measured, not
+/// stylistic: an earlier array-based version of this exact algorithm ran
+/// *slower* than the one-thread-one-element predecessor it was meant to
+/// replace (naga's WGSL-\>MSL lowering did not promote the small
+/// loop-indexed arrays to registers on this backend, so every accumulator
+/// read/write went through real memory instead) — rewriting the identical
+/// math with named scalars in place of the two small arrays measured
+/// 3-4x faster than that array version, and is what actually delivers the
+/// register-blocking win described above. If a future edit reintroduces an
+/// array here (e.g. to shrink this file), re-benchmark before assuming it
+/// is a neutral refactor.
+///
+/// [dispatch contract] `oxionnx-gpu/src/compute.rs` (a parallel agent's file
+/// — not touched here) dispatches `ceil(N/16) x ceil(M/16)` workgroups; that
+/// formula was sized for this kernel's *predecessor*, whose macro-tile was
+/// 16x16. It is intentionally left as-is rather than recomputed for the new
+/// 64x64 macro-tile, because `ceil(X/16) >= ceil(X/64)` for every X >= 1 (16
+/// is a divisor of 64), so that dispatch always launches *at least* as many
+/// workgroups along each axis as this kernel needs — it only ever
+/// over-provisions, never under-provisions. The `tiles_m` / `tiles_n` bounds
+/// check below turns the surplus (up to 16x fewer workgroups would actually
+/// be needed at large M/N) into an immediate, uniform-control-flow return —
+/// `workgroup_id` is identical for every invocation in a workgroup, so this
+/// is not a divergent exit ahead of the `workgroupBarrier()` calls later in
+/// the function (same reasoning `softmax_rows` / `layer_norm` in this file
+/// already rely on for their own early returns). This is why the entry
+/// point name, bind group layout and dispatch-count formula did not need to
+/// change anywhere else: anyone lowering that divisor below 64 must keep it
+/// a divisor of 64 (e.g. 32, 8, ...), or this bound under-dispatches.
+/// (Measured: the 16x surplus this produces at large M/N is not a
+/// meaningful cost — every early-returning workgroup retires in a handful
+/// of instructions.)
 pub(super) const TILED_MATMUL_SHADER: &str = r#"
 struct Dims {
     M: u32,
@@ -422,61 +465,171 @@ struct Dims {
     _pad: u32,
 }
 
-const TILE_SIZE: u32 = 16u;
+// Macro-tile: output rows/cols owned by one workgroup.
+const MACRO_M: u32 = 64u;
+const MACRO_N: u32 = 64u;
+// K-chunk staged into shared memory per outer-loop iteration.
+const KTILE: u32 = 16u;
 
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 @group(0) @binding(3) var<uniform> dims: Dims;
 
-var<workgroup> tile_a: array<array<f32, 16>, 16>;
-var<workgroup> tile_b: array<array<f32, 16>, 16>;
+// k-major storage (tile_a[k][m], tile_b[k][n]): for a fixed k, a thread's 4
+// register-tile elements (`m_base..m_base+3` or `n_base..n_base+3`) are
+// contiguous within one row, and same-k/same-tile-row(col) reads across
+// threads land on shared addresses rather than a strided pattern.
+var<workgroup> tile_a: array<array<f32, 64>, 16>;
+var<workgroup> tile_b: array<array<f32, 64>, 16>;
 
 @compute @workgroup_size(16, 16)
 fn tiled_matmul(
-    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let row = gid.y;
-    let col = gid.x;
-    let local_row = lid.y;
-    let local_col = lid.x;
     let M = dims.M;
     let K = dims.K;
     let N = dims.N;
 
-    var sum: f32 = 0.0;
-    let num_tiles = (K + TILE_SIZE - 1u) / TILE_SIZE;
+    // See the "[dispatch contract]" note on the Rust doc comment above this
+    // shader: `wid` is uniform across the whole workgroup, so this is not a
+    // divergent early exit relative to the workgroupBarrier() calls below.
+    let tiles_n = (N + MACRO_N - 1u) / MACRO_N;
+    let tiles_m = (M + MACRO_M - 1u) / MACRO_M;
+    if (wid.x >= tiles_n || wid.y >= tiles_m) {
+        return;
+    }
 
-    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
-        // Load tile of A into shared memory
-        let a_col = t * TILE_SIZE + local_col;
-        if (row < M && a_col < K) {
-            tile_a[local_row][local_col] = a[row * K + a_col];
-        } else {
-            tile_a[local_row][local_col] = 0.0;
+    let tile_row = wid.y * MACRO_M;
+    let tile_col = wid.x * MACRO_N;
+    let tx = lid.x;
+    let ty = lid.y;
+
+    // See the "[register tile: 16 named scalars]" doc comment above: this
+    // block intentionally does not use `array<f32, 4>` / `array<array<f32,
+    // 4>, 4>` in place of these 16 declarations.
+    var acc00: f32 = 0.0;
+    var acc01: f32 = 0.0;
+    var acc02: f32 = 0.0;
+    var acc03: f32 = 0.0;
+    var acc10: f32 = 0.0;
+    var acc11: f32 = 0.0;
+    var acc12: f32 = 0.0;
+    var acc13: f32 = 0.0;
+    var acc20: f32 = 0.0;
+    var acc21: f32 = 0.0;
+    var acc22: f32 = 0.0;
+    var acc23: f32 = 0.0;
+    var acc30: f32 = 0.0;
+    var acc31: f32 = 0.0;
+    var acc32: f32 = 0.0;
+    var acc33: f32 = 0.0;
+
+    let num_k_tiles = (K + KTILE - 1u) / KTILE;
+    for (var t: u32 = 0u; t < num_k_tiles; t = t + 1u) {
+        let k0 = t * KTILE;
+
+        // Cooperatively load A's [MACRO_M x KTILE] sub-block (k-major),
+        // zero-padding any (row, k) outside [M, K) so the accumulate loop
+        // below needs no bounds check of its own. Division-free 2-D
+        // grid-stride loop: ty walks k in steps of 16, tx walks m in steps
+        // of 16 (16x16 threads cover the 16x64 sub-block in 4 inner steps).
+        for (var kr: u32 = ty; kr < KTILE; kr = kr + 16u) {
+            let g_col = k0 + kr;
+            for (var mc: u32 = tx; mc < MACRO_M; mc = mc + 16u) {
+                let g_row = tile_row + mc;
+                if (g_row < M && g_col < K) {
+                    tile_a[kr][mc] = a[g_row * K + g_col];
+                } else {
+                    tile_a[kr][mc] = 0.0;
+                }
+            }
         }
 
-        // Load tile of B into shared memory
-        let b_row = t * TILE_SIZE + local_row;
-        if (b_row < K && col < N) {
-            tile_b[local_row][local_col] = b[b_row * N + col];
-        } else {
-            tile_b[local_row][local_col] = 0.0;
+        // Cooperatively load B's [KTILE x MACRO_N] sub-block (k-major, same
+        // orientation as B's own row-major global layout), same zero-pad.
+        for (var kr: u32 = ty; kr < KTILE; kr = kr + 16u) {
+            let g_row = k0 + kr;
+            for (var nc: u32 = tx; nc < MACRO_N; nc = nc + 16u) {
+                let g_col = tile_col + nc;
+                if (g_row < K && g_col < N) {
+                    tile_b[kr][nc] = b[g_row * N + g_col];
+                } else {
+                    tile_b[kr][nc] = 0.0;
+                }
+            }
         }
 
         workgroupBarrier();
 
-        // Compute partial dot product for this tile
-        for (var i: u32 = 0u; i < TILE_SIZE; i = i + 1u) {
-            sum = sum + tile_a[local_row][i] * tile_b[i][local_col];
+        for (var kk: u32 = 0u; kk < KTILE; kk = kk + 1u) {
+            let a_reg0 = tile_a[kk][ty * 4u + 0u];
+            let a_reg1 = tile_a[kk][ty * 4u + 1u];
+            let a_reg2 = tile_a[kk][ty * 4u + 2u];
+            let a_reg3 = tile_a[kk][ty * 4u + 3u];
+            let b_reg0 = tile_b[kk][tx * 4u + 0u];
+            let b_reg1 = tile_b[kk][tx * 4u + 1u];
+            let b_reg2 = tile_b[kk][tx * 4u + 2u];
+            let b_reg3 = tile_b[kk][tx * 4u + 3u];
+            acc00 = acc00 + a_reg0 * b_reg0;
+            acc01 = acc01 + a_reg0 * b_reg1;
+            acc02 = acc02 + a_reg0 * b_reg2;
+            acc03 = acc03 + a_reg0 * b_reg3;
+            acc10 = acc10 + a_reg1 * b_reg0;
+            acc11 = acc11 + a_reg1 * b_reg1;
+            acc12 = acc12 + a_reg1 * b_reg2;
+            acc13 = acc13 + a_reg1 * b_reg3;
+            acc20 = acc20 + a_reg2 * b_reg0;
+            acc21 = acc21 + a_reg2 * b_reg1;
+            acc22 = acc22 + a_reg2 * b_reg2;
+            acc23 = acc23 + a_reg2 * b_reg3;
+            acc30 = acc30 + a_reg3 * b_reg0;
+            acc31 = acc31 + a_reg3 * b_reg1;
+            acc32 = acc32 + a_reg3 * b_reg2;
+            acc33 = acc33 + a_reg3 * b_reg3;
         }
 
         workgroupBarrier();
     }
 
-    if (row < M && col < N) {
-        c[row * N + col] = sum;
+    let r0 = tile_row + ty * 4u + 0u;
+    let r1 = tile_row + ty * 4u + 1u;
+    let r2 = tile_row + ty * 4u + 2u;
+    let r3 = tile_row + ty * 4u + 3u;
+    let col0 = tile_col + tx * 4u + 0u;
+    let col1 = tile_col + tx * 4u + 1u;
+    let col2 = tile_col + tx * 4u + 2u;
+    let col3 = tile_col + tx * 4u + 3u;
+
+    // Ragged M/N edges clip individual rows/cols of this thread's 4x4 tile;
+    // each of the 16 writes is bounds-checked independently rather than
+    // split into a fast/slow path, which measured indistinguishably from a
+    // fast-path version at every shape tested (the K-loop above dominates
+    // total cost by orders of magnitude).
+    if (r0 < M) {
+        if (col0 < N) { c[r0 * N + col0] = acc00; }
+        if (col1 < N) { c[r0 * N + col1] = acc01; }
+        if (col2 < N) { c[r0 * N + col2] = acc02; }
+        if (col3 < N) { c[r0 * N + col3] = acc03; }
+    }
+    if (r1 < M) {
+        if (col0 < N) { c[r1 * N + col0] = acc10; }
+        if (col1 < N) { c[r1 * N + col1] = acc11; }
+        if (col2 < N) { c[r1 * N + col2] = acc12; }
+        if (col3 < N) { c[r1 * N + col3] = acc13; }
+    }
+    if (r2 < M) {
+        if (col0 < N) { c[r2 * N + col0] = acc20; }
+        if (col1 < N) { c[r2 * N + col1] = acc21; }
+        if (col2 < N) { c[r2 * N + col2] = acc22; }
+        if (col3 < N) { c[r2 * N + col3] = acc23; }
+    }
+    if (r3 < M) {
+        if (col0 < N) { c[r3 * N + col0] = acc30; }
+        if (col1 < N) { c[r3 * N + col1] = acc31; }
+        if (col2 < N) { c[r3 * N + col2] = acc32; }
+        if (col3 < N) { c[r3 * N + col3] = acc33; }
     }
 }
 "#;

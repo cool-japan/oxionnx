@@ -7,6 +7,85 @@ use crate::shaders::{
     gpu_transpose,
 };
 
+/// After a dispatch, the only device memory this crate still holds is what the
+/// pool deliberately retains — every operand, params and staging buffer has
+/// been destroyed and its bytes released.
+///
+/// This is the regression test for the browser stall: the old kernels dropped
+/// those buffers, which on the WebGPU backend released nothing, so live bytes
+/// grew by the whole working set of every node, every frame, until
+/// `createBuffer` started failing. Native drops do free, so the assertion this
+/// makes here is about the *accounting* — but the accounting is what the
+/// budget declines on, and it is the same code on both targets.
+#[test]
+fn a_dispatch_leaves_only_pooled_bytes_live() {
+    let ctx = match GpuContext::try_new() {
+        Some(ctx) => ctx,
+        None => return,
+    };
+    assert_eq!(ctx.live_gpu_bytes(), 0, "a fresh context owns nothing");
+
+    // Comfortably over `EW_GPU_THRESHOLD` so the kernel does not decline.
+    let data = vec![-1.0f32; 200_000];
+    for _ in 0..4 {
+        let out = match gpu_relu(&ctx, &data) {
+            Some(out) => out,
+            None => return, // The device declined; nothing to assert.
+        };
+        assert_eq!(out.len(), data.len());
+
+        let pooled = match ctx.pool.lock() {
+            Ok(pool) => pool.pooled_bytes(),
+            Err(_) => return,
+        };
+        assert_eq!(
+            ctx.live_gpu_bytes(),
+            pooled,
+            "input, params and staging buffers must all be released after a dispatch",
+        );
+    }
+
+    if let Ok(mut pool) = ctx.pool.lock() {
+        pool.clear();
+    }
+    assert_eq!(
+        ctx.live_gpu_bytes(),
+        0,
+        "clearing the pool must release every remaining byte",
+    );
+}
+
+/// An exhausted budget is a decline, not an error: the node falls back to the
+/// CPU and the context stays perfectly usable afterwards.
+#[test]
+fn an_exhausted_budget_declines_instead_of_allocating() {
+    let ctx = match GpuContext::try_new() {
+        Some(ctx) => ctx,
+        None => return,
+    };
+    let data = vec![0.5f32; 200_000];
+    if gpu_relu(&ctx, &data).is_none() {
+        return; // No dispatch on this device at all; nothing to compare against.
+    }
+
+    ctx.set_gpu_byte_budget(0);
+    assert!(
+        gpu_relu(&ctx, &data).is_none(),
+        "a node that cannot fit the budget must decline",
+    );
+    assert_eq!(ctx.live_gpu_bytes(), 0, "a decline must allocate nothing");
+    assert!(
+        !ctx.is_degraded(),
+        "a budget decline is transient and must not degrade the context",
+    );
+
+    ctx.set_gpu_byte_budget(crate::context::DEFAULT_LIVE_BYTE_BUDGET);
+    assert!(
+        gpu_relu(&ctx, &data).is_some(),
+        "restoring the budget must restore dispatch",
+    );
+}
+
 #[test]
 fn test_gpu_buffer_pool_basic() {
     let ctx = match GpuContext::try_new() {
@@ -18,11 +97,13 @@ fn test_gpu_buffer_pool_basic() {
     assert_eq!(pool.available_count(), 0);
 
     // Get a buffer (creates new since pool is empty).
-    let buf = pool.get_buffer(
-        &ctx.device,
-        1024,
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    );
+    let buf = pool
+        .get_buffer(
+            &ctx.device,
+            1024,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        )
+        .expect("an empty pool with an unlimited budget must allocate");
     assert_eq!(pool.available_count(), 0);
 
     // Return it.
@@ -45,7 +126,9 @@ fn test_gpu_buffer_pool_reuse() {
     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
 
     // Get and return a 1024-byte buffer.
-    let buf = pool.get_buffer(&ctx.device, 1024, usage);
+    let buf = pool
+        .get_buffer(&ctx.device, 1024, usage)
+        .expect("allocation must succeed");
     pool.return_buffer(buf);
     assert_eq!(pool.available_count(), 1);
 
@@ -58,13 +141,207 @@ fn test_gpu_buffer_pool_reuse() {
     assert_eq!(pool.available_count(), 0);
 
     // Return multiple buffers and verify they accumulate.
-    let b1 = pool.get_buffer(&ctx.device, 512, usage);
-    let b2 = pool.get_buffer(&ctx.device, 2048, usage);
-    let b3 = pool.get_buffer(&ctx.device, 4096, usage);
+    let b1 = pool
+        .get_buffer(&ctx.device, 512, usage)
+        .expect("allocation must succeed");
+    let b2 = pool
+        .get_buffer(&ctx.device, 2048, usage)
+        .expect("allocation must succeed");
+    let b3 = pool
+        .get_buffer(&ctx.device, 4096, usage)
+        .expect("allocation must succeed");
     pool.return_buffer(b1);
     pool.return_buffer(b2);
     pool.return_buffer(b3);
     assert_eq!(pool.available_count(), 3);
+}
+
+/// [F5] `GpuBufferPool::get_buffer` may hand back an idle entry up to 2x the
+/// requested size (its own doc comment above, and `test_gpu_buffer_pool_reuse`
+/// above already exercises the mechanism). Binding that reused buffer's
+/// *actual* capacity via `as_entire_binding()` -- instead of the caller's
+/// requested size -- can then exceed `max_storage_buffer_binding_size` even
+/// though the request itself was validated. Every `output_buf` / `c_buf` site
+/// that binds a pooled buffer in this crate now binds an explicit
+/// `wgpu::BufferBinding { size: Some(requested), .. }` instead, the same
+/// pattern `conv2d.rs`'s `output_binding` already used; this test is the
+/// regression guard for that fix.
+///
+/// Reproduced against a purpose-built device with a deliberately small
+/// storage-binding limit rather than the real adapter's: `GpuContext::try_new`
+/// requests the adapter's own limits (see `acquire_device`), which on a
+/// modern GPU can be several GiB -- reaching that boundary for real would mean
+/// allocating gigabytes just to run this test. Requesting a device whose
+/// `required_limits.max_storage_buffer_binding_size` is tiny (with a roomier
+/// `max_buffer_size`, since only the latter gates buffer *creation*, not
+/// binding) reproduces the identical wgpu validation path with two tiny
+/// allocations, deterministically, on any adapter.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_reused_oversized_pooled_buffer_binds_at_its_requested_size() {
+    let Some((device, queue)) = pollster::block_on(tiny_limited_device()) else {
+        return; // No adapter on this machine.
+    };
+
+    // The device's storage-binding limit, and an entry sized at exactly 2x
+    // it -- the inclusive edge of `GpuBufferPool::get_buffer`'s `<= 2 *
+    // min_size` reuse window, so asking for `LIMIT` after returning a `BIG`
+    // buffer reuses it deterministically rather than probabilistically.
+    const LIMIT: u64 = 4096;
+    const BIG: u64 = 2 * LIMIT;
+
+    let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+    let mut pool = GpuBufferPool::new(4);
+
+    let big = pool
+        .get_buffer(&device, BIG, usage)
+        .expect("creating a buffer within max_buffer_size must succeed");
+    assert_eq!(big.reserved_bytes(), BIG);
+    pool.return_buffer(big);
+
+    let reused = pool
+        .get_buffer(&device, LIMIT, usage)
+        .expect("the oversized idle entry must be reused for the smaller request");
+    assert_eq!(
+        reused.reserved_bytes(),
+        BIG,
+        "test is meaningless unless the pool actually handed back the bigger buffer"
+    );
+
+    // A minimal read-write storage pipeline -- correctness is not the point,
+    // only whether the device's validator accepts the binding.
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("f5_probe_shader"),
+        source: wgpu::ShaderSource::Wgsl(
+            "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n\
+             @compute @workgroup_size(1)\n\
+             fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+             \x20   if (gid.x < arrayLength(&data)) { data[gid.x] = data[gid.x]; }\n\
+             }"
+            .into(),
+        ),
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("f5_probe_bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("f5_probe_pl"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("f5_probe_pipeline"),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    // The fix under test: bind exactly `LIMIT` bytes of the oversized
+    // buffer -- never its full `reserved_bytes()` -- and run a real
+    // dispatch through it end to end.
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("f5_bg_exact"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &reused,
+                offset: 0,
+                size: wgpu::BufferSize::new(LIMIT),
+            }),
+        }],
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("f5_enc"),
+    });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("f5_pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+    queue.submit(std::iter::once(encoder.finish()));
+    let error = pollster::block_on(scope.pop());
+    assert!(
+        error.is_none(),
+        "binding the pool's reused buffer at its requested size must validate: {error:?}"
+    );
+
+    // Sanity check: binding the *same* reused buffer at its full (2x,
+    // oversized) capacity -- what `as_entire_binding()` would do -- must be
+    // exactly what this device's `max_storage_buffer_binding_size` rejects,
+    // so the assertion above is not vacuously true on this adapter.
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oversized_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("f5_bg_oversized"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: reused.as_entire_binding(),
+        }],
+    });
+    drop(oversized_bind_group);
+    let oversized_error = pollster::block_on(scope.pop());
+    assert!(
+        oversized_error.is_some(),
+        "binding the reused buffer at its full 2x capacity was expected to \
+         exceed this device's max_storage_buffer_binding_size; if it did not, \
+         LIMIT/BIG below need adjusting"
+    );
+}
+
+/// A device whose storage-binding limit is deliberately much smaller than its
+/// buffer-size limit, so [`a_reused_oversized_pooled_buffer_binds_at_its_requested_size`]
+/// can reach the validation boundary with byte-scale buffers instead of the
+/// real adapter's (often gigabyte-scale) one. `None` when no adapter exists on
+/// this machine, matching every other device-backed test in this crate.
+#[cfg(not(target_arch = "wasm32"))]
+async fn tiny_limited_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        flags: wgpu::InstanceFlags::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        display: None,
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok()?;
+    let limits = wgpu::Limits {
+        max_storage_buffer_binding_size: 4096,
+        max_buffer_size: 1 << 20,
+        ..wgpu::Limits::default()
+    };
+    adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("oxionnx_f5_probe"),
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+            ..Default::default()
+        })
+        .await
+        .ok()
 }
 
 #[test]

@@ -7,7 +7,7 @@
 
 use oxionnx_core::{OnnxError, Tensor};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 use rayon::prelude::*;
 
 use super::im2col::im2col_adaptive;
@@ -94,6 +94,75 @@ fn winograd_work(oc: usize, c: usize, oh: usize, ow: usize) -> usize {
         .saturating_mul(ow.div_ceil(2))
 }
 
+/// Upper bound on the bytes a **single** im2col column workspace may occupy.
+///
+/// The column matrix is `[C/group * kH * kW, OH * OW]` f32, which grows as the
+/// product of the kernel volume and the output area: `inswapper_128`'s last
+/// convolution (`[3, 128, 7, 7]` over a `128×128` output) alone asks for
+/// 411 MB, and `[256, 512, 3, 3]` over `128×128` for 302 MB — every frame,
+/// on top of the resident weights. On `wasm32` a `WebAssembly.Memory.grow`
+/// that cannot be satisfied *aborts* the module, and wasm linear memory never
+/// shrinks, so one such request permanently raises the tab's memory ceiling.
+///
+/// Above this cap the output columns are processed in blocks (see
+/// [`im2col_block_cols`]): the workspace is rebuilt per block and the GEMM
+/// writes each block into the disjoint columns of the output it owns. The
+/// result is bit-identical — `matrixmultiply`'s N loop is its outermost loop,
+/// so the K-accumulation order of every output element is unchanged by an
+/// external split of N (asserted by
+/// `sgemm_column_blocks_are_bitwise_identical_to_one_call`).
+///
+/// The cap is **per workspace**, not per call: the native multi-job path keeps
+/// one capped buffer per rayon worker (`for_each_init`), so its aggregate peak
+/// is `workers × cap` — still a strict improvement on `workers × full`. The
+/// wasm32 twin and the single-job path hold exactly one.
+pub(crate) const IM2COL_WORKSPACE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Number of output columns one im2col + GEMM block covers.
+///
+/// Returns `col_cols` — i.e. *no* blocking, the historical code path, byte for
+/// byte — whenever the full workspace already fits `cap_bytes`, so small and
+/// medium convolutions keep their exact previous behaviour and cost.
+///
+/// Over the cap it picks the smallest number of blocks that fits,
+/// `ceil(col_cols / cap_cols)`, then spreads the columns evenly over them
+/// rather than filling greedily (a greedy split leaves a lopsided remainder
+/// block, e.g. 14563 + 1821). The even width is finally rounded to a whole
+/// number of output rows (`ow`) when that still fits, so each block is a
+/// contiguous run of output rows and the gather never has to handle a partial
+/// row — true for every convolution in `inswapper_128`. Only a single output
+/// row wider than the cap falls back to an unaligned width.
+pub(crate) fn im2col_block_cols(
+    col_rows: usize,
+    col_cols: usize,
+    ow: usize,
+    cap_bytes: usize,
+) -> usize {
+    let bytes_per_col = col_rows.saturating_mul(core::mem::size_of::<f32>());
+    if bytes_per_col == 0 || col_cols == 0 {
+        return col_cols;
+    }
+    if bytes_per_col.saturating_mul(col_cols) <= cap_bytes {
+        return col_cols;
+    }
+    // At least one column always fits, however large a single column is.
+    let cap_cols = (cap_bytes / bytes_per_col).max(1);
+    let blocks = col_cols.div_ceil(cap_cols);
+    let even = col_cols.div_ceil(blocks.max(1)).clamp(1, cap_cols);
+    if ow > 0 && even >= ow {
+        // Round up to whole output rows if that still fits, else down.
+        let up = even.next_multiple_of(ow);
+        if up <= cap_cols {
+            return up.min(col_cols);
+        }
+        let down = (even / ow) * ow;
+        if down >= 1 {
+            return down.min(col_cols);
+        }
+    }
+    even
+}
+
 /// Write conv2d result directly into a pre-allocated output buffer.
 ///
 /// `out_shape` must be the result of `compute_conv2d_out_shape` for these inputs.
@@ -136,7 +205,7 @@ pub(crate) fn conv2d_into(
 /// lowering in [`super::conv_nd`] re-interpret a `[N, C, W]` buffer as
 /// `[N, C, 1, W]` with no copy, and lets the typed (f16/bf16) wrappers pass
 /// their promoted scratch buffers directly.
-#[allow(unsafe_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn conv2d_into_slices(
     input: &[f32],
     input_shape: &[usize],
@@ -149,6 +218,44 @@ pub(crate) fn conv2d_into_slices(
     group: usize,
     out: &mut [f32],
     out_shape: &[usize],
+) {
+    conv2d_into_slices_capped(
+        input,
+        input_shape,
+        weight,
+        weight_shape,
+        bias,
+        strides,
+        pads,
+        dilations,
+        group,
+        out,
+        out_shape,
+        IM2COL_WORKSPACE_MAX_BYTES,
+    );
+}
+
+/// [`conv2d_into_slices`] with the im2col workspace cap as a parameter.
+///
+/// Production callers go through [`conv2d_into_slices`], which passes
+/// [`IM2COL_WORKSPACE_MAX_BYTES`]. The explicit cap exists so the test-suite
+/// can reach *both* sides of the blocking decision on the same shape —
+/// `usize::MAX` forces the monolithic reference, a small cap forces many
+/// blocks — and assert they agree bit for bit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d_into_slices_capped(
+    input: &[f32],
+    input_shape: &[usize],
+    weight: &[f32],
+    weight_shape: &[usize],
+    bias: Option<&[f32]>,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    group: usize,
+    out: &mut [f32],
+    out_shape: &[usize],
+    workspace_cap_bytes: usize,
 ) {
     // Defensive guards: never panic on malformed shapes/attributes.
     if group == 0 || input_shape.len() != 4 || weight_shape.len() != 4 || out_shape.len() != 4 {
@@ -241,6 +348,8 @@ pub(crate) fn conv2d_into_slices(
     let col_rows = c_per_group * kh * kw;
     let col_cols = oh * ow;
     let total_jobs = n * group;
+    // `col_cols` (no blocking) for every shape whose workspace fits the cap.
+    let block_cols = im2col_block_cols(col_rows, col_cols, ow, workspace_cap_bytes);
 
     if total_jobs <= 1 {
         // ── Single job: im2col + GEMM straight into the output buffer ────
@@ -251,37 +360,81 @@ pub(crate) fn conv2d_into_slices(
         // output channel (disjoint row bands of the result), so the arithmetic
         // per element — and therefore the result — is bit-identical to the
         // sequential path.
-        let mut col = vec![0.0f32; col_rows * col_cols];
+        //
+        // Over the workspace cap the output columns are additionally walked in
+        // blocks of `block_cols`: the same `col` buffer is refilled for each
+        // block and the GEMM writes it into the columns of `out` that block
+        // owns (row stride `col_cols`, hence the `_ldc` entry point). Both
+        // halves stay bit-identical — im2col is a pure gather, and the GEMM's
+        // K-accumulation order does not depend on how N is split.
+        let mut col = vec![0.0f32; col_rows * block_cols];
         for batch in 0..n {
             for g in 0..group {
                 let in_c_start = g * c_per_group;
-                im2col_maybe_parallel(
-                    input,
-                    c_in,
-                    h,
-                    w,
-                    in_c_start,
-                    c_per_group,
-                    kh,
-                    kw,
-                    strides,
-                    pads,
-                    dilations,
-                    oh,
-                    ow,
-                    batch,
-                    &mut col,
-                );
                 let w_off = g * c_out_per_group * col_rows;
                 let o_off = (batch * c_out + g * c_out_per_group) * col_cols;
-                sgemm_maybe_parallel(
-                    c_out_per_group,
-                    col_rows,
-                    col_cols,
-                    &weight[w_off..],
-                    &col,
-                    &mut out[o_off..],
-                );
+                if block_cols == col_cols {
+                    im2col_maybe_parallel(
+                        input,
+                        c_in,
+                        h,
+                        w,
+                        in_c_start,
+                        c_per_group,
+                        kh,
+                        kw,
+                        strides,
+                        pads,
+                        dilations,
+                        oh,
+                        ow,
+                        batch,
+                        &mut col,
+                    );
+                    sgemm_maybe_parallel(
+                        c_out_per_group,
+                        col_rows,
+                        col_cols,
+                        &weight[w_off..],
+                        &col,
+                        &mut out[o_off..],
+                    );
+                } else {
+                    let mut col_start = 0;
+                    while col_start < col_cols {
+                        let col_end = (col_start + block_cols).min(col_cols);
+                        let block_w = col_end - col_start;
+                        let col_block = &mut col[..col_rows * block_w];
+                        im2col_block_maybe_parallel(
+                            input,
+                            c_in,
+                            h,
+                            w,
+                            in_c_start,
+                            c_per_group,
+                            kh,
+                            kw,
+                            strides,
+                            pads,
+                            dilations,
+                            ow,
+                            col_start,
+                            col_end,
+                            batch,
+                            col_block,
+                        );
+                        sgemm_maybe_parallel_ldc(
+                            c_out_per_group,
+                            col_rows,
+                            block_w,
+                            &weight[w_off..],
+                            col_block,
+                            &mut out[o_off + col_start..],
+                            col_cols,
+                        );
+                        col_start = col_end;
+                    }
+                }
                 if let Some(b) = bias {
                     for oc in 0..c_out_per_group {
                         let bv = b.get(g * c_out_per_group + oc).copied().unwrap_or(0.0_f32);
@@ -322,12 +475,12 @@ pub(crate) fn conv2d_into_slices(
         // `out[needed..].fill(0.0)` already zeroed everything, since
         // `needed == total_jobs * job_out_size == 0` too).
         if job_out_size > 0 {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             out[..total_jobs * job_out_size]
                 .par_chunks_mut(job_out_size)
                 .enumerate()
                 .for_each_init(
-                    || vec![0.0f32; col_rows * col_cols],
+                    || vec![0.0f32; col_rows * block_cols],
                     |col_scratch, (idx, dst)| {
                         conv2d_single_job_into(
                             input,
@@ -347,6 +500,7 @@ pub(crate) fn conv2d_into_slices(
                             ow,
                             col_rows,
                             col_cols,
+                            block_cols,
                             idx / group,
                             idx % group,
                             col_scratch,
@@ -355,9 +509,9 @@ pub(crate) fn conv2d_into_slices(
                     },
                 );
 
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
             {
-                let mut col_scratch = vec![0.0f32; col_rows * col_cols];
+                let mut col_scratch = vec![0.0f32; col_rows * block_cols];
                 for (idx, dst) in out[..total_jobs * job_out_size]
                     .chunks_mut(job_out_size)
                     .enumerate()
@@ -380,6 +534,7 @@ pub(crate) fn conv2d_into_slices(
                         ow,
                         col_rows,
                         col_cols,
+                        block_cols,
                         idx / group,
                         idx % group,
                         &mut col_scratch,
@@ -429,7 +584,7 @@ pub fn conv2d(
 /// Minimum `M * K * N` before a GEMM (or an im2col of comparable size) is worth
 /// splitting across threads. Shared by the 1×1 path and the single-job path so
 /// small convolutions keep their sequential, allocation-free behaviour.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 const PARALLEL_GEMM_THRESHOLD: usize = 64 * 64 * 64;
 
 /// Run `im2col_adaptive`, splitting the column matrix by input channel across
@@ -459,7 +614,7 @@ fn im2col_maybe_parallel(
     batch: usize,
     col: &mut [f32],
 ) {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     {
         let col_cols = oh * ow;
         let num_threads = rayon::current_num_threads();
@@ -516,9 +671,198 @@ fn im2col_maybe_parallel(
     );
 }
 
+/// Build the columns `[col_start, col_end)` of the im2col matrix for one
+/// (batch, group) slice into a `[col_rows, col_end - col_start]` buffer.
+///
+/// Same gather as `im2col::im2col_adaptive`, restricted to a range of output
+/// spatial positions and written with the *block* width as the row stride, so
+/// the result feeds `matrixmultiply::sgemm` directly as a `[k, n]` operand.
+/// Because im2col is a pure gather — every element is either an input element
+/// or a padding zero — the block is bit-identical to the corresponding slice
+/// of the monolithic matrix by construction.
+///
+/// The block boundaries are chosen as whole output rows whenever possible (see
+/// [`im2col_block_cols`]); the head/tail arithmetic below is what makes an
+/// unaligned block — a single output row wider than the workspace cap — work
+/// as well.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn im2col_block(
+    input: &[f32],
+    c_in: usize,
+    h: usize,
+    w: usize,
+    in_c_start: usize,
+    c_per_group: usize,
+    kh: usize,
+    kw: usize,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    ow: usize,
+    col_start: usize,
+    col_end: usize,
+    batch: usize,
+    col: &mut [f32],
+) {
+    if ow == 0 || col_end <= col_start {
+        return;
+    }
+    let block_w = col_end - col_start;
+    let oy_first = col_start / ow;
+    let oy_last = (col_end - 1) / ow;
+    // Horizontal runs are contiguous in the input exactly when a step of one
+    // output column is a step of one input column.
+    let contiguous_rows = strides[1] == 1 && dilations[1] == 1;
+
+    let mut row = 0;
+    for ic in 0..c_per_group {
+        let in_c = in_c_start + ic;
+        let in_plane = &input[(batch * c_in + in_c) * h * w..][..h * w];
+        for ky in 0..kh {
+            for kx in 0..kw {
+                let dst_row = &mut col[row * block_w..][..block_w];
+                for oy in oy_first..=oy_last {
+                    let row_base = oy * ow;
+                    // Columns of this output row that lie inside the block.
+                    let ox_start = col_start.saturating_sub(row_base);
+                    let ox_end = (col_end - row_base).min(ow);
+                    let dst_off = row_base + ox_start - col_start;
+                    let seg = &mut dst_row[dst_off..dst_off + (ox_end - ox_start)];
+
+                    let iy = (oy * strides[0] + ky * dilations[0]) as isize - pads[0] as isize;
+                    if iy < 0 || iy >= h as isize {
+                        // Whole segment is vertical padding.
+                        seg.fill(0.0);
+                        continue;
+                    }
+                    let src_row = &in_plane[iy as usize * w..][..w];
+
+                    if contiguous_rows {
+                        // ix = ox + kx - pad_left, valid for 0 <= ix < w. Both
+                        // bounds are clamped into [ox_start, ox_end]: a
+                        // segment can lie entirely inside the left or the
+                        // right padding.
+                        let lo = pads[1].saturating_sub(kx).clamp(ox_start, ox_end);
+                        let hi = (w + pads[1]).saturating_sub(kx).clamp(lo, ox_end);
+                        seg[..lo - ox_start].fill(0.0);
+                        if lo < hi {
+                            let src_start = lo + kx - pads[1];
+                            seg[lo - ox_start..hi - ox_start]
+                                .copy_from_slice(&src_row[src_start..src_start + (hi - lo)]);
+                        }
+                        seg[hi - ox_start..].fill(0.0);
+                    } else {
+                        for (t, dst) in seg.iter_mut().enumerate() {
+                            let ix = ((ox_start + t) * strides[1] + kx * dilations[1]) as isize
+                                - pads[1] as isize;
+                            *dst = if ix >= 0 && ix < w as isize {
+                                src_row[ix as usize]
+                            } else {
+                                0.0
+                            };
+                        }
+                    }
+                }
+                row += 1;
+            }
+        }
+    }
+}
+
+/// Run [`im2col_block`], splitting the block by input channel across rayon
+/// when the work justifies it — the blocked twin of
+/// [`im2col_maybe_parallel`], and load-bearing: the convolutions that trip the
+/// workspace cap are gather-bound (`inswapper_128`'s final `[3, 128, 7, 7]`
+/// layer has `m = 3`, so the GEMM is noise next to the im2col).
+///
+/// Row `r` of the block belongs to input channel `r / (kH * kW)`, so a
+/// contiguous band of input channels owns a contiguous band of rows: each
+/// thread calls the same gather with a shifted `in_c_start` over a disjoint
+/// sub-slice.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn im2col_block_maybe_parallel(
+    input: &[f32],
+    c_in: usize,
+    h: usize,
+    w: usize,
+    in_c_start: usize,
+    c_per_group: usize,
+    kh: usize,
+    kw: usize,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    ow: usize,
+    col_start: usize,
+    col_end: usize,
+    batch: usize,
+    col: &mut [f32],
+) {
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+    {
+        let block_w = col_end.saturating_sub(col_start);
+        let num_threads = rayon::current_num_threads();
+        let work = c_per_group * kh * kw * block_w;
+        if num_threads > 1 && c_per_group >= 2 && work >= PARALLEL_GEMM_THRESHOLD {
+            let chunk_ic = c_per_group.div_ceil(num_threads).max(1);
+            let chunk_len = chunk_ic * kh * kw * block_w;
+            if chunk_len > 0 {
+                col.par_chunks_mut(chunk_len)
+                    .enumerate()
+                    .for_each(|(t, sub)| {
+                        let first = t * chunk_ic;
+                        if first >= c_per_group {
+                            return;
+                        }
+                        let count = (c_per_group - first).min(chunk_ic);
+                        im2col_block(
+                            input,
+                            c_in,
+                            h,
+                            w,
+                            in_c_start + first,
+                            count,
+                            kh,
+                            kw,
+                            strides,
+                            pads,
+                            dilations,
+                            ow,
+                            col_start,
+                            col_end,
+                            batch,
+                            sub,
+                        );
+                    });
+                return;
+            }
+        }
+    }
+
+    im2col_block(
+        input,
+        c_in,
+        h,
+        w,
+        in_c_start,
+        c_per_group,
+        kh,
+        kw,
+        strides,
+        pads,
+        dilations,
+        ow,
+        col_start,
+        col_end,
+        batch,
+        col,
+    );
+}
+
 /// `C = A × B` with `beta = 0`, split by rows of `A` across rayon when large.
 #[inline]
-#[allow(unsafe_code)]
 pub(crate) fn sgemm_maybe_parallel(
     m: usize,
     k: usize,
@@ -527,18 +871,54 @@ pub(crate) fn sgemm_maybe_parallel(
     b: &[f32],
     c: &mut [f32],
 ) {
-    #[cfg(not(target_arch = "wasm32"))]
+    sgemm_maybe_parallel_ldc(m, k, n, a, b, c, n);
+}
+
+/// [`sgemm_maybe_parallel`] with an explicit row stride for `C`.
+///
+/// `ldc == n` is the packed case and reproduces `sgemm_maybe_parallel`
+/// exactly. `ldc > n` lets a column block of an im2col GEMM write straight
+/// into the columns of a wider output matrix it owns, with no staging buffer
+/// and no copy-back.
+#[inline]
+fn sgemm_maybe_parallel_ldc(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    ldc: usize,
+) {
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     {
         let num_threads = rayon::current_num_threads();
         if m.saturating_mul(k).saturating_mul(n) >= PARALLEL_GEMM_THRESHOLD && m >= num_threads * 2
         {
-            parallel_sgemm(m, k, n, a, b, c);
+            parallel_sgemm(m, k, n, a, b, c, ldc);
             return;
         }
     }
-    // SAFETY: `a` is [m, k], `b` is [k, n] and `c` is at least [m, n], all
-    // row-major and checked by the caller; the row/column strides below match
-    // that layout exactly.
+    sgemm_sequential_ldc(m, k, n, a, b, c, ldc);
+}
+
+/// One sequential `matrixmultiply::sgemm` call: `C = A × B`, `beta = 0`, with
+/// an explicit row stride for `C`.
+#[inline]
+#[allow(unsafe_code)]
+fn sgemm_sequential_ldc(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    ldc: usize,
+) {
+    // SAFETY: `a` is [m, k] and `b` is [k, n], both row-major and packed; `c`
+    // is a row-major `[m, >= n]` matrix of row stride `ldc >= n`, so the last
+    // element touched is `(m - 1) * ldc + n - 1`, within `c` by the caller's
+    // construction. The strides below match that layout exactly.
     unsafe {
         matrixmultiply::sgemm(
             m,
@@ -553,7 +933,7 @@ pub(crate) fn sgemm_maybe_parallel(
             1,
             0.0,
             c.as_mut_ptr(),
-            n as isize,
+            ldc as isize,
             1,
         );
     }
@@ -563,12 +943,17 @@ pub(crate) fn sgemm_maybe_parallel(
 /// into `dst` (`[c_out_per_group, col_cols]`, row-major) instead of
 /// allocating and returning a fresh `Vec<f32>`.
 ///
-/// `col_scratch` must have length `>= col_rows * col_cols`; it is reused
+/// `col_scratch` must have length `>= col_rows * block_cols`; it is reused
 /// across calls by the caller (one buffer per rayon worker via
 /// `for_each_init`, or one buffer for the whole wasm32 loop) rather than
-/// allocated fresh per job. Safe to reuse dirty, since `im2col_adaptive`
-/// unconditionally overwrites every element it uses of `col_scratch`,
-/// including explicit zero-fills for padding.
+/// allocated fresh per job. Safe to reuse dirty, since `im2col_adaptive` and
+/// [`im2col_block`] unconditionally overwrite every element they use of
+/// `col_scratch`, including explicit zero-fills for padding.
+///
+/// `block_cols == col_cols` means the whole column matrix fits the workspace
+/// cap: the job runs as one im2col + one GEMM, exactly as before. Otherwise
+/// the output columns are walked in blocks of `block_cols`, each GEMM writing
+/// into the columns of `dst` it owns (row stride `col_cols`).
 #[allow(clippy::too_many_arguments)]
 fn conv2d_single_job_into(
     input: &[f32],
@@ -588,55 +973,79 @@ fn conv2d_single_job_into(
     ow: usize,
     col_rows: usize,
     col_cols: usize,
+    block_cols: usize,
     batch: usize,
     g: usize,
     col_scratch: &mut [f32],
     dst: &mut [f32],
 ) {
-    let col = &mut col_scratch[..col_rows * col_cols];
     let in_c_start = g * c_per_group;
-    im2col_adaptive(
-        input,
-        c_in,
-        h,
-        w,
-        in_c_start,
-        c_per_group,
-        kh,
-        kw,
-        strides,
-        pads,
-        dilations,
-        oh,
-        ow,
-        batch,
-        col,
-    );
-
     let w_off = g * c_out_per_group * col_rows;
 
-    // Already inside a rayon job — keep the inner GEMM sequential.
-    // SAFETY: same layout contract as `sgemm_maybe_parallel`; `dst` is at
-    // least `c_out_per_group * col_cols` long (the caller's `par_chunks_mut`
-    // / `chunks_mut` chunk size), matching `[c_out_per_group, col_cols]`.
-    #[allow(unsafe_code)]
-    unsafe {
-        matrixmultiply::sgemm(
+    // Already inside a rayon job — keep the inner GEMMs sequential.
+    if block_cols == col_cols {
+        let col = &mut col_scratch[..col_rows * col_cols];
+        im2col_adaptive(
+            input,
+            c_in,
+            h,
+            w,
+            in_c_start,
+            c_per_group,
+            kh,
+            kw,
+            strides,
+            pads,
+            dilations,
+            oh,
+            ow,
+            batch,
+            col,
+        );
+        sgemm_sequential_ldc(
             c_out_per_group,
             col_rows,
             col_cols,
-            1.0,
-            weight[w_off..].as_ptr(),
-            col_rows as isize,
-            1,
-            col.as_ptr(),
-            col_cols as isize,
-            1,
-            0.0,
-            dst.as_mut_ptr(),
-            col_cols as isize,
-            1,
+            &weight[w_off..],
+            col,
+            dst,
+            col_cols,
         );
+    } else {
+        let mut col_start = 0;
+        while col_start < col_cols {
+            let col_end = (col_start + block_cols).min(col_cols);
+            let block_w = col_end - col_start;
+            let col_block = &mut col_scratch[..col_rows * block_w];
+            im2col_block(
+                input,
+                c_in,
+                h,
+                w,
+                in_c_start,
+                c_per_group,
+                kh,
+                kw,
+                strides,
+                pads,
+                dilations,
+                ow,
+                col_start,
+                col_end,
+                batch,
+                col_block,
+            );
+            sgemm_sequential_ldc(
+                c_out_per_group,
+                col_rows,
+                block_w,
+                &weight[w_off..],
+                col_block,
+                &mut dst[col_start..],
+                col_cols,
+            );
+            col_start = col_end;
+        }
     }
 
     if let Some(b) = bias {
@@ -705,23 +1114,41 @@ fn conv2d_1x1_into(
 }
 
 /// Split a large sgemm (C = A × B) by rows of A across rayon threads.
-/// A: [m, k] row-major, B: [k, n] row-major, C: [m, n] row-major.
+/// A: [m, k] row-major, B: [k, n] row-major, C: [m, >= n] row-major.
 ///
 /// Each thread runs the *same* `matrixmultiply::sgemm` over a disjoint row
 /// band, and the K-blocking (hence the accumulation order of every output
 /// element) does not depend on `m`, so the result is bit-identical to one
 /// sequential call — asserted by `parallel_sgemm_is_bitwise_identical`.
-#[cfg(not(target_arch = "wasm32"))]
+///
+/// `ldc` is the row stride of `C`; `ldc == n` is the packed case. The row
+/// bands stay disjoint whatever the stride: band `t` owns rows
+/// `[t * chunk, (t + 1) * chunk)`, and a band's slice may cover the columns
+/// beyond `n` of its own last row — which this GEMM never writes, and which
+/// belong to a different column block of the *same* job, processed before or
+/// after this call, never concurrently.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 #[allow(unsafe_code)] // matrixmultiply::sgemm requires unsafe
-pub(crate) fn parallel_sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+pub(crate) fn parallel_sgemm(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    ldc: usize,
+) {
+    if m == 0 || n == 0 || ldc == 0 {
+        return;
+    }
     let num_threads = rayon::current_num_threads();
     let chunk = m.div_ceil(num_threads.max(1)).max(1);
 
     // `par_chunks_mut` hands each thread a disjoint, correctly-sized row band
     // of C, so the tiles are written in place — no scratch allocation and no
     // second pass over the result.
-    c[..m * n]
-        .par_chunks_mut(chunk * n)
+    c[..(m - 1) * ldc + n]
+        .par_chunks_mut(chunk * ldc)
         .enumerate()
         .for_each(|(t, tile)| {
             let row_start = t * chunk;
@@ -730,8 +1157,10 @@ pub(crate) fn parallel_sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32],
             }
             let tile_m = (m - row_start).min(chunk);
             // SAFETY: `a` is [m, k] row-major so row `row_start` starts at
-            // `row_start * k`; `tile` is exactly `tile_m * n` elements, the
-            // last chunk being the short one.
+            // `row_start * k`; `tile` starts at row `row_start` of C and spans
+            // `(tile_m - 1) * ldc + n` elements or more — full chunks are
+            // `chunk * ldc >= (chunk - 1) * ldc + n` since `ldc >= n`, and the
+            // final short chunk ends exactly at the last element written.
             unsafe {
                 matrixmultiply::sgemm(
                     tile_m,
@@ -746,7 +1175,7 @@ pub(crate) fn parallel_sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32],
                     1,
                     0.0,
                     tile.as_mut_ptr(),
-                    n as isize,
+                    ldc as isize,
                     1,
                 );
             }

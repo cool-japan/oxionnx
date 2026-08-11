@@ -2,7 +2,7 @@
 
 use oxionnx_core::{OnnxError, Tensor};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 use super::gemm::should_parallelize;
 #[cfg(feature = "simd")]
 use super::gemm::SGEMM_MIN_ROWS;
@@ -429,6 +429,13 @@ impl SdpaJob<'_> {
 
     /// Multiply-accumulates for one `(batch, head)` slice — the parallelism
     /// threshold input.
+    ///
+    /// Only ever consulted by the `should_parallelize` check that picks
+    /// between [`Self::run_parallel`] and [`Self::run_serial`], which is
+    /// itself compiled out of a serial wasm32 build (no rayon there, so that
+    /// target always takes the serial path); gated the same way so it is not
+    /// dead code there.
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn macs_per_slice(&self) -> usize {
         self.seq_q
             .saturating_mul(self.seq_k)
@@ -497,7 +504,7 @@ impl SdpaJob<'_> {
     /// Rayon driver: every `(batch, head)` pair is independent, so each becomes
     /// one task writing its own `seq_q × d_v` output chunk. Scratch is
     /// allocated per worker (via `for_each_init`), not per slice.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     fn run_parallel(&self, batch: usize, out: &mut [f32]) {
         use rayon::prelude::*;
         let unit = self.seq_q * self.d_v;
@@ -672,13 +679,13 @@ pub(crate) fn sdpa_into(
     // `par_chunks_mut(0)` panics, so degenerate slices stay on the serial path
     // (where they are a no-op / zero fill).
     if seq_q != 0 && d_v != 0 {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
         if should_parallelize(batch, job.macs_per_slice()) {
             job.run_parallel(batch, out);
         } else {
             job.run_serial(batch, out);
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
         job.run_serial(batch, out);
     }
 

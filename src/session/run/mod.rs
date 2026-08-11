@@ -2,8 +2,13 @@ mod dispatch;
 mod entry;
 mod parallel;
 pub(super) mod plan;
-mod scheduling;
+pub(crate) mod scheduling;
 mod sequential;
+/// The asynchronous node loop that lets WebGPU work be awaited rather than
+/// blocked on. Compiled only with the `gpu` feature, which is the only backend
+/// that has an asynchronous interface at all.
+#[cfg(feature = "gpu")]
+mod sequential_async;
 mod shape_resolution;
 mod state;
 mod text;

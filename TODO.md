@@ -1,10 +1,10 @@
-# OxiONNX 0.1.5 -- Pure Rust ONNX Inference Engine
+# OxiONNX 0.1.6 -- Pure Rust ONNX Inference Engine
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
 **Author:** COOLJAPAN OU (Team Kitasan)
 
-**Current stats (2026-08-06):** ~126,388 SLoC (Rust code, tokei) | 190 OpKind variants | 188 registered operators (203 op-type strings incl. aliases) | 2,946 tests passing | workspace layout (8 crates)
+**Current stats (2026-08-11):** ~143,426 SLoC (Rust code, tokei) | 190 OpKind variants | 188 registered operators (203 op-type strings incl. aliases) | 3,212 tests passing | workspace layout (8 crates)
 **Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)
 **Zero C/C++ dependencies.**
 
@@ -210,9 +210,9 @@ Summary of key items:
 - [x] Shader library -- WGSL compute shaders for MatMul, Conv2D, element-wise ops, Softmax, Reduction, Attention
 - [x] Automatic CPU-to-GPU fallback when an operator has no GPU kernel
 - [x] GPU memory pool -- reuse `wgpu::Buffer` allocations across inference calls
-- [ ] Host-device transfer minimization -- keep tensors on GPU between consecutive GPU-capable nodes (never actually implemented: `GpuTensorTracker` promised this but nothing ever called `store`/`take`/`is_on_gpu` outside its own unit test; deleted as dead code in v0.1.5 wave 2 rather than left as a false claim. Real keep-on-GPU chaining needs `Tensor` to carry a device buffer, or the session executor to hold a residency map, plus buffer-taking variants of every `gpu_*` entry point -- none of which is a change local to `oxionnx-gpu`)
+- [~] Host-device transfer minimization -- **weights: done (session-lifetime); activations: done (run-scoped), shipped v0.1.6.** A graph's initializers (conv `W`/`B`, `Gemm` `B`/`C`) are uploaded once per session and bound from a device-side residency cache on every later dispatch (`oxionnx-gpu/src/context/resident.rs`, keyed by initializer name from `src/session/gpu_dispatch.rs`) -- 502.7 MB of InSwapper-128 weights that used to cross the bus every frame now cross it once. Activations: `src/session/gpu_activations.rs`'s `RunActivations` now lets a GPU node's output stay in its device buffer for the next GPU consumer to bind in place, instead of a read-back + re-upload at every node boundary -- toggle via `Session::activation_residency_enabled()`/`set_activation_residency()`. Scope is deliberately narrower than weight residency, which is why the checkbox stays partial: it lasts only for the one `run()` call rather than across calls, a name is excluded entirely unless *every* consumer can bind it resident (`op_accepts_resident_slot`), and values captured into an `If`/`Loop` subgraph are always excluded since the subgraph body runs on the CPU. `GpuTensorTracker`, which promised the whole thing and was called by nothing, was deleted as dead code in v0.1.5 wave 2 -- its replacement is actually wired into the dispatcher and covered by 5 end-to-end tests (`src/session/tests/gpu_activation.rs`).
 - [x] Tiled MatMul with shared memory for large dimensions
-- [ ] WebGPU compatibility for wasm32 targets (honestly declined as of v0.1.5 wave 2: `GpuContext::try_new`/`try_new_async` return `None` on wasm32 at context-creation time, so the CPU path runs directly. Before this, a wasm32 context still uploaded inputs, encoded a pass, and called `queue.submit` for every node, then discarded the result because blocking `map_async` readback is impossible in the browser -- pure overhead that could never produce a value. Restoring real browser acceleration needs an `async` variant of every `gpu_*` entry point plus a `wasm-bindgen-futures` bridge, a public API split, not a local fix)
+- [~] WebGPU compatibility for wasm32 targets -- **context + kernels: done; browser (`WasmSession`) wiring and in-browser verification: not started.** Honestly declined as of v0.1.5 wave 2: `GpuContext::try_new`/`try_new_async` returned `None` on wasm32 at context-creation time, so the CPU path ran directly -- before that, a wasm32 context still uploaded inputs, encoded a pass, and called `queue.submit` for every node, then discarded the result because blocking `map_async` readback is impossible in the browser, pure overhead that could never produce a value. Fixed in v0.1.6 for `try_new_async` specifically (the synchronous `try_new` still returns `None` on wasm32 by design): it now acquires a real `wgpu::Backends::BROWSER_WEBGPU` adapter, every kernel's read-back is an `async fn` awaiting a genuine `map_async` promise (`device_guard::read_back_web`, `#[cfg(target_arch = "wasm32")]`-gated), and `Session::enable_gpu_async()`/`Session::run_gpu_async()` are the entry points that drive them. Proven only on native so far -- `pollster::block_on`-driven tests (`src/session/run/sequential_async.rs`, `src/session/gpu_dispatch_tests.rs`, `src/session/tests/gpu_{activation,f16}.rs`) exercise the async entry points and run loop, but on native `enable_gpu_async` takes the blocking `try_new` branch and read-back goes through `read_back_blocking`, not `BROWSER_WEBGPU` acquisition or `read_back_web` -- so those two browser-specific pieces have zero runtime coverage anywhere. `src/wasm.rs`'s `WasmSession` (what JS callers actually use) has no GPU/async-GPU references at all and still calls the synchronous `Session::run`, and there is no `wasm-bindgen-test` anywhere in the repo (`scripts/check_wasm.sh` only builds the CPU-only `wasm` feature) -- so wiring `WasmSession` to the async path and validating it in a real browser remains open work
 - [x] Benchmark GPU vs CPU paths for each operator; auto-select fastest
 
 ---
@@ -285,7 +285,7 @@ Summary of key items:
 
 ### Foreign Bindings
 
-- [x] `wasm-bindgen` feature -- run in browser via WebAssembly
+- [x] `wasm-bindgen` feature -- run in browser via WebAssembly. `cargo check`/`build --target wasm32-unknown-unknown --features wasm` compiled since v0.1.4, but CPU inference actually *worked* at runtime only from v0.1.6: `oxifft`'s default `threading` feature was a `compile_error!` on wasm32 (worked around by `oxionnx-ops` splitting it per-target), and `std::time::Instant`/`SystemTime` panic unconditionally on that target at the first timed load/dispatch call (fixed via `web_time`-backed `time_compat` modules in `oxionnx` and `oxionnx-ops`). `run_async`/`spawn_run`/`block_on` (thread-per-inference) remain native-only -- wasm32-unknown-unknown cannot spawn OS threads -- and are now a compile-time-absent API on that target rather than a runtime panic; call `Session::run` synchronously in the browser. `+simd128` (matrixmultiply's `v128` `sgemm` kernel) measured ~3-4.3x over scalar. `gpu` + `wasm` together now build: `Session`'s `Send + Sync` compile-time assertion (`src/session/mod.rs`) is wasm32-exempt, and an async WebGPU execution path exists (`Session::enable_gpu_async`/`run_gpu_async`, `GpuContext::try_new_async` acquiring a `wgpu::Backends::BROWSER_WEBGPU` adapter, kernels awaiting a real `map_async` read-back) -- proven on native targets only so far (see the WebGPU-compatibility entry under Section 8, GPU Backend, above for the native/browser coverage split); `WasmSession` (`src/wasm.rs`) does not yet call any of it and still runs every GPU-eligible node on the CPU
 - [x] ~~Python bindings via PyO3~~ (out of scope: requires CPython C dependency; reference doc at /tmp/oxionnx-python-reference.md)
 - [x] Pre-built binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) (CI workflow created)
 
@@ -766,3 +766,61 @@ session, unconditionally.
       version (item 18) has a loose enough margin to survive either outcome, but should be
       revisited to assert something meaningful again once GPU context creation is no longer the
       dominant cost
+
+## 20. v0.1.6 — GPU Residency, Async WebGPU, InstanceNorm Fusion (2026-08-11) — COMPLETE
+
+Shipped work for this release, summarized from `CHANGELOG.md`'s `## [0.1.6]` section (the
+authoritative source — see there for full detail).
+
+- [x] `oxionnx-gpu/src/context/resident.rs`: `ResidentBuffers` — session-lifetime GPU weight
+      residency; `Conv`'s `W`/`B` and `Gemm`'s `B`/`C` initializers now upload once per session
+      instead of once per dispatch (502.7 MB/frame → once, InSwapper-128)
+- [x] `src/session/gpu_activations.rs`: `RunActivations` (new) — run-scoped GPU activation
+      residency; a GPU node's output can now stay device-resident for the next GPU consumer
+      instead of a read-back + re-upload at every node boundary; toggle via
+      `Session::set_activation_residency()`
+- [x] `src/session/run/sequential_async.rs` (new, ~932 lines) + `gpu_dispatch.rs`'s
+      `try_gpu_dispatch_async`: `Session::run_gpu_async`/`enable_gpu_async` — a genuinely async
+      GPU execution path (awaited, not thread-blocked); proven on native targets only so far
+- [x] `oxionnx-gpu`: `GpuContext::try_new_async` now acquires a real
+      `wgpu::Backends::BROWSER_WEBGPU` adapter, and kernel read-back is a real `async fn` via
+      `device_guard::read_back_web`'s `map_async` — `gpu` + `wasm32` now builds together
+      (`Session: Send + Sync` assertion is wasm32-exempt); not yet wired into `WasmSession`
+- [x] wasm32-unknown-unknown CPU inference **actually works at runtime now**, not just compiles
+      (every prior release's claim was compile-only): `oxifft`'s default `threading` feature
+      target-split per-arch, a new `time_compat` module replacing `Instant`/`SystemTime` panics
+      on wasm32, `session::async_run` now `#[cfg(not(target_arch = "wasm32"))]` (compile-time
+      absent instead of a runtime panic)
+- [x] `src/optimizer/fusion/instance_norm.rs`: `fuse_instance_norm` — recognizes decomposed
+      AdaIN-style 8-node normalization chains (the only form PyTorch can export for this case)
+      and collapses them into a single `OxiInstanceNorm` op (12 chains in InSwapper-128); matching
+      GPU kernel in `oxionnx-gpu/src/shaders/instance_norm.rs`
+- [x] `oxionnx-gpu/src/shaders/conv2d.rs`: `gpu_conv2d_implicit` — a direct implicit-GEMM Conv2D
+      kernel replacing a CPU/GPU hybrid that measured slower than the plain CPU operator
+      (~692 GFLOP/s at InSwapper's 128×128 decoder layer, M3)
+- [x] `oxionnx-gpu`: four new WGSL kernels — `broadcast_binary.rs` (NumPy-style broadcast for
+      Add/Sub/Mul/Div), `gemm.rs`'s `gpu_gemm_nt` (transposed-B Gemm), `prelu.rs`, `resize.rs`
+      (bilinear/nearest) — plus `f16_variant.rs` (half-precision kernels derived from the f32
+      source by textual substitution) and `kernel_support.rs` (compiled-pipeline caching)
+- [x] `src/session/gpu_residency.rs`: `gpu_min_transfer_elements`/`ResidencyTier` — a measured
+      two-tier size gate deciding whether a node is worth dispatching to the GPU at all, closing
+      regressions of up to 36x that weight residency alone would have reopened
+- [x] `oxionnx-gpu/src/context/budget.rs`: `TrackedBuffer`/`GpuMemoryBudget` (new) — the reusable
+      buffer pool no longer leaks device memory without bound (`WebBuffer::drop` is a no-op on
+      wgpu 29.0.4); every allocation is now checked against a live-byte budget (1.5 GiB default)
+      before creation
+- [x] `src/session/gpu_dispatch.rs`: `normalize_reduce_axes`/`normalize_single_reduce_axis` fix —
+      GPU `Reduce*` no longer wraps a negative axis into a huge `usize`, and a full reduction now
+      reports the correct rank-0 output shape instead of `[1]`
+- [x] `oxionnx-ops`'s `conv2d.rs`: CPU im2col workspace capped at 64 MiB
+      (`IM2COL_WORKSPACE_MAX_BYTES`) — output columns now processed in bit-identical blocks
+      instead of scaling unbounded with kernel volume × output area (a wasm32 OOM risk)
+- [x] `oxionnx-gpu`: WGSL `reflect`-mode `Pad` kernel fix — `reflect_coord`'s modulo assumed
+      WGSL's `%` returns a sign-of-dividend remainder on a negative operand; Vulkan/NVIDIA
+      returns the unsigned two's-complement remainder instead, producing wrong values in the
+      leading padding region
+- [x] `oxionnx-coreml`: on-disk `.mlpackage` compile cache (`compile_cache.rs`, content-keyed by
+      path/length/mtime) fixes an unbounded leak (7,408 orphaned `.mlmodelc` trees / 857 GB
+      measured) and cuts a warm three-model load from ~4.34s to ~0.14s (M3); output extraction
+      (`array_read.rs`'s `CopyPlan`) fused into a single pass, 2.7x faster on SCRFD's padded
+      outputs

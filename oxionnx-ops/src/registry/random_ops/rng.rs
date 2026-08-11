@@ -30,9 +30,10 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use oxionnx_core::Attributes;
+
+use crate::time_compat::{SystemTime, UNIX_EPOCH};
 
 /// SplitMix64: used only to expand a `u64` seed into two well-distributed
 /// `u64` lanes for xorshift128+'s state (feeding xorshift128+ small/sequential

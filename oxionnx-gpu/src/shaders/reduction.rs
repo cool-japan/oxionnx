@@ -1,11 +1,10 @@
 //! GPU-accelerated reduction operations (sum, max, min, mean).
 
 use crate::context::GpuContext;
-use wgpu::util::DeviceExt;
 
 use super::common::{
-    checked_storage_bytes, plan_dispatch, read_back_and_recycle, DispatchGrid, ErrorScope,
-    ReduceParams, REDUCE_GPU_THRESHOLD, WG_SIZE,
+    block_on_gpu, checked_storage_bytes, plan_dispatch, read_back_and_recycle_async, DispatchGrid,
+    ErrorScope, ReduceParams, REDUCE_GPU_THRESHOLD, WG_SIZE,
 };
 
 // ========================================================================
@@ -57,8 +56,13 @@ fn reduce_plan(
     }
     // Both the input and the output are bound as storage buffers.
     let out_size = checked_storage_bytes(&ctx.limits, out_count)?;
-    checked_storage_bytes(&ctx.limits, total_in)?;
+    let in_size = checked_storage_bytes(&ctx.limits, total_in)?;
     if !ctx.limits.buffer_fits(out_size) {
+        return None;
+    }
+    // Input, output and read-back staging. Checked here rather than in each
+    // dispatcher because both of them allocate exactly these three.
+    if !ctx.budget_admits(&[in_size, out_size, out_size]) {
         return None;
     }
     let grid = plan_dispatch(&ctx.limits, out_count as u64, WG_SIZE)?;
@@ -66,7 +70,7 @@ fn reduce_plan(
 }
 
 /// Internal helper for reduction GPU dispatch.
-pub(super) fn gpu_reduce_dispatch(
+pub(super) async fn gpu_reduce_dispatch(
     ctx: &GpuContext,
     data: &[f32],
     axis: usize,
@@ -81,20 +85,26 @@ pub(super) fn gpu_reduce_dispatch(
 
     let scope = ErrorScope::begin(ctx);
 
-    let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("reduce_in"),
-        contents: bytemuck::cast_slice(&data[..total_in]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let input_buf = ctx.upload_buffer(
+        "reduce_in",
+        bytemuck::cast_slice(&data[..total_in]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let output_buf = {
-        let mut pool = ctx.pool.lock().ok()?;
-        pool.get_buffer(
-            device,
-            out_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        )
-    };
+    let output_buf = ctx.pooled_buffer(
+        out_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    )?;
+    // The pool may hand back a buffer up to 2x `out_size` -- see
+    // `GpuBufferPool::get_buffer` -- and `as_entire_binding()` would then bind
+    // that larger size, which can exceed `max_storage_buffer_binding_size`
+    // even though `out_size` itself was validated. Bind the exact range
+    // instead, as `conv2d::gpu_conv2d_implicit_resident_async`'s `output_binding` does.
+    let output_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &output_buf,
+        offset: 0,
+        size: wgpu::BufferSize::new(out_size),
+    });
 
     let params = ReduceParams {
         outer_size: outer as u32,
@@ -102,18 +112,13 @@ pub(super) fn gpu_reduce_dispatch(
         inner_size: inner as u32,
         row_threads: grid.threads_per_row,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("reduce_params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "reduce_params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("reduce_staging"),
-        size: out_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging_buf = ctx.staging_buffer("reduce_staging", out_size)?;
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("reduce_bg"),
@@ -125,7 +130,7 @@ pub(super) fn gpu_reduce_dispatch(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: output_buf.as_entire_binding(),
+                resource: output_binding,
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -149,47 +154,83 @@ pub(super) fn gpu_reduce_dispatch(
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    if !scope.finish(ctx) {
+    if !scope.finish_async(ctx).await {
         return None;
     }
 
-    read_back_and_recycle(ctx, &staging_buf, out_count, output_buf)
+    read_back_and_recycle_async(ctx, &staging_buf, out_count, output_buf).await
 }
 
 /// GPU-accelerated parallel reduction (sum) along an axis.
 ///
 /// Returns `None` if the output is too small for GPU benefit.
+pub async fn gpu_reduce_sum_async(
+    ctx: &GpuContext,
+    data: &[f32],
+    axis: usize,
+    shape: &[usize],
+) -> Option<Vec<f32>> {
+    gpu_reduce_dispatch(ctx, data, axis, shape, &ctx.reduce_sum_pipeline).await
+}
+
+/// Blocking form of [`gpu_reduce_sum_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
 pub fn gpu_reduce_sum(
     ctx: &GpuContext,
     data: &[f32],
     axis: usize,
     shape: &[usize],
 ) -> Option<Vec<f32>> {
-    gpu_reduce_dispatch(ctx, data, axis, shape, &ctx.reduce_sum_pipeline)
+    block_on_gpu(gpu_reduce_sum_async(ctx, data, axis, shape))
 }
 
 /// GPU-accelerated parallel reduction (max) along an axis.
 ///
 /// Returns `None` if the output is too small for GPU benefit.
+pub async fn gpu_reduce_max_async(
+    ctx: &GpuContext,
+    data: &[f32],
+    axis: usize,
+    shape: &[usize],
+) -> Option<Vec<f32>> {
+    gpu_reduce_dispatch(ctx, data, axis, shape, &ctx.reduce_max_pipeline).await
+}
+
+/// Blocking form of [`gpu_reduce_max_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
 pub fn gpu_reduce_max(
     ctx: &GpuContext,
     data: &[f32],
     axis: usize,
     shape: &[usize],
 ) -> Option<Vec<f32>> {
-    gpu_reduce_dispatch(ctx, data, axis, shape, &ctx.reduce_max_pipeline)
+    block_on_gpu(gpu_reduce_max_async(ctx, data, axis, shape))
 }
 
 /// GPU-accelerated parallel reduction (min) along an axis.
 ///
 /// Returns `None` if the output is too small for GPU benefit.
+pub async fn gpu_reduce_min_async(
+    ctx: &GpuContext,
+    data: &[f32],
+    axis: usize,
+    shape: &[usize],
+) -> Option<Vec<f32>> {
+    gpu_reduce_dispatch(ctx, data, axis, shape, &ctx.reduce_min_pipeline).await
+}
+
+/// Blocking form of [`gpu_reduce_min_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
 pub fn gpu_reduce_min(
     ctx: &GpuContext,
     data: &[f32],
     axis: usize,
     shape: &[usize],
 ) -> Option<Vec<f32>> {
-    gpu_reduce_dispatch(ctx, data, axis, shape, &ctx.reduce_min_pipeline)
+    block_on_gpu(gpu_reduce_min_async(ctx, data, axis, shape))
 }
 
 // ========================================================================
@@ -201,7 +242,7 @@ pub fn gpu_reduce_min(
 /// Reduces the input along each axis in `axes` sequentially.
 /// For a single axis, uses the GPU reduce_mean kernel directly.
 /// Returns `None` if below threshold or on error.
-pub fn gpu_reduce_mean(
+pub async fn gpu_reduce_mean_async(
     ctx: &GpuContext,
     data: &[f32],
     shape: &[usize],
@@ -214,7 +255,7 @@ pub fn gpu_reduce_mean(
     // For single-axis reduction, dispatch directly
     if axes.len() == 1 {
         let axis = axes[0];
-        return gpu_reduce_mean_single(ctx, data, axis, shape);
+        return gpu_reduce_mean_single(ctx, data, axis, shape).await;
     }
     // For multi-axis: reduce axes one at a time (largest first to keep indices valid)
     let mut sorted_axes: Vec<usize> = axes.to_vec();
@@ -234,7 +275,7 @@ pub fn gpu_reduce_mean(
         if axis >= current_shape.len() {
             return None;
         }
-        let result = gpu_reduce_mean_single(ctx, &current_data, axis, &current_shape)?;
+        let result = gpu_reduce_mean_single(ctx, &current_data, axis, &current_shape).await?;
         // Update shape: remove the reduced axis
         current_shape.remove(axis);
         if current_shape.is_empty() {
@@ -246,8 +287,21 @@ pub fn gpu_reduce_mean(
     Some(current_data)
 }
 
+/// Blocking form of [`gpu_reduce_mean_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
+pub fn gpu_reduce_mean(
+    ctx: &GpuContext,
+    data: &[f32],
+    shape: &[usize],
+    axes: &[usize],
+    keepdims: bool,
+) -> Option<Vec<f32>> {
+    block_on_gpu(gpu_reduce_mean_async(ctx, data, shape, axes, keepdims))
+}
+
 /// GPU-accelerated ReduceMean along a single axis.
-fn gpu_reduce_mean_single(
+async fn gpu_reduce_mean_single(
     ctx: &GpuContext,
     data: &[f32],
     axis: usize,
@@ -261,20 +315,26 @@ fn gpu_reduce_mean_single(
 
     let scope = ErrorScope::begin(ctx);
 
-    let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("reduce_mean_in"),
-        contents: bytemuck::cast_slice(&data[..total_in]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let input_buf = ctx.upload_buffer(
+        "reduce_mean_in",
+        bytemuck::cast_slice(&data[..total_in]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let output_buf = {
-        let mut pool = ctx.pool.lock().ok()?;
-        pool.get_buffer(
-            device,
-            out_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        )
-    };
+    let output_buf = ctx.pooled_buffer(
+        out_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    )?;
+    // The pool may hand back a buffer up to 2x `out_size` -- see
+    // `GpuBufferPool::get_buffer` -- and `as_entire_binding()` would then bind
+    // that larger size, which can exceed `max_storage_buffer_binding_size`
+    // even though `out_size` itself was validated. Bind the exact range
+    // instead, as `conv2d::gpu_conv2d_implicit_resident_async`'s `output_binding` does.
+    let output_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &output_buf,
+        offset: 0,
+        size: wgpu::BufferSize::new(out_size),
+    });
 
     let params = ReduceParams {
         outer_size: outer as u32,
@@ -282,18 +342,13 @@ fn gpu_reduce_mean_single(
         inner_size: inner as u32,
         row_threads: grid.threads_per_row,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("reduce_mean_params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "reduce_mean_params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("reduce_mean_staging"),
-        size: out_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging_buf = ctx.staging_buffer("reduce_mean_staging", out_size)?;
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("reduce_mean_bg"),
@@ -305,7 +360,7 @@ fn gpu_reduce_mean_single(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: output_buf.as_entire_binding(),
+                resource: output_binding,
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -329,9 +384,9 @@ fn gpu_reduce_mean_single(
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    if !scope.finish(ctx) {
+    if !scope.finish_async(ctx).await {
         return None;
     }
 
-    read_back_and_recycle(ctx, &staging_buf, out_count, output_buf)
+    read_back_and_recycle_async(ctx, &staging_buf, out_count, output_buf).await
 }

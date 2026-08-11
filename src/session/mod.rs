@@ -6,13 +6,32 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 mod accessors;
+// `run_async`/`spawn_run` start inference on a plain `std::thread`, which
+// compiles on wasm32-unknown-unknown but panics the instant it is called
+// (that target cannot spawn OS threads at all). Nothing on the wasm-facing
+// API (`crate::wasm::WasmSession`, which calls `Session::run` synchronously)
+// references this module, so it is compiled out entirely on wasm32 rather
+// than kept around as dead weight or a fake stub nobody asked for -- a
+// caller reaching for `oxionnx::run_async` there gets a compile-time "not
+// found" instead of the previous runtime panic.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod async_run;
 mod builder;
 pub mod cancellation;
+/// The run-scoped map from tensor name to device buffer: which activations stay
+/// on the device, and when each one is destroyed.
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_activations;
 #[cfg(feature = "gpu")]
 mod gpu_dispatch;
 #[cfg(feature = "gpu")]
 mod gpu_owner;
+// The summary of this module lives in its own `//!` header rather than here.
+// A doc comment at the declaration site and one inside the file are merged,
+// and rustdoc then resolves the whole merged block in *this* module's scope —
+// which makes every `[`gpu_min_transfer_elements`]`-style link in the header
+// unresolvable. Keeping the docs in one place keeps the links working.
+pub mod gpu_residency;
 mod loading;
 pub(crate) mod mixed_precision;
 mod run;
@@ -22,6 +41,7 @@ pub mod types;
 
 pub use types::{ModelInfo, ModelMetadata, NodeProfile, OptLevel};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use async_run::{block_on, RunFuture, RunHandle};
 pub use cancellation::CancellationToken;
 pub use serialize::{SessionCacheHeader, SESSION_CACHE_FORMAT_VERSION, SESSION_CACHE_MAGIC};
@@ -202,14 +222,38 @@ impl ShapePlanCache {
 // assertion the failure would surface as a wall of inscrutable rayon trait-bound
 // errors from *parallel.rs*, far away from the field that actually broke it.
 //
-// The assertion is deliberately NOT `#[cfg]`-gated, so it is enforced under
-// every feature combination — no features, `gpu`, `cuda`, `directml`, and all
-// together.  Any provider context added to `Session` must be `Send + Sync`
-// (wrap non-thread-safe device handles in a `Mutex`, or make the context own a
-// thread-confined worker it talks to via channels).
+// The assertion is enforced under every *native* feature combination — no
+// features, `gpu`, `cuda`, `directml`, and all together.  Any provider context
+// added to `Session` must be `Send + Sync` (wrap non-thread-safe device handles
+// in a `Mutex`, or make the context own a thread-confined worker it talks to
+// via channels).
+//
+// ── Why wasm32 is exempt ────────────────────────────────────────────────────
+//
+// Every reason above is a *threading* reason, and wasm32-unknown-unknown has no
+// threads on any path this crate takes:
+//
+//   * `run_parallel_inner`'s rayon dependency is declared only for
+//     `cfg(not(target_arch = "wasm32"))` (see the root `Cargo.toml`), and
+//     `run_internal` forces `use_parallel = false` there, so no `&Session` is
+//     ever shared across workers.
+//   * `session::async_run` — the only other cross-thread user — is compiled out
+//     entirely on wasm32 (see its module gate above).
+//   * A wasm session is single-owner by construction: the wasm-bindgen surface
+//     that wraps it (`crate::wasm::WasmSession`) is itself `!Send`, because
+//     every JS handle it can hold is, so a `Send` bound on `Session` could not
+//     buy a caller anything even if it held.
+//
+// And it cannot hold: with `--features wasm,gpu` the session owns a
+// `GpuContext`, whose `wgpu::Device`/`Queue`/`Buffer` are `Rc`-backed
+// `WebDevice`/`WebBuffer` handles on the WebGPU backend — `!Send + !Sync` by
+// construction, since a `GPUDevice` belongs to the JS agent that created it and
+// cannot cross a worker boundary at all. Asserting `Send + Sync` there does not
+// catch a bug; it forbids the only GPU backend the browser has.
 //
 // This is a compile-time check with zero runtime cost: it is evaluated during
 // const-checking and produces no code.
+#[cfg(not(target_arch = "wasm32"))]
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Session>();

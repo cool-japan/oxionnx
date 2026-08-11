@@ -17,6 +17,23 @@ categories = ["science", "graphics"]
 oxionnx-core = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
+# [w2-f16] Host-side `f32 -> f16` conversion for the opt-in half-precision
+# weight copies (`context::weight_format`). Pure Rust, already a workspace
+# dependency of the root crate, and used here only at weight-upload time —
+# never per dispatch.
+half = { workspace = true }
+
+[dev-dependencies]
+# [c3] Reference convolution for the Conv2D kernel's parity sweep and its
+# CPU-vs-GPU benchmark (`tests/c3_conv2d_parity.rs`,
+# `examples/c3_conv2d_gflops.rs`). Dev-only and cycle-free: `oxionnx-ops`
+# depends on core/matrixmultiply/half/rayon/oxifft, never on this crate.
+# Path-only (not `{ workspace = true }`): a sibling `workspace = true` dev-dep
+# expands to path+version in the packaged manifest, and `cargo publish` then
+# refuses to package this crate until that sibling's *new* version is already
+# on crates.io. Path-only dev-deps are stripped from the published manifest
+# entirely, so this has no such ordering requirement.
+oxionnx-ops = { path = "../oxionnx-ops" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = { workspace = true }

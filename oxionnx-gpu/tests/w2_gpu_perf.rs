@@ -17,7 +17,7 @@
 use std::time::Instant;
 
 use oxionnx_core::Tensor;
-use oxionnx_gpu::{gpu_conv2d, gpu_softmax, GpuBufferPool, GpuContext};
+use oxionnx_gpu::{gpu_conv2d, gpu_softmax, GpuBufferPool, GpuContext, TrackedBuffer};
 
 fn context() -> Option<GpuContext> {
     GpuContext::try_new()
@@ -360,8 +360,11 @@ fn w2_buffer_pool_is_bounded_by_bytes() {
     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
 
     // Hold all 32 at once (8 MiB), then hand them all back.
-    let buffers: Vec<wgpu::Buffer> = (0..32)
-        .map(|_| pool.get_buffer(&ctx.device, one, usage))
+    let buffers: Vec<TrackedBuffer> = (0..32)
+        .map(|_| {
+            pool.get_buffer(&ctx.device, one, usage)
+                .expect("allocation must succeed")
+        })
         .collect();
     assert_eq!(pool.available_count(), 0);
     for buf in buffers {
@@ -401,9 +404,12 @@ fn w2_buffer_pool_evicts_least_recently_used_not_smallest() {
     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
 
     let sizes = [4096u64, 3072, 2048, 1024];
-    let buffers: Vec<wgpu::Buffer> = sizes
+    let buffers: Vec<TrackedBuffer> = sizes
         .iter()
-        .map(|&s| pool.get_buffer(&ctx.device, s, usage))
+        .map(|&s| {
+            pool.get_buffer(&ctx.device, s, usage)
+                .expect("allocation must succeed")
+        })
         .collect();
     for buf in buffers {
         pool.return_buffer(buf);
@@ -415,7 +421,9 @@ fn w2_buffer_pool_evicts_least_recently_used_not_smallest() {
     assert_eq!(pool.pooled_bytes(), 6144);
     // Prove 4096 is gone: asking for it must allocate rather than reuse, so the
     // pool still holds the same three afterwards.
-    let fresh = pool.get_buffer(&ctx.device, 4096, usage);
+    let fresh = pool
+        .get_buffer(&ctx.device, 4096, usage)
+        .expect("allocation must succeed");
     assert_eq!(fresh.size(), 4096);
     assert_eq!(
         pool.available_count(),
@@ -423,7 +431,9 @@ fn w2_buffer_pool_evicts_least_recently_used_not_smallest() {
         "the 4096-byte buffer should have been evicted as least-recently-used"
     );
     // ... while the most recently returned one is still served from the pool.
-    let reused = pool.get_buffer(&ctx.device, 1024, usage);
+    let reused = pool
+        .get_buffer(&ctx.device, 1024, usage)
+        .expect("the pooled buffer must be reused");
     assert_eq!(reused.size(), 1024);
     assert_eq!(pool.available_count(), 2);
 }
@@ -437,11 +447,15 @@ fn w2_buffer_pool_refuses_a_buffer_larger_than_the_budget() {
     let mut pool = GpuBufferPool::with_byte_budget(64, 4096);
     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
 
-    let small = pool.get_buffer(&ctx.device, 2048, usage);
+    let small = pool
+        .get_buffer(&ctx.device, 2048, usage)
+        .expect("allocation must succeed");
     pool.return_buffer(small);
     assert_eq!(pool.available_count(), 1);
 
-    let oversized = pool.get_buffer(&ctx.device, 8192, usage);
+    let oversized = pool
+        .get_buffer(&ctx.device, 8192, usage)
+        .expect("allocation must succeed");
     pool.return_buffer(oversized);
     assert_eq!(
         pool.available_count(),

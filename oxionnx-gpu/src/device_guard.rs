@@ -12,11 +12,28 @@
 //! * any wgpu validation / out-of-memory / device-lost error (captured by an
 //!   error scope, or by the uncaptured-error handler installed on the device),
 //! * a read-back that never completes (bounded wait instead of an infinite one).
+//!
+//! # Sync and async
+//!
+//! Every kernel in this crate is written **once**, as an `async fn` ending in
+//! `read_back_and_recycle_async`. The synchronous `gpu_*` entry points are
+//! one-line wrappers around `block_on_gpu`:
+//!
+//! * **native** — `block_on_gpu` is `pollster::block_on`, and the awaited
+//!   read-back is the same `poll(Wait)` + `recv_timeout` pair it always was
+//!   (see `read_back_blocking`), so the future completes in a single `poll`
+//!   and native behaviour is unchanged, instruction for instruction.
+//! * **wasm32** — `block_on_gpu` drops the future without polling it and
+//!   returns `None`, because a browser thread cannot block. Callers there use
+//!   the `*_async` entry points, whose read-back is a real `map_async` future
+//!   driven by the JS microtask queue (`read_back_web`).
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-use crate::context::GpuContext;
+use crate::context::activation::{DeviceTensor, GpuOutput, OutputPlacement};
+use crate::context::{GpuContext, TrackedBuffer};
+use oxionnx_core::Tensor;
 
 /// Bytes occupied by one `f32`.
 const F32_BYTES: u64 = std::mem::size_of::<f32>() as u64;
@@ -228,27 +245,107 @@ impl ErrorScope {
     /// installed in `build_from_device_queue`, which sets the degraded flag. So
     /// the flag is consulted here too — otherwise an allocation failure would
     /// leave this dispatch reading back a dead buffer.
-    pub(crate) fn finish(mut self, ctx: &GpuContext) -> bool {
+    ///
+    /// # Why this is the only variant
+    ///
+    /// There used to be a synchronous `finish` too, whose wasm32 arm simply
+    /// **dropped** the guard — which pops the scope and discards whatever it
+    /// captured, so every validation error in the browser was invisible.
+    /// `ErrorScopeGuard::pop` returns a future on both backends
+    /// (`wgpu/src/api/device.rs`), and on native that future is
+    /// `ready(scope.error)` — already complete before the first `poll`
+    /// (`wgpu/src/backend/wgpu_core.rs:1883`). So awaiting it costs a native
+    /// caller nothing, and there is no reason to keep a second, weaker
+    /// implementation alive next to it.
+    ///
+    /// # Ordering contract
+    ///
+    /// wgpu error scopes are a per-thread LIFO stack and the native backend
+    /// *panics* if they are popped out of order. Two GPU dispatches from this
+    /// crate must therefore never be in flight at the same time on one device —
+    /// which is exactly what the sequential, one-op-at-a-time async run loop
+    /// guarantees. Do not `join!` two `gpu_*_async` calls.
+    pub(crate) async fn finish_async(mut self, ctx: &GpuContext) -> bool {
         let Some(guard) = self.guard.take() else {
             return !ctx.is_degraded();
         };
-        #[cfg(target_arch = "wasm32")]
-        {
-            // Cannot block on the pop future in the browser; dropping the guard
-            // pops the scope and discards whatever it captured.
-            drop(guard);
-            !ctx.is_degraded()
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            match pollster::block_on(guard.pop()) {
-                Some(err) => {
-                    ctx.mark_degraded(err.to_string());
-                    false
-                }
-                None => !ctx.is_degraded(),
+        match guard.pop().await {
+            Some(err) => {
+                ctx.mark_degraded(err.to_string());
+                false
             }
+            None => !ctx.is_degraded(),
         }
+    }
+
+    /// Blocking form of [`Self::finish_async`], for kernels that are still
+    /// written synchronously.
+    ///
+    /// On wasm32 this reports `false` — "treat this dispatch as failed" — which
+    /// makes a synchronous kernel decline to the CPU, the only correct outcome
+    /// there. The scope is still popped: the unpolled future owns `self`, so
+    /// dropping it runs `ErrorScopeGuard`'s own `Drop`, and the per-thread
+    /// scope stack stays balanced.
+    ///
+    /// # Do not reach for this when wiring a kernel into the async dispatcher
+    ///
+    /// This shim (and [`read_back_and_recycle`]) exists so kernels written
+    /// against the old synchronous API keep compiling while they are being
+    /// integrated — nothing more. Calling a *synchronous* kernel from
+    /// `try_gpu_dispatch_async` compiles and works natively, and in a browser
+    /// it silently never runs: `block_on_gpu` drops the future unpolled and
+    /// yields `None`, so the op quietly falls back to the CPU on exactly the
+    /// target the async dispatcher was built for, with no error anywhere. That
+    /// is the "GPU as pure overhead in the browser" failure this wave removed.
+    ///
+    /// Integrating a kernel means converting its body to an `async fn` ending
+    /// in [`read_back_and_recycle_async`] and adding a one-line
+    /// `block_on_gpu` wrapper for the synchronous name — the shape every
+    /// kernel in `shaders/` and `compute.rs` already has.
+    ///
+    /// [R3b] That conversion is now complete for every kernel this crate
+    /// ships (the K2 batch — `broadcast_binary`/`gemm`/`pad`/`prelu`/`resize`
+    /// — was the last holdout), so nothing calls this synchronous shim
+    /// anymore; `cargo check` proves it (a `dead_code` warning here without
+    /// the `#[allow]` below), which is a stronger guarantee than any test
+    /// could give that no kernel can silently no-op in a browser. Left in
+    /// place rather than deleted: this file is outside the K2-conversion
+    /// wave's file ownership, and removing `pub(crate)` infrastructure is a
+    /// bigger edit than that wave's scope warrants. A follow-up cleanup wave
+    /// that owns this file can delete both this method and
+    /// [`read_back_and_recycle`] once that is confirmed stable.
+    #[allow(dead_code)]
+    pub(crate) fn finish(self, ctx: &GpuContext) -> bool {
+        block_on_gpu(async move { Some(self.finish_async(ctx).await) }).unwrap_or(false)
+    }
+}
+
+// ========================================================================
+// Blocking bridge
+// ========================================================================
+
+/// Drive `future` to completion on a target that is allowed to block.
+///
+/// This is the single seam between the crate's `async` kernels and its
+/// synchronous public API. On native it is `pollster::block_on` — the same
+/// pattern `GpuContext::try_new` already used for adapter acquisition. On
+/// wasm32 it declines: the future is dropped **unpolled** (an `async fn` body
+/// runs only when polled, so nothing is submitted, allocated or uploaded), and
+/// the caller falls back to the CPU operator.
+///
+/// That decline is not a limitation of this function, it is the correct answer:
+/// blocking a browser's only thread on a GPU fence deadlocks the page. Browser
+/// callers use the `*_async` entry points instead.
+#[inline]
+pub(crate) fn block_on_gpu<T>(future: impl core::future::Future<Output = Option<T>>) -> Option<T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        pollster::block_on(future)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _unpolled = future;
+        None
     }
 }
 
@@ -256,59 +353,213 @@ impl ErrorScope {
 // Read-back
 // ========================================================================
 
-/// Read a mapped staging buffer back into a `Vec<f32>`.
+/// Copy the first `count` `f32`s out of a mapped byte range.
+///
+/// Deliberately **not** `bytemuck::cast_slice`, which panics on a misaligned
+/// source. On the WebGPU backend `get_mapped_range` hands back a range whose
+/// backing pointer carries no `f32` alignment guarantee at all (it is
+/// materialized out of a JS `ArrayBuffer` copy), so the aligned cast is a
+/// best-effort fast path and the byte-wise decode is the contract. Both are
+/// little-endian, which is what WebGPU specifies and what every target this
+/// crate builds for uses.
+fn decode_f32(bytes: &[u8], count: usize) -> Option<Vec<f32>> {
+    let needed = count.checked_mul(std::mem::size_of::<f32>())?;
+    let src = bytes.get(..needed)?;
+    if let Ok(values) = bytemuck::try_cast_slice::<u8, f32>(src) {
+        return Some(values.to_vec());
+    }
+    let mut out = Vec::with_capacity(count);
+    for chunk in src.chunks_exact(std::mem::size_of::<f32>()) {
+        let quad: [u8; 4] = chunk.try_into().ok()?;
+        out.push(f32::from_le_bytes(quad));
+    }
+    Some(out)
+}
+
+/// Read a mapped staging buffer back into a `Vec<f32>`, blocking the calling
+/// thread until the submission retires.
 ///
 /// The wait is bounded: a device that never completes the submission (driver
 /// reset, GPU hang, lost device) marks the context degraded and yields `None`
 /// rather than blocking the calling thread forever.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_back_blocking(
+    ctx: &GpuContext,
+    staging: &wgpu::Buffer,
+    count: usize,
+    bytes: u64,
+) -> Option<Vec<f32>> {
+    let slice = staging.slice(0..bytes);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+
+    // Bounded wait: a lost device or a timeout is an error, not a hang.
+    if let Err(err) = ctx.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: Some(READBACK_TIMEOUT),
+    }) {
+        ctx.mark_degraded(format!("gpu readback poll failed: {err}"));
+        return None;
+    }
+
+    match receiver.recv_timeout(READBACK_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            // Mapping itself failed — decline, but the device is still usable.
+            let _ = err;
+            return None;
+        }
+        Err(err) => {
+            ctx.mark_degraded(format!("gpu readback did not complete: {err}"));
+            return None;
+        }
+    }
+
+    let data = slice.get_mapped_range();
+    let result = decode_f32(&data, count);
+    drop(data);
+    staging.unmap();
+    result
+}
+
+/// Browser read-back: register the map and `.await` its completion.
 ///
-/// On wasm32 blocking is not possible at all, so this always returns `None`.
-pub(crate) fn read_back(
+/// `Device::poll` is a **no-op** on the WebGPU backend — it returns
+/// `Ok(QueueEmpty)` without touching the queue (`wgpu/src/backend/webgpu.rs`,
+/// `WebDevice::poll`) — so [`read_back_blocking`]'s `poll(Wait)` +
+/// `recv_timeout` pair would simply hang the page's only thread forever. What
+/// actually completes a WebGPU map is the JS `GPUBuffer.mapAsync` promise, and
+/// the only way to observe it is to yield to the event loop. Hence: no poll, no
+/// channel, no timeout — one future whose waker is armed from the map callback
+/// (which wgpu invokes from the promise's `then`).
+///
+/// Registering `map_async` immediately after `queue.submit` is the same thing
+/// `CommandEncoder::map_buffer_on_submit` does — that API just defers the very
+/// same `buffer.map_async` call to submit time (`wgpu`'s
+/// `DeferredCommandBufferActions::execute`, `api/command_buffer_actions.rs:33`)
+/// — so the kernels here call it directly and keep one code path for both
+/// targets.
+#[cfg(target_arch = "wasm32")]
+async fn read_back_web(staging: &wgpu::Buffer, count: usize, bytes: u64) -> Option<Vec<f32>> {
+    let slice = staging.slice(0..bytes);
+    let signal = map_signal::MapSignal::new();
+    {
+        let signal = signal.clone();
+        slice.map_async(wgpu::MapMode::Read, move |result| signal.complete(result));
+    }
+    // A mapping failure is a decline, not a degradation: the device is still
+    // perfectly usable, this one buffer just never became readable.
+    signal.await.ok()?;
+
+    let data = slice.get_mapped_range();
+    let result = decode_f32(&data, count);
+    drop(data);
+    staging.unmap();
+    result
+}
+
+/// The one-shot future [`read_back_web`] waits on.
+///
+/// Hand-rolled rather than pulled from `futures`: it needs no dependency, and
+/// `wasm32-unknown-unknown` lets the map callback be `!Send` (wgpu bounds it by
+/// `WasmNotSend`, which is an empty bound there), so a plain `Rc` is enough.
+///
+/// Both cells are `Cell`, not `RefCell`: `Cell::take`/`Cell::set` cannot panic,
+/// so there is no borrow-conflict failure mode to reason about even if wgpu
+/// were to invoke the callback re-entrantly from inside `map_async`.
+#[cfg(target_arch = "wasm32")]
+mod map_signal {
+    use core::cell::Cell;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, Waker};
+    use std::rc::Rc;
+
+    type MapResult = Result<(), wgpu::BufferAsyncError>;
+
+    #[derive(Default)]
+    struct Slot {
+        result: Cell<Option<MapResult>>,
+        waker: Cell<Option<Waker>>,
+    }
+
+    /// Cloneable handle to one pending `map_async`.
+    pub(super) struct MapSignal(Rc<Slot>);
+
+    impl Clone for MapSignal {
+        fn clone(&self) -> Self {
+            Self(Rc::clone(&self.0))
+        }
+    }
+
+    impl MapSignal {
+        pub(super) fn new() -> Self {
+            Self(Rc::new(Slot::default()))
+        }
+
+        /// Called from wgpu's map callback: record the outcome and wake the
+        /// awaiting task. Waking after the store is what makes the `poll`
+        /// below observe a result rather than re-arming its waker forever.
+        pub(super) fn complete(&self, result: MapResult) {
+            self.0.result.set(Some(result));
+            if let Some(waker) = self.0.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    impl Future for MapSignal {
+        type Output = MapResult;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if let Some(result) = self.0.result.take() {
+                return Poll::Ready(result);
+            }
+            self.0.waker.set(Some(cx.waker().clone()));
+            // Re-check: the callback may have fired between the `take` above
+            // and the waker being stored, in which case nothing will wake us.
+            match self.0.result.take() {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Read a mapped staging buffer back into a `Vec<f32>`.
+///
+/// The single read-back every kernel in this crate ends in. Native blocks
+/// ([`read_back_blocking`], unchanged); wasm32 awaits the `mapAsync` promise
+/// ([`read_back_web`]).
+///
+/// Exactly `count` f32s are mapped, never the whole buffer: on the WebGPU
+/// backend `get_mapped_range` materializes its range as a `Vec<u8>` in wasm
+/// linear memory, so mapping a staging buffer larger than the result would copy
+/// the slack too. A range wider than the buffer is a decline rather than a
+/// panic — `Buffer::slice` panics on an out-of-range range, and this crate does
+/// not panic on any input.
+pub(crate) async fn read_back_async(
     ctx: &GpuContext,
     staging: &wgpu::Buffer,
     count: usize,
 ) -> Option<Vec<f32>> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (ctx, staging, count);
-        None
+    let bytes = f32_bytes(count)?;
+    if bytes == 0 {
+        return Some(Vec::new());
+    }
+    if bytes > staging.size() {
+        return None;
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let slice = staging.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-
-        // Bounded wait: a lost device or a timeout is an error, not a hang.
-        if let Err(err) = ctx.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(READBACK_TIMEOUT),
-        }) {
-            ctx.mark_degraded(format!("gpu readback poll failed: {err}"));
-            return None;
-        }
-
-        match receiver.recv_timeout(READBACK_TIMEOUT) {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                // Mapping itself failed — decline, but the device is still usable.
-                let _ = err;
-                return None;
-            }
-            Err(err) => {
-                ctx.mark_degraded(format!("gpu readback did not complete: {err}"));
-                return None;
-            }
-        }
-
-        let data = slice.get_mapped_range();
-        let values: &[f32] = bytemuck::cast_slice(&data);
-        let result = values.get(..count).map(<[f32]>::to_vec);
-        drop(data);
-        staging.unmap();
-        result
+        read_back_blocking(ctx, staging, count, bytes)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = ctx;
+        read_back_web(staging, count, bytes).await
     }
 }
 
@@ -316,28 +567,144 @@ pub(crate) fn read_back(
 /// buffer pool — but **only** if the read-back actually completed.
 ///
 /// [a7-10] Every kernel used to recycle its output buffer unconditionally,
-/// right after `queue.submit`. On the failure paths of [`read_back`] the
+/// right after `queue.submit`. On the failure paths of [`read_back_async`] the
 /// submission may still be executing (the poll timed out, or the device was
 /// lost mid-flight), so returning the buffer there lets a later dispatch pull
 /// it out of the pool and bind it while the GPU is still writing to it. When
-/// the read-back fails the buffer is simply dropped instead; wgpu keeps the
-/// allocation alive until the submission it belongs to retires.
+/// the read-back fails the buffer is dropped instead — which now *destroys* it
+/// rather than merely releasing the handle. That is still safe with a
+/// submission in flight: both backends defer the underlying free until the last
+/// submission referencing the buffer retires (`wgpu-core`'s `Buffer::destroy`
+/// schedules a `TempResource` against that submission index; WebGPU specifies
+/// the same). What it is not safe to do is hand it to another *dispatch*, which
+/// is why the a7-10 rule is unchanged.
 ///
 /// A poisoned pool mutex only costs the recycling, never the result — the old
 /// `ctx.pool.lock().ok()?` discarded a perfectly good tensor in that case.
-pub(crate) fn read_back_and_recycle(
+///
+/// The pool lock is taken **after** the await and released before returning, so
+/// no `MutexGuard` is ever held across a suspension point.
+pub(crate) async fn read_back_and_recycle_async(
     ctx: &GpuContext,
     staging: &wgpu::Buffer,
     count: usize,
-    output: wgpu::Buffer,
+    output: TrackedBuffer,
 ) -> Option<Vec<f32>> {
-    let result = read_back(ctx, staging, count);
+    let result = read_back_async(ctx, staging, count).await;
     if result.is_some() {
         if let Ok(mut pool) = ctx.pool.lock() {
             pool.return_buffer(output);
         }
     }
     result
+}
+
+/// Finish a dispatch, either by reading its output back or by handing the
+/// output buffer to the caller as a run-scoped activation.
+///
+/// The single tail every residency-aware kernel ends in, so "what happens after
+/// submit" is written once rather than once per kernel:
+///
+/// * [`OutputPlacement::Host`] — the pre-residency behaviour exactly, including
+///   the a7-10 rule that the output buffer is recycled *only* when the read-back
+///   completed. `staging` must be the buffer the kernel copied into; a `None`
+///   here is a kernel that allocated no staging for a host result, which is a
+///   decline rather than a panic.
+/// * [`OutputPlacement::Device`] — no map, no copy, no wait. The output buffer
+///   becomes a [`DeviceTensor`] the caller owns and destroys at the activation's
+///   last consumer.
+///
+/// # There is no fence in the `Device` arm, and that is correct
+///
+/// A host result implies a `map_async` that cannot complete until the
+/// submission retires, so the pre-residency path always ended with the GPU
+/// caught up. Keeping a result on the device ends with work still in flight —
+/// which is safe for every consumer of the value, because WebGPU orders one
+/// queue's submissions and inserts the buffer barriers between them, so the
+/// next dispatch's reads are ordered after this dispatch's writes. It is *not*
+/// safe to assume anything about elapsed time: a per-node duration measured
+/// around this arm measures encode-and-submit, not execution.
+pub(crate) async fn finish_output_async(
+    ctx: &GpuContext,
+    placement: OutputPlacement,
+    staging: Option<TrackedBuffer>,
+    output: TrackedBuffer,
+    count: usize,
+    bytes: u64,
+    shape: Vec<usize>,
+) -> Option<GpuOutput> {
+    match placement {
+        OutputPlacement::Host => {
+            let staging = staging?;
+            let data = read_back_and_recycle_async(ctx, &staging, count, output).await?;
+            Some(GpuOutput::Host(Tensor::new(data, shape)))
+        }
+        OutputPlacement::Device => Some(GpuOutput::Device(DeviceTensor::new(
+            output, shape, count, bytes,
+        ))),
+    }
+}
+
+/// Read a run-scoped activation back into host memory.
+///
+/// The lazy half of the residency contract: a value that stayed on the device
+/// because its producer's consumers looked GPU-bound, and then met a consumer
+/// that declined. One encoder, one copy, one submit, one map — the same
+/// sequence a kernel's own read-back performs, minus the compute pass.
+///
+/// The activation itself is untouched: `tensor` is borrowed, not consumed, so a
+/// later GPU consumer can still bind it in place. Callers memoize the result so
+/// this happens at most once per tensor per run.
+pub async fn read_device_tensor_async(ctx: &GpuContext, tensor: &DeviceTensor) -> Option<Tensor> {
+    if ctx.is_degraded() {
+        return None;
+    }
+    if tensor.is_empty() {
+        return Some(Tensor::new(Vec::new(), tensor.shape().to_vec()));
+    }
+    let bytes = tensor.byte_len();
+    if !ctx.budget_admits(&[bytes]) {
+        return None;
+    }
+    let scope = ErrorScope::begin(ctx);
+    let staging = ctx.staging_buffer("activation_readback_staging", bytes)?;
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("activation_readback_enc"),
+        });
+    encoder.copy_buffer_to_buffer(tensor.buffer(), 0, &staging, 0, bytes);
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+    if !scope.finish_async(ctx).await {
+        return None;
+    }
+    let data = read_back_async(ctx, &staging, tensor.len()).await?;
+    Some(Tensor::new(data, tensor.shape().to_vec()))
+}
+
+/// Blocking form of [`read_back_and_recycle_async`], for kernels that are still
+/// written synchronously.
+///
+/// Declines on wasm32 without submitting anything further: the future is
+/// dropped unpolled, so `output` is destroyed rather than recycled (the
+/// underlying free still waits for its submission to retire) and the caller
+/// falls back to the CPU operator.
+///
+/// **A kernel that still calls this cannot run in a browser.** See
+/// [`ErrorScope::finish`] for the full warning and the one-line conversion a
+/// kernel needs before it is wired into `try_gpu_dispatch_async`.
+///
+/// [R3b] Unused since the K2 kernel batch's conversion to the async contract
+/// removed its last caller — see [`ErrorScope::finish`]'s `[R3b]` note for
+/// why this is suppressed here rather than deleted.
+#[allow(dead_code)]
+pub(crate) fn read_back_and_recycle(
+    ctx: &GpuContext,
+    staging: &wgpu::Buffer,
+    count: usize,
+    output: TrackedBuffer,
+) -> Option<Vec<f32>> {
+    block_on_gpu(read_back_and_recycle_async(ctx, staging, count, output))
 }
 
 #[cfg(test)]
@@ -463,6 +830,40 @@ mod tests {
             Some(u64::from(u32::MAX) * 4)
         );
         assert!(checked_storage_bytes(&huge, max_addressable + 1).is_none());
+    }
+
+    /// The mapped range handed back by the WebGPU backend carries no `f32`
+    /// alignment guarantee, so the decoder must produce the same values from an
+    /// aligned and a deliberately misaligned view of identical bytes — where
+    /// `bytemuck::cast_slice` would have panicked on the second.
+    #[test]
+    fn decode_f32_agrees_on_aligned_and_misaligned_input() {
+        let values = [1.0f32, -2.5, 3.25, 0.0, f32::MIN_POSITIVE];
+        let mut bytes = Vec::new();
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let aligned = decode_f32(&bytes, values.len()).expect("aligned decode");
+        assert_eq!(aligned, values);
+
+        // Offset by one byte so the slice can no longer be a `&[f32]`.
+        let mut shifted = vec![0u8];
+        shifted.extend_from_slice(&bytes);
+        let misaligned = decode_f32(&shifted[1..], values.len()).expect("misaligned decode");
+        assert_eq!(misaligned, values);
+    }
+
+    #[test]
+    fn decode_f32_declines_a_short_range_instead_of_panicking() {
+        let bytes = [0u8; 7];
+        assert!(
+            decode_f32(&bytes, 2).is_none(),
+            "7 bytes cannot hold 2 f32s"
+        );
+        assert!(decode_f32(&bytes, 1).is_some());
+        assert_eq!(decode_f32(&bytes, 0), Some(Vec::new()));
+        // A count whose byte size overflows `usize` declines rather than wraps.
+        assert!(decode_f32(&bytes, usize::MAX).is_none());
     }
 
     #[test]

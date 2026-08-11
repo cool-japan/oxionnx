@@ -1,11 +1,11 @@
 //! GPU-accelerated normalization operations (LayerNorm and BatchNorm).
 
 use crate::context::GpuContext;
-use wgpu::util::DeviceExt;
 
 use super::common::{
-    checked_storage_bytes, plan_dispatch, read_back_and_recycle, BatchNormParams, ErrorScope,
-    LayerNormParams, BATCH_NORM_GPU_THRESHOLD, LAYER_NORM_GPU_THRESHOLD, WG_SIZE,
+    block_on_gpu, checked_storage_bytes, plan_dispatch, read_back_and_recycle_async,
+    BatchNormParams, ErrorScope, LayerNormParams, BATCH_NORM_GPU_THRESHOLD,
+    LAYER_NORM_GPU_THRESHOLD, WG_SIZE,
 };
 
 // ========================================================================
@@ -21,6 +21,20 @@ use super::common::{
 /// explicit axis.
 ///
 /// Returns `None` if the problem is below the GPU threshold or if GPU is unavailable.
+pub async fn gpu_layer_norm_async(
+    ctx: &GpuContext,
+    input: &[f32],
+    shape: &[usize],
+    scale: &[f32],
+    bias: &[f32],
+    eps: f32,
+) -> Option<Vec<f32>> {
+    gpu_layer_norm_axis_async(ctx, input, shape, scale, bias, eps, -1).await
+}
+
+/// Blocking form of [`gpu_layer_norm_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
 pub fn gpu_layer_norm(
     ctx: &GpuContext,
     input: &[f32],
@@ -29,7 +43,7 @@ pub fn gpu_layer_norm(
     bias: &[f32],
     eps: f32,
 ) -> Option<Vec<f32>> {
-    gpu_layer_norm_axis(ctx, input, shape, scale, bias, eps, -1)
+    block_on_gpu(gpu_layer_norm_async(ctx, input, shape, scale, bias, eps))
 }
 
 /// GPU-accelerated LayerNormalization over `product(shape[axis..])`.
@@ -38,7 +52,7 @@ pub fn gpu_layer_norm(
 /// normalized region is the suffix of the shape starting at `axis` (matching the
 /// CPU `LayerNormOp`). `scale` and `bias` must have exactly that many elements.
 #[allow(clippy::too_many_arguments)]
-pub fn gpu_layer_norm_axis(
+pub async fn gpu_layer_norm_axis_async(
     ctx: &GpuContext,
     input: &[f32],
     shape: &[usize],
@@ -88,40 +102,50 @@ pub fn gpu_layer_norm_axis(
     let queue = &ctx.queue;
 
     let out_size = checked_storage_bytes(&ctx.limits, total)?;
-    checked_storage_bytes(&ctx.limits, n_elements)?;
+    let vec_size = checked_storage_bytes(&ctx.limits, n_elements)?;
     if !ctx.limits.buffer_fits(out_size) {
         return None;
     }
     // One workgroup per normalization instance, split across a 2-D grid when
     // there are more instances than the device allows along one dimension.
     let grid = plan_dispatch(&ctx.limits, batch_count as u64, 1)?;
+    // Input, scale, bias, output and read-back staging.
+    if !ctx.budget_admits(&[out_size, vec_size, vec_size, out_size, out_size]) {
+        return None;
+    }
 
     let scope = ErrorScope::begin(ctx);
 
-    let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("ln_input"),
-        contents: bytemuck::cast_slice(&input[..total]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let scale_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("ln_scale"),
-        contents: bytemuck::cast_slice(&scale[..n_elements]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let bias_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("ln_bias"),
-        contents: bytemuck::cast_slice(&bias[..n_elements]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let input_buf = ctx.upload_buffer(
+        "ln_input",
+        bytemuck::cast_slice(&input[..total]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
+    let scale_buf = ctx.upload_buffer(
+        "ln_scale",
+        bytemuck::cast_slice(&scale[..n_elements]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
+    let bias_buf = ctx.upload_buffer(
+        "ln_bias",
+        bytemuck::cast_slice(&bias[..n_elements]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let output_buf = {
-        let mut pool = ctx.pool.lock().ok()?;
-        pool.get_buffer(
-            device,
-            out_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        )
-    };
+    let output_buf = ctx.pooled_buffer(
+        out_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    )?;
+    // The pool may hand back a buffer up to 2x `out_size` -- see
+    // `GpuBufferPool::get_buffer` -- and `as_entire_binding()` would then bind
+    // that larger size, which can exceed `max_storage_buffer_binding_size`
+    // even though `out_size` itself was validated. Bind the exact range
+    // instead, as `conv2d::gpu_conv2d_implicit_resident_async`'s `output_binding` does.
+    let output_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &output_buf,
+        offset: 0,
+        size: wgpu::BufferSize::new(out_size),
+    });
 
     let params = LayerNormParams {
         n_elements: u32::try_from(n_elements).ok()?,
@@ -129,18 +153,13 @@ pub fn gpu_layer_norm_axis(
         eps,
         wg_per_row: grid.x,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("ln_params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "ln_params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ln_staging"),
-        size: out_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging_buf = ctx.staging_buffer("ln_staging", out_size)?;
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ln_bg"),
@@ -160,7 +179,7 @@ pub fn gpu_layer_norm_axis(
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: output_buf.as_entire_binding(),
+                resource: output_binding,
             },
             wgpu::BindGroupEntry {
                 binding: 4,
@@ -184,11 +203,11 @@ pub fn gpu_layer_norm_axis(
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    if !scope.finish(ctx) {
+    if !scope.finish_async(ctx).await {
         return None;
     }
 
-    read_back_and_recycle(ctx, &staging_buf, total, output_buf)
+    read_back_and_recycle_async(ctx, &staging_buf, total, output_buf).await
 }
 
 // ========================================================================
@@ -200,7 +219,7 @@ pub fn gpu_layer_norm_axis(
 /// Input shape is [N, C, H, W] (or [N, C, D1, D2, ...]). Per-channel parameters.
 /// Returns `None` if the problem is below the GPU threshold.
 #[allow(clippy::too_many_arguments)]
-pub fn gpu_batch_norm(
+pub async fn gpu_batch_norm_async(
     ctx: &GpuContext,
     input: &[f32],
     shape: &[usize],
@@ -239,48 +258,60 @@ pub fn gpu_batch_norm(
     let queue = &ctx.queue;
 
     let out_size = checked_storage_bytes(&ctx.limits, total)?;
-    checked_storage_bytes(&ctx.limits, channels)?;
+    let vec_size = checked_storage_bytes(&ctx.limits, channels)?;
     if !ctx.limits.buffer_fits(out_size) {
         return None;
     }
     let grid = plan_dispatch(&ctx.limits, total as u64, WG_SIZE)?;
+    // Input, four per-channel vectors, output and read-back staging.
+    if !ctx.budget_admits(&[
+        out_size, vec_size, vec_size, vec_size, vec_size, out_size, out_size,
+    ]) {
+        return None;
+    }
 
     let scope = ErrorScope::begin(ctx);
 
-    let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bn_input"),
-        contents: bytemuck::cast_slice(&input[..total]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let scale_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bn_scale"),
-        contents: bytemuck::cast_slice(&scale[..channels]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let bias_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bn_bias"),
-        contents: bytemuck::cast_slice(&bias[..channels]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let mean_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bn_mean"),
-        contents: bytemuck::cast_slice(&mean[..channels]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let var_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bn_var"),
-        contents: bytemuck::cast_slice(&var[..channels]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let input_buf = ctx.upload_buffer(
+        "bn_input",
+        bytemuck::cast_slice(&input[..total]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
+    let scale_buf = ctx.upload_buffer(
+        "bn_scale",
+        bytemuck::cast_slice(&scale[..channels]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
+    let bias_buf = ctx.upload_buffer(
+        "bn_bias",
+        bytemuck::cast_slice(&bias[..channels]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
+    let mean_buf = ctx.upload_buffer(
+        "bn_mean",
+        bytemuck::cast_slice(&mean[..channels]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
+    let var_buf = ctx.upload_buffer(
+        "bn_var",
+        bytemuck::cast_slice(&var[..channels]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let output_buf = {
-        let mut pool = ctx.pool.lock().ok()?;
-        pool.get_buffer(
-            device,
-            out_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        )
-    };
+    let output_buf = ctx.pooled_buffer(
+        out_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    )?;
+    // The pool may hand back a buffer up to 2x `out_size` -- see
+    // `GpuBufferPool::get_buffer` -- and `as_entire_binding()` would then bind
+    // that larger size, which can exceed `max_storage_buffer_binding_size`
+    // even though `out_size` itself was validated. Bind the exact range
+    // instead, as `conv2d::gpu_conv2d_implicit_resident_async`'s `output_binding` does.
+    let output_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &output_buf,
+        offset: 0,
+        size: wgpu::BufferSize::new(out_size),
+    });
 
     let params = BatchNormParams {
         total_elements: u32::try_from(total).ok()?,
@@ -292,18 +323,13 @@ pub fn gpu_batch_norm(
         _pad1: 0,
         _pad2: 0,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bn_params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "bn_params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bn_staging"),
-        size: out_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging_buf = ctx.staging_buffer("bn_staging", out_size)?;
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("bn_bg"),
@@ -331,7 +357,7 @@ pub fn gpu_batch_norm(
             },
             wgpu::BindGroupEntry {
                 binding: 5,
-                resource: output_buf.as_entire_binding(),
+                resource: output_binding,
             },
             wgpu::BindGroupEntry {
                 binding: 6,
@@ -355,9 +381,46 @@ pub fn gpu_batch_norm(
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    if !scope.finish(ctx) {
+    if !scope.finish_async(ctx).await {
         return None;
     }
 
-    read_back_and_recycle(ctx, &staging_buf, total, output_buf)
+    read_back_and_recycle_async(ctx, &staging_buf, total, output_buf).await
+}
+
+/// Blocking form of [`gpu_layer_norm_axis_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_layer_norm_axis(
+    ctx: &GpuContext,
+    input: &[f32],
+    shape: &[usize],
+    scale: &[f32],
+    bias: &[f32],
+    eps: f32,
+    axis: i64,
+) -> Option<Vec<f32>> {
+    block_on_gpu(gpu_layer_norm_axis_async(
+        ctx, input, shape, scale, bias, eps, axis,
+    ))
+}
+
+/// Blocking form of [`gpu_batch_norm_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_batch_norm(
+    ctx: &GpuContext,
+    input: &[f32],
+    shape: &[usize],
+    scale: &[f32],
+    bias: &[f32],
+    mean: &[f32],
+    var: &[f32],
+    eps: f32,
+) -> Option<Vec<f32>> {
+    block_on_gpu(gpu_batch_norm_async(
+        ctx, input, shape, scale, bias, mean, var, eps,
+    ))
 }

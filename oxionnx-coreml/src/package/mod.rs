@@ -15,6 +15,19 @@
 //! impls for [`MlPackageModel`] (the `Retained<MLModel>` field does not
 //! auto-derive these, since `objc2` cannot tell from the type alone).
 //!
+//! ## Compilation
+//!
+//! A `.mlpackage` must be compiled to a `.mlmodelc` before CoreML can
+//! load it.  `MLModel::compileModelAtURL_error:` does that into a fresh
+//! UUID-named `$TMPDIR` directory on *every* call and never reuses or
+//! deletes it, so the naive loop compiles on every process start and
+//! leaks the result forever.  `compile_cache` fixes both halves: the
+//! compile happens once per (bundle, content) pair and its output is
+//! moved into a stable, content-keyed cache directory.  See
+//! [`MlPackageModel::ensure_compiled`](crate::MlPackageModel::ensure_compiled)
+//! for the cache location and `compile_cache`'s own module
+//! documentation for keying, concurrency and degradation.
+//!
 //! ## I/O details
 //!
 //! * Inputs are projected into `MLMultiArray` instances (Float32)
@@ -32,9 +45,12 @@
 //!   path) into a tightly packed, C-contiguous buffer, regardless of
 //!   whatever strides CoreML's own allocation used internally.  `predict`
 //!   accepts `Float32` and `Float16` outputs, up-converting the latter to
-//!   `f32`.  `predict_raw` returns the same bytes dtype-preserving (see
+//!   `f32` **in the same pass** as the stride walk — no intermediate byte
+//!   buffer.  `predict_raw` returns the same bytes dtype-preserving (see
 //!   `RawArray`) — no up-conversion — for pipelines that want the exact
-//!   bytes an upstream CoreML model produced.
+//!   bytes an upstream CoreML model produced.  Both readers live in
+//!   `array_read`; see that module for the layout planner and the SCRFD
+//!   stride-padding story that motivates it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -152,6 +168,20 @@ pub enum FeatureOutput {
     Double(f64),
 }
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "visionos"
+))]
+mod array_read;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "visionos"
+))]
+mod compile_cache;
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",

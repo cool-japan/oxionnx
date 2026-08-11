@@ -663,14 +663,18 @@ fn buffer_pool_only_reuses_buffers_with_compatible_usage() {
     let mut pool = GpuBufferPool::new(16);
     let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
 
-    let buf = pool.get_buffer(&ctx.device, 4096, storage);
+    let buf = pool
+        .get_buffer(&ctx.device, 4096, storage)
+        .expect("allocation must succeed");
     assert!(buf.usage().contains(storage));
     pool.return_buffer(buf);
     assert_eq!(pool.available_count(), 1);
 
     // A request that needs COPY_DST must NOT get the STORAGE|COPY_SRC buffer.
     let needs_copy_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-    let fresh = pool.get_buffer(&ctx.device, 4096, needs_copy_dst);
+    let fresh = pool
+        .get_buffer(&ctx.device, 4096, needs_copy_dst)
+        .expect("allocation must succeed");
     assert!(
         fresh.usage().contains(needs_copy_dst),
         "pool handed back a buffer missing the requested usage flags"
@@ -682,13 +686,17 @@ fn buffer_pool_only_reuses_buffers_with_compatible_usage() {
     );
 
     // The original request is still served from the pool.
-    let reused = pool.get_buffer(&ctx.device, 4096, storage);
+    let reused = pool
+        .get_buffer(&ctx.device, 4096, storage)
+        .expect("the pooled buffer must be reused");
     assert!(reused.usage().contains(storage));
     assert_eq!(pool.available_count(), 0);
 
     // A superset request is compatible with a superset buffer.
     pool.return_buffer(fresh);
-    let subset = pool.get_buffer(&ctx.device, 4096, wgpu::BufferUsages::STORAGE);
+    let subset = pool
+        .get_buffer(&ctx.device, 4096, wgpu::BufferUsages::STORAGE)
+        .expect("the pooled buffer must be reused");
     assert!(subset.usage().contains(wgpu::BufferUsages::STORAGE));
     assert_eq!(pool.available_count(), 0);
 }

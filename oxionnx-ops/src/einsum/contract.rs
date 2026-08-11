@@ -52,7 +52,7 @@ pub(crate) const GENERAL_PATH_FLOP_LIMIT: u128 = 4096;
 
 /// Batched GEMMs at or above this many multiply-accumulates are split across
 /// rayon threads by batch element.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 const PARALLEL_GEMM_FLOPS: u128 = 64 * 64 * 64;
 
 /// How a planned binary contraction is evaluated.
@@ -452,7 +452,7 @@ fn gemm_batched(
         ));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     {
         let flops = (batch as u128)
             .saturating_mul(m as u128)

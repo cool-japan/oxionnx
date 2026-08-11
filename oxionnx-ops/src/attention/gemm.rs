@@ -31,7 +31,7 @@ pub(crate) const SGEMM_MIN_ROWS: usize = 4;
 
 /// Minimum multiply-accumulate count before splitting GEMM rows across rayon
 /// workers is worth the task-dispatch overhead (~10 µs).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 const PAR_MIN_MACS: usize = 1 << 17;
 
 // ── C = A[m,k] · B[k,n] ──────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ pub(crate) fn matmul_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> V
 /// The row partition is derived from `rayon::current_num_threads()` and each
 /// block is computed independently, so the result is deterministic for a given
 /// machine and does not depend on scheduling order.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 pub(crate) fn matmul_nt_into_par(
     a: &[f32],
     b: &[f32],
@@ -207,7 +207,7 @@ pub(crate) fn matmul_nt_into_par(
         });
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
 pub(crate) fn matmul_nt_into_par(
     a: &[f32],
     b: &[f32],
@@ -224,9 +224,9 @@ pub(crate) fn matmul_nt_into_par(
 /// Whether a loop of `units` independent `(batch, head)` slices, each costing
 /// roughly `macs_per_unit` multiply-accumulates, is worth handing to rayon.
 ///
-/// Only defined off wasm32, where there is no rayon and every caller stays on
-/// its serial path.
-#[cfg(not(target_arch = "wasm32"))]
+/// Not defined on a serial wasm32 build (no rayon there — every caller stays
+/// on its serial path); present again under `wasm-threads`.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 #[inline]
 pub(crate) fn should_parallelize(units: usize, macs_per_unit: usize) -> bool {
     /// Task dispatch costs a few microseconds; below this much total work the

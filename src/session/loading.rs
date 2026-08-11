@@ -42,7 +42,7 @@ pub(crate) fn parse_stage<T, E>(
 ) -> Result<T, E> {
     let span = tracing::debug_span!(target: LOAD_TARGET, "parse", kind, bytes = byte_len);
     let _entered = span.enter();
-    let started = std::time::Instant::now();
+    let started = crate::time_compat::Instant::now();
     let result = parse();
     tracing::debug!(
         target: LOAD_TARGET,
@@ -207,7 +207,7 @@ impl Session {
             opt_level = ?opt_level,
         );
         let _entered = build_span.enter();
-        let build_started = std::time::Instant::now();
+        let build_started = crate::time_compat::Instant::now();
 
         let mut weights = weights;
         let input_names = graph.input_names.clone();
@@ -224,7 +224,7 @@ impl Session {
         // plus the fusions, `All` = the full pipeline (shape materialisation,
         // constant folding, CSE and fusions).
         let nodes_before_optimize = graph.nodes.len();
-        let optimize_started = std::time::Instant::now();
+        let optimize_started = crate::time_compat::Instant::now();
         let optimized_nodes = match opt_level {
             OptLevel::None => graph.nodes,
             OptLevel::Basic | OptLevel::Extended | OptLevel::All => {
@@ -263,7 +263,7 @@ impl Session {
             ..Default::default()
         };
 
-        let sort_started = std::time::Instant::now();
+        let sort_started = crate::time_compat::Instant::now();
         let known: Vec<String> = weights
             .keys()
             .cloned()
@@ -291,7 +291,7 @@ impl Session {
         // static-input seed the optimizer used: without it this pass could not
         // size a single activation buffer, so the pool's size classes were
         // derived from weights alone.
-        let plan_started = std::time::Instant::now();
+        let plan_started = crate::time_compat::Instant::now();
         let (pool, shape_cache) = if enable_memory_pool {
             let _span = tracing::debug_span!(target: LOAD_TARGET, "shape_inference").entered();
             let shapes = crate::optimizer::shape_inference::infer_shapes(

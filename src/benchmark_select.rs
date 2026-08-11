@@ -4,9 +4,11 @@
 //! the faster path based on input size.
 
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use oxionnx_core::Tensor;
+
+use crate::time_compat::Instant;
 
 /// Result of benchmarking a single operator.
 #[derive(Debug, Clone)]

@@ -225,6 +225,146 @@ impl Session {
         released
     }
 
+    /// [w2-f16] Whether this session's GPU device can run the half-precision
+    /// kernels at all.
+    ///
+    /// `false` when the session has no device, or when the adapter did not
+    /// report `shader-f16`. A caller offering the mode as a user-facing option
+    /// should ask this first; a caller that just wants it on can call
+    /// [`Self::set_f16_compute`] unconditionally and read the answer back.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn f16_compute_supported(&self) -> bool {
+        self.gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.f16_compute_supported())
+    }
+
+    /// [w2-f16] Ask the convolution and GEMM kernels to compute in half
+    /// precision, and get back the state that actually took effect.
+    ///
+    /// **Off by default.** The mode changes results — weights are narrowed to
+    /// `f16` on the device and products are evaluated at half precision, though
+    /// every accumulator stays `f32` — so it is strictly opt-in. See
+    /// `oxionnx_gpu::context::weight_format` for the enumerated rounding points
+    /// and the measured PSNR.
+    ///
+    /// Returns the **effective** state, which is `false` whenever the session
+    /// has no device or the device lacks the feature. So
+    /// `session.set_f16_compute(true) == false` is a complete answer: nothing
+    /// changed, and every kernel is still on its `f32` path.
+    ///
+    /// Safe to call between runs on a live session; the residency cache keys
+    /// weights by format, so a flip cannot serve a kernel bytes in a width its
+    /// shader does not read.
+    #[cfg(feature = "gpu")]
+    pub fn set_f16_compute(&self, enabled: bool) -> bool {
+        self.gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.set_f16_compute(enabled))
+    }
+
+    /// [w2-f16] Whether dispatches are currently taking the half-precision
+    /// path.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn f16_compute_enabled(&self) -> bool {
+        self.gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.f16_compute_enabled())
+    }
+
+    /// Device bytes this session's weights are holding for its whole lifetime.
+    ///
+    /// The initializers the GPU path has uploaded and kept — a subset of the
+    /// device's live bytes that no run will release. `0` without a device.
+    ///
+    /// [w2-f16] Exposed so a caller can *see* the footprint change when it
+    /// turns half precision on: an initializer resident in both formats is
+    /// counted once per format, because that is what the device is actually
+    /// holding.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_resident_bytes(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.resident_bytes())
+    }
+
+    /// Whether kernels may leave a result in a device buffer for the next node
+    /// to consume in place, instead of reading it back and uploading it again.
+    ///
+    /// `false` without a device. On by default when there is one.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn activation_residency_enabled(&self) -> bool {
+        self.gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.activation_residency_enabled())
+    }
+
+    /// Turn run-scoped activation residency on or off, and get back the state
+    /// that actually took effect.
+    ///
+    /// The switch exists so the two paths can be compared *within one session*:
+    /// with it off every entry point behaves exactly as it did before run-scoped
+    /// activations existed, so an A/B is a measurement of the mechanism rather
+    /// than of two differently-built sessions. The counterpart of
+    /// [`Self::set_f16_compute`] for the other half of the GPU data path, and
+    /// like it, safe to call between runs on a live session.
+    ///
+    /// Returns `false` when the session has no device, in which case nothing
+    /// changed and there was nothing to change.
+    #[cfg(feature = "gpu")]
+    pub fn set_activation_residency(&self, enabled: bool) -> bool {
+        match self.gpu.as_ref() {
+            Some(gpu) => {
+                gpu.set_activation_residency(enabled);
+                gpu.activation_residency_enabled()
+            }
+            None => false,
+        }
+    }
+
+    /// Cumulative host→device bytes this session's context has uploaded —
+    /// weights, activations and parameter blocks alike.
+    ///
+    /// Never falls and never resets, so one run's upload volume is the
+    /// difference between two readings taken around it. That difference is the
+    /// only complete account of the outbound half of a run's bus traffic:
+    /// [`GpuRunStats::weight_upload_bytes`](crate::session::gpu_residency::GpuRunStats::weight_upload_bytes)
+    /// covers initializers only and
+    /// [`activation_upload_bytes`](crate::session::gpu_residency::GpuRunStats::activation_upload_bytes)
+    /// covers only the operands promoted ahead of a dispatch — both are subsets
+    /// of this, so adding them to it would double-count.
+    ///
+    /// `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_uploaded_bytes(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.uploaded_bytes())
+    }
+
+    /// The first unrecoverable device error this session's GPU context saw, if
+    /// any.
+    ///
+    /// `Some` means every later GPU entry point declined and the graph finished
+    /// on CPU operators — so a measurement taken across such a run is timing a
+    /// fallback, not the device. `None` without a device, and `None` on a
+    /// healthy one.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_device_error(&self) -> Option<String> {
+        let gpu = self.gpu.as_ref()?;
+        if !gpu.is_degraded() {
+            return None;
+        }
+        // Degraded with an empty error slot should not read as healthy: the
+        // caller asked whether the device is usable, and it is not.
+        Some(
+            gpu.last_error()
+                .unwrap_or_else(|| "device degraded without a recorded reason".to_string()),
+        )
+    }
+
     /// Return the ordered execution provider list configured for this session.
     ///
     /// Returns an empty slice when no explicit list was set (legacy heuristic

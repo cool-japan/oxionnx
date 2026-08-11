@@ -1,14 +1,38 @@
+use crate::context::activation::{GpuOutput, OutputPlacement, TensorSource};
 use crate::context::GpuContext;
-use crate::device_guard::{checked_storage_bytes, dispatch_2d_fits, read_back, ErrorScope};
+use crate::device_guard::{
+    block_on_gpu, checked_storage_bytes, dispatch_2d_fits, read_back_async, ErrorScope,
+};
 use oxionnx_core::Tensor;
 use wgpu;
-use wgpu::util::DeviceExt;
 
 /// Minimum number of FLOPs (M*K*N) before we bother using the GPU.
 /// Below this threshold, CPU is faster due to GPU dispatch overhead.
 /// GPU is only beneficial for very large GEMMs where compute dominates over
 /// CPU-to-GPU transfer overhead.  10M is a conservative threshold.
-const GPU_THRESHOLD: usize = 10_000_000;
+///
+/// `u64`, not `usize`, and that is load-bearing: `usize` is **32 bits** on
+/// wasm32, so a `usize` product overflowed for every GEMM at or above
+/// `M*K*N == 2^32` — a 2048³ multiply, 8.6 GFLOP, is 2× past it. The
+/// `checked_mul` that guards the product then returned `None` and the kernel
+/// *declined*, so in a browser the GPU silently refused exactly the multiplies
+/// it exists for while happily taking the small ones. Measured in Chrome
+/// (Apple/metal-3): 1024³ dispatched in 7.7 ms, 2048³ declined in 0.0 ms with
+/// no device error, which is what put this on the record.
+///
+/// The operand *sizes* below stay `usize` on purpose — those are real
+/// allocations, and a length that does not fit `usize` cannot be indexed on
+/// this target anyway. Only the FLOP count, which is a pure comparison and
+/// never an index, is widened.
+const GPU_THRESHOLD: u64 = 10_000_000;
+
+/// FLOP count of an `[m, k] x [k, n]` GEMM, or `None` if it overflows `u64`.
+///
+/// See [`GPU_THRESHOLD`] for why this is not `usize` arithmetic.
+#[inline]
+fn gemm_flops(m: usize, k: usize, n: usize) -> Option<u64> {
+    (m as u64).checked_mul(k as u64)?.checked_mul(n as u64)
+}
 
 /// Minimum dimension size for tiled matmul (shared-memory tiles are 16x16).
 const TILED_MIN_DIM: usize = 32;
@@ -68,11 +92,16 @@ fn gemm_buffer_sizes(
     if a.len() < a_len || b.len() < b_len {
         return None;
     }
-    checked_storage_bytes(&ctx.limits, a_len)?;
-    checked_storage_bytes(&ctx.limits, b_len)?;
+    let a_size = checked_storage_bytes(&ctx.limits, a_len)?;
+    let b_size = checked_storage_bytes(&ctx.limits, b_len)?;
     let c_size = checked_storage_bytes(&ctx.limits, c_len)?;
     // The staging copy is not bound, but still has to be allocatable.
     if !ctx.limits.buffer_fits(c_size) {
+        return None;
+    }
+    // A, B, C and the read-back staging copy — the four buffers both matmul
+    // kernels allocate.
+    if !ctx.budget_admits(&[a_size, b_size, c_size, c_size]) {
         return None;
     }
     Some(c_size)
@@ -85,6 +114,31 @@ fn gemm_buffer_sizes(
 /// and falls back to basic kernel for smaller ones.
 ///
 /// Returns `None` if the problem is too small for GPU (caller should use CPU).
+pub async fn gpu_matmul_async(
+    ctx: &GpuContext,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<Vec<f32>> {
+    // Skip GPU for small matrices — overhead not worth it. A shape whose FLOP
+    // count overflows even `u64` is nonsensical, not "big enough for the GPU".
+    if gemm_flops(m, k, n)? < GPU_THRESHOLD {
+        return None;
+    }
+
+    // Use tiled kernel for large dimensions, basic for small.
+    if m >= TILED_MIN_DIM && n >= TILED_MIN_DIM && k >= TILED_MIN_DIM {
+        gpu_matmul_tiled_inner(ctx, a, b, m, k, n).await
+    } else {
+        gpu_matmul_basic(ctx, a, b, m, k, n).await
+    }
+}
+
+/// Blocking form of [`gpu_matmul_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
 pub fn gpu_matmul(
     ctx: &GpuContext,
     a: &[f32],
@@ -93,19 +147,7 @@ pub fn gpu_matmul(
     k: usize,
     n: usize,
 ) -> Option<Vec<f32>> {
-    // Skip GPU for small matrices — overhead not worth it. A shape whose
-    // product overflows `usize` is nonsensical, not "big enough for the GPU".
-    let flops = m.checked_mul(k)?.checked_mul(n)?;
-    if flops < GPU_THRESHOLD {
-        return None;
-    }
-
-    // Use tiled kernel for large dimensions, basic for small.
-    if m >= TILED_MIN_DIM && n >= TILED_MIN_DIM && k >= TILED_MIN_DIM {
-        gpu_matmul_tiled_inner(ctx, a, b, m, k, n)
-    } else {
-        gpu_matmul_basic(ctx, a, b, m, k, n)
-    }
+    block_on_gpu(gpu_matmul_async(ctx, a, b, m, k, n))
 }
 
 /// Tiled matrix multiply using shared memory for improved cache locality.
@@ -113,7 +155,7 @@ pub fn gpu_matmul(
 /// Falls back to the basic kernel for small matrices.
 ///
 /// Returns `None` if the problem is too small for GPU (caller should use CPU).
-pub fn gpu_matmul_tiled(
+pub async fn gpu_matmul_tiled_async(
     ctx: &GpuContext,
     a: &[f32],
     b: &[f32],
@@ -122,21 +164,34 @@ pub fn gpu_matmul_tiled(
     n: usize,
 ) -> Option<Vec<f32>> {
     // Only use GPU for large enough matrices
-    let flops = m.checked_mul(k)?.checked_mul(n)?;
-    if flops < GPU_THRESHOLD {
+    if gemm_flops(m, k, n)? < GPU_THRESHOLD {
         return None;
     }
 
     // Use tiled kernel for large dimensions, basic for small
     if m >= TILED_MIN_DIM && n >= TILED_MIN_DIM && k >= TILED_MIN_DIM {
-        gpu_matmul_tiled_inner(ctx, a, b, m, k, n)
+        gpu_matmul_tiled_inner(ctx, a, b, m, k, n).await
     } else {
-        gpu_matmul_basic(ctx, a, b, m, k, n)
+        gpu_matmul_basic(ctx, a, b, m, k, n).await
     }
 }
 
+/// Blocking form of [`gpu_matmul_tiled_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
+pub fn gpu_matmul_tiled(
+    ctx: &GpuContext,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<Vec<f32>> {
+    block_on_gpu(gpu_matmul_tiled_async(ctx, a, b, m, k, n))
+}
+
 /// Inner implementation of tiled matmul using 16x16 shared-memory tiles.
-fn gpu_matmul_tiled_inner(
+async fn gpu_matmul_tiled_inner(
     ctx: &GpuContext,
     a: &[f32],
     b: &[f32],
@@ -161,24 +216,23 @@ fn gpu_matmul_tiled_inner(
 
     let scope = ErrorScope::begin(ctx);
 
-    let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("tiled_A"),
-        contents: bytemuck::cast_slice(&a[..m * k]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let a_buf = ctx.upload_buffer(
+        "tiled_A",
+        bytemuck::cast_slice(&a[..m * k]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let b_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("tiled_B"),
-        contents: bytemuck::cast_slice(&b[..k * n]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let b_buf = ctx.upload_buffer(
+        "tiled_B",
+        bytemuck::cast_slice(&b[..k * n]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let c_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("tiled_C"),
-        size: c_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    let c_buf = ctx.alloc_buffer(
+        "tiled_C",
+        c_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    )?;
 
     let params = GemmParams {
         m: m as u32,
@@ -186,18 +240,13 @@ fn gpu_matmul_tiled_inner(
         n: n as u32,
         _pad: 0,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("tiled_params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "tiled_params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("tiled_staging"),
-        size: c_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging_buf = ctx.staging_buffer("tiled_staging", c_size)?;
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tiled_matmul_bg"),
@@ -239,15 +288,15 @@ fn gpu_matmul_tiled_inner(
     encoder.copy_buffer_to_buffer(&c_buf, 0, &staging_buf, 0, c_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    if !scope.finish(ctx) {
+    if !scope.finish_async(ctx).await {
         return None;
     }
 
-    read_back(ctx, &staging_buf, m * n)
+    read_back_async(ctx, &staging_buf, m * n).await
 }
 
 /// Basic (non-tiled) GPU matmul — used as fallback for matrices with small dimensions.
-fn gpu_matmul_basic(
+async fn gpu_matmul_basic(
     ctx: &GpuContext,
     a: &[f32],
     b: &[f32],
@@ -271,24 +320,23 @@ fn gpu_matmul_basic(
 
     let scope = ErrorScope::begin(ctx);
 
-    let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("A"),
-        contents: bytemuck::cast_slice(&a[..m * k]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let a_buf = ctx.upload_buffer(
+        "A",
+        bytemuck::cast_slice(&a[..m * k]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let b_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("B"),
-        contents: bytemuck::cast_slice(&b[..k * n]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let b_buf = ctx.upload_buffer(
+        "B",
+        bytemuck::cast_slice(&b[..k * n]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let c_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("C"),
-        size: c_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    let c_buf = ctx.alloc_buffer(
+        "C",
+        c_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    )?;
 
     let params = GemmParams {
         m: m as u32,
@@ -296,18 +344,13 @@ fn gpu_matmul_basic(
         n: n as u32,
         _pad: 0,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("staging"),
-        size: c_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging_buf = ctx.staging_buffer("staging", c_size)?;
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("matmul_bg"),
@@ -349,11 +392,11 @@ fn gpu_matmul_basic(
     encoder.copy_buffer_to_buffer(&c_buf, 0, &staging_buf, 0, c_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    if !scope.finish(ctx) {
+    if !scope.finish_async(ctx).await {
         return None;
     }
 
-    read_back(ctx, &staging_buf, m * n)
+    read_back_async(ctx, &staging_buf, m * n).await
 }
 
 /// How many `(batch, group)` iterations of a conv may share one submission.
@@ -431,7 +474,259 @@ fn plan_conv_gemm(ctx: &GpuContext, m: usize, k: usize, n: usize) -> Option<Conv
     }
 }
 
-/// GPU-accelerated Conv2D: im2col on CPU, GEMM on GPU.
+/// The GEMM shape `[m, k] x [k, n]` a Conv2D reduces to, or `None` when the
+/// convolution is malformed or degenerate.
+///
+/// [c3] Split out so the size gate below can be applied *before* choosing
+/// between the direct kernel and the hybrid im2col path — both must decline at
+/// exactly the same size, or wiring in the direct kernel would silently start
+/// dispatching convolutions the crate has always sent to the CPU.
+fn conv_gemm_shape(
+    input_shape: &[usize],
+    weight: &Tensor,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    group: usize,
+) -> Option<(usize, usize, usize)> {
+    if input_shape.len() != 4 || weight.shape.len() != 4 {
+        return None;
+    }
+    let (h, w) = (input_shape[2], input_shape[3]);
+    let (c_out, c_per_group, kh, kw) = (
+        weight.shape[0],
+        weight.shape[1],
+        weight.shape[2],
+        weight.shape[3],
+    );
+    if group == 0 || strides[0] == 0 || strides[1] == 0 || kh == 0 || kw == 0 {
+        return None;
+    }
+    if c_out % group != 0 {
+        return None;
+    }
+    let padded_h = h.checked_add(pads[0])?.checked_add(pads[2])?;
+    let padded_w = w.checked_add(pads[1])?.checked_add(pads[3])?;
+    let span_h = dilations[0].checked_mul(kh - 1)?.checked_add(1)?;
+    let span_w = dilations[1].checked_mul(kw - 1)?.checked_add(1)?;
+    let oh = padded_h.checked_sub(span_h)? / strides[0] + 1;
+    let ow = padded_w.checked_sub(span_w)? / strides[1] + 1;
+    Some((
+        c_out / group,
+        c_per_group.checked_mul(kh)?.checked_mul(kw)?,
+        oh.checked_mul(ow)?,
+    ))
+}
+
+/// GPU-accelerated Conv2D with a fused bias and activation.
+///
+/// \[c3\] The entry point the whole conv path now goes through. It tries the
+/// direct implicit-GEMM kernel first
+/// ([`gpu_conv2d_implicit_async`](crate::shaders::gpu_conv2d_implicit_async):
+/// no host im2col, bias and activation folded into the epilogue) and falls
+/// back to the hybrid im2col path below for anything that kernel declines —
+/// today that means `group > 1`, plus any shape the device cannot bind or
+/// dispatch. The hybrid path has no fused activation, so `act` is applied on
+/// the host there; the *result* of this function carries the activation either
+/// way.
+///
+/// Both paths are gated on the same `GPU_THRESHOLD`, applied here once, so
+/// the set of convolutions this crate accepts is exactly what it always was.
+///
+/// See [`gpu_conv2d_async`] for the un-fused form and why it exists separately.
+///
+/// Uploads the weight on every call; [`gpu_conv2d_fused_resident_async`] is the
+/// form that keeps it on the device.
+#[allow(clippy::too_many_arguments)]
+pub async fn gpu_conv2d_fused_async(
+    ctx: &GpuContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    group: usize,
+    act: crate::shaders::ConvActivation,
+) -> Option<Tensor> {
+    gpu_conv2d_fused_resident_async(
+        ctx,
+        input,
+        weight,
+        bias,
+        crate::context::WeightKeys::default(),
+        strides,
+        pads,
+        dilations,
+        group,
+        act,
+    )
+    .await
+}
+
+/// [`gpu_conv2d_fused_async`] with the weight and bias kept on the device.
+///
+/// `keys` names the invariant operands; see
+/// [`gpu_conv2d_implicit_resident_async`](crate::shaders::gpu_conv2d_implicit_resident_async),
+/// which is where they are honoured.
+///
+/// # The hybrid fallback deliberately does not take them
+///
+/// The im2col path below runs for what the direct kernel declines — grouped
+/// convolution, and shapes the device cannot bind — and it does not upload the
+/// weight tensor at all: it uploads one buffer per `group`, each a *slice* of
+/// the weight, so one caller identity does not name one buffer there. Its
+/// dominant traffic is the column matrix anyway, which is derived from the
+/// input and changes every frame. Making that path resident is a different
+/// change (per-group identities) with a much smaller prize, and inventing
+/// composite keys here would put ONNX-shaped naming into this crate.
+#[allow(clippy::too_many_arguments)]
+pub async fn gpu_conv2d_fused_resident_async(
+    ctx: &GpuContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    keys: crate::context::WeightKeys<'_>,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    group: usize,
+    act: crate::shaders::ConvActivation,
+) -> Option<Tensor> {
+    gpu_conv2d_fused_placed_async(
+        ctx,
+        TensorSource::tensor(input),
+        weight,
+        bias,
+        keys,
+        strides,
+        pads,
+        dilations,
+        group,
+        act,
+        OutputPlacement::Host,
+    )
+    .await?
+    .into_tensor()
+}
+
+/// [`gpu_conv2d_fused_resident_async`] with the activation free to arrive on,
+/// and stay on, the device.
+///
+/// The conv entry point the residency-aware dispatcher calls. Same gate
+/// (`GPU_THRESHOLD` on the implied GEMM's FLOPs), same kernel, same numerics —
+/// the only differences are where the input comes from and where the result is
+/// left.
+///
+/// # The hybrid fallback is host-only, and that is a decline rather than a bug
+///
+/// When the implicit kernel declines (a grouped convolution, a shape the device
+/// cannot bind), the host path falls back to `gpu_conv2d_hybrid_async`, which
+/// im2cols on the CPU and therefore needs the input's bytes. A device-resident
+/// input has none to give, so this returns `None` and the caller — which is the
+/// one holding the activation — reads it back and runs the CPU operator. That
+/// is exactly the contract every other decline in this crate has.
+#[allow(clippy::too_many_arguments)]
+pub async fn gpu_conv2d_fused_placed_async(
+    ctx: &GpuContext,
+    input: TensorSource<'_>,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    keys: crate::context::WeightKeys<'_>,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    group: usize,
+    act: crate::shaders::ConvActivation,
+    placement: OutputPlacement,
+) -> Option<GpuOutput> {
+    let (m, k, n) = conv_gemm_shape(input.shape(), weight, strides, pads, dilations, group)?;
+    if gemm_flops(m, k, n)? < GPU_THRESHOLD {
+        return None;
+    }
+    if ctx.is_degraded() {
+        return None;
+    }
+    if let Some(out) = crate::shaders::gpu_conv2d_implicit_placed_async(
+        ctx, input, weight, bias, keys, strides, pads, dilations, group, act, placement,
+    )
+    .await
+    {
+        return Some(out);
+    }
+    let mut out =
+        gpu_conv2d_hybrid_async(ctx, input, weight, bias, strides, pads, dilations, group).await?;
+    act.apply_host(&mut out.data);
+    Some(GpuOutput::Host(out))
+}
+
+/// Blocking form of [`gpu_conv2d_fused_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_conv2d_fused(
+    ctx: &GpuContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    group: usize,
+    act: crate::shaders::ConvActivation,
+) -> Option<Tensor> {
+    block_on_gpu(gpu_conv2d_fused_async(
+        ctx, input, weight, bias, strides, pads, dilations, group, act,
+    ))
+}
+
+/// GPU-accelerated Conv2D, no fused activation.
+///
+/// \[c3\] This is deliberately **not** an activation-fusing entry point, and the
+/// distinction is load-bearing rather than stylistic. `src/session/gpu_dispatch.rs`
+/// reads the `activation` attribute the optimizer's Conv+Relu / Conv+Clip
+/// fusion folded into the node, calls *this* function, and then applies that
+/// activation itself (`apply_conv_activation`). Fusing an activation in here
+/// too would apply it twice. ReLU and Clip are idempotent so the bug would
+/// hide, but `leaky_relu(leaky_relu(x)) = alpha^2 * x` for `x < 0` — the slope
+/// would be silently squared. A caller that wants the fused form must ask for
+/// it explicitly, via [`gpu_conv2d_fused_async`].
+///
+/// The convolution itself still runs on the direct implicit-GEMM kernel; only
+/// the epilogue's activation is `None`.
+#[allow(clippy::too_many_arguments)]
+pub async fn gpu_conv2d_async(
+    ctx: &GpuContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    group: usize,
+) -> Option<Tensor> {
+    gpu_conv2d_fused_async(
+        ctx,
+        input,
+        weight,
+        bias,
+        strides,
+        pads,
+        dilations,
+        group,
+        crate::shaders::ConvActivation::None,
+    )
+    .await
+}
+
+/// Hybrid Conv2D: im2col on CPU, GEMM on GPU, bias on CPU.
+///
+/// \[c3\] Kept as the fallback for everything the direct kernel in
+/// `shaders/conv2d.rs` declines (grouped convolution, and any shape whose
+/// operands the direct kernel cannot bind). It is *not* the fast path any
+/// more: for InSwapper's dominant layer it uploads a 37.7 MB column matrix per
+/// call where the direct kernel uploads a 4 MB input, and it pays a CPU im2col
+/// ahead of every dispatch.
 ///
 /// [a7-21] The `(batch, group)` iterations are batched. Previously this loop
 /// called `gpu_matmul` once per iteration, and each call allocated fresh
@@ -457,10 +752,15 @@ fn plan_conv_gemm(ctx: &GpuContext, m: usize, k: usize, n: usize) -> Option<Conv
 /// dispatch can observe another's writes.
 ///
 /// Falls back to `None` if the GEMM is too small for GPU benefit.
+///
+/// \[c3\] Public so the direct kernel's benchmark
+/// (`examples/c3_conv2d_gflops.rs`) can time the path it replaced against it
+/// on the same shapes. Production callers should use [`gpu_conv2d_async`] or
+/// [`gpu_conv2d_fused_async`], which pick between the two paths.
 #[allow(clippy::too_many_arguments)]
-pub fn gpu_conv2d(
+pub async fn gpu_conv2d_hybrid_async(
     ctx: &GpuContext,
-    input: &Tensor,
+    input: TensorSource<'_>,
     weight: &Tensor,
     bias: Option<&Tensor>,
     strides: [usize; 2],
@@ -468,17 +768,23 @@ pub fn gpu_conv2d(
     dilations: [usize; 2],
     group: usize,
 ) -> Option<Tensor> {
+    // im2col runs on the host, so this path needs the input's bytes. A
+    // device-resident activation has none to give and declines here — its
+    // holder reads it back and runs the CPU operator, the same contract every
+    // other decline in this crate has.
+    let input_data = input.host_data()?;
+    let input_shape = input.shape();
     // Every dimension here comes from the model file: validate the ranks and
     // the divisors before doing any arithmetic, so a malformed Conv declines
     // (and the CPU operator reports a typed error) instead of panicking.
-    if input.shape.len() != 4 || weight.shape.len() != 4 {
+    if input_shape.len() != 4 || weight.shape.len() != 4 {
         return None;
     }
     let [n, c_in, h, w] = [
-        input.shape[0],
-        input.shape[1],
-        input.shape[2],
-        input.shape[3],
+        input_shape[0],
+        input_shape[1],
+        input_shape[2],
+        input_shape[3],
     ];
     let [c_out, c_per_group, kh, kw] = [
         weight.shape[0],
@@ -492,7 +798,7 @@ pub fn gpu_conv2d(
     if c_out % group != 0 || c_in != c_per_group.checked_mul(group)? {
         return None;
     }
-    if input.data.len() < n.checked_mul(c_in)?.checked_mul(h)?.checked_mul(w)?
+    if input_data.len() < n.checked_mul(c_in)?.checked_mul(h)?.checked_mul(w)?
         || weight.data.len()
             < c_out
                 .checked_mul(c_per_group)?
@@ -523,12 +829,10 @@ pub fn gpu_conv2d(
         }
     }
 
-    // Check if the GEMM is large enough for GPU.
-    if c_out_per_group
-        .checked_mul(col_rows)?
-        .checked_mul(col_cols)?
-        < GPU_THRESHOLD
-    {
+    // Check if the GEMM is large enough for GPU. Same `u64` widening as
+    // `gpu_matmul_async` — see `GPU_THRESHOLD`: a conv whose inner GEMM is at
+    // or above 2^32 FLOPs used to decline on wasm32 instead of dispatching.
+    if gemm_flops(c_out_per_group, col_rows, col_cols)? < GPU_THRESHOLD {
         return None;
     }
 
@@ -582,13 +886,11 @@ pub fn gpu_conv2d(
         let w_off = g.checked_mul(c_out_per_group)?.checked_mul(col_rows)?;
         let w_end = w_off.checked_add(a_len)?;
         let weight_slice = weight.data.get(w_off..w_end)?;
-        weight_bufs.push(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("conv_weight"),
-                contents: bytemuck::cast_slice(weight_slice),
-                usage: wgpu::BufferUsages::STORAGE,
-            }),
-        );
+        weight_bufs.push(ctx.upload_buffer(
+            "conv_weight",
+            bytemuck::cast_slice(weight_slice),
+            wgpu::BufferUsages::STORAGE,
+        )?);
     }
     let params = GemmParams {
         m: u32::try_from(gemm_m).ok()?,
@@ -596,11 +898,11 @@ pub fn gpu_conv2d(
         n: u32::try_from(gemm_n).ok()?,
         _pad: 0,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("conv_params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "conv_params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
     let mut col = vec![0.0f32; col_len];
     let mut iter_start = 0usize;
@@ -608,6 +910,11 @@ pub fn gpu_conv2d(
         let this_chunk = chunk_len.min(total_iters - iter_start);
         let staging_size = c_size.checked_mul(u64::try_from(this_chunk).ok()?)?;
         if !ctx.limits.buffer_fits(staging_size) {
+            return None;
+        }
+        // `per_iter_bytes` already covers this chunk's col, C and staging
+        // slice; the weight buffers above are live and counted already.
+        if !ctx.budget_admits(&[per_iter_bytes.checked_mul(u64::try_from(this_chunk).ok()?)?]) {
             return None;
         }
 
@@ -627,7 +934,7 @@ pub fn gpu_conv2d(
 
             // im2col on CPU into the reused scratch buffer.
             im2col(
-                &input.data,
+                input_data,
                 c_in,
                 h,
                 w,
@@ -643,21 +950,27 @@ pub fn gpu_conv2d(
                 batch,
                 &mut col,
             );
-            col_bufs.push(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("conv_col"),
-                    contents: bytemuck::cast_slice(&col),
-                    usage: wgpu::BufferUsages::STORAGE,
-                }),
-            );
-            let c_buf = {
-                let mut pool = ctx.pool.lock().ok()?;
-                pool.get_buffer(
-                    device,
-                    c_size,
-                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                )
-            };
+            col_bufs.push(ctx.upload_buffer(
+                "conv_col",
+                bytemuck::cast_slice(&col),
+                wgpu::BufferUsages::STORAGE,
+            )?);
+            let c_buf = ctx.pooled_buffer(
+                c_size,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )?;
+            // The pooled buffer may be *larger* than `c_size` (the pool hands
+            // back anything within 2x -- see `GpuBufferPool::get_buffer`), and
+            // `as_entire_binding()` would then bind that larger size, which can
+            // exceed `max_storage_buffer_binding_size` even though `c_size`
+            // itself was validated. Bind the exact range instead, as
+            // `conv2d::gpu_conv2d_implicit_resident_async`'s `output_binding` does for the same
+            // reason.
+            let c_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &c_buf,
+                offset: 0,
+                size: wgpu::BufferSize::new(c_size),
+            });
             bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("conv_gemm_bg"),
                 layout: plan.layout,
@@ -672,7 +985,7 @@ pub fn gpu_conv2d(
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: c_buf.as_entire_binding(),
+                        resource: c_binding,
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -683,12 +996,7 @@ pub fn gpu_conv2d(
             c_bufs.push(c_buf);
         }
 
-        let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("conv_staging"),
-            size: staging_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let staging_buf = ctx.staging_buffer("conv_staging", staging_size)?;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("conv_enc"),
@@ -713,11 +1021,11 @@ pub fn gpu_conv2d(
         }
         ctx.queue.submit(std::iter::once(encoder.finish()));
 
-        if !scope.finish(ctx) {
+        if !scope.finish_async(ctx).await {
             return None;
         }
 
-        let chunk_data = read_back(ctx, &staging_buf, c_len.checked_mul(this_chunk)?)?;
+        let chunk_data = read_back_async(ctx, &staging_buf, c_len.checked_mul(this_chunk)?).await?;
 
         // The read-back completed, so the submission has retired and the C
         // buffers are safe to recycle.
@@ -759,6 +1067,25 @@ pub fn gpu_conv2d(
     }
 
     Some(Tensor::new(out, vec![n, c_out, oh, ow]))
+}
+
+/// Blocking form of [`gpu_conv2d_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_conv2d(
+    ctx: &GpuContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    strides: [usize; 2],
+    pads: [usize; 4],
+    dilations: [usize; 2],
+    group: usize,
+) -> Option<Tensor> {
+    block_on_gpu(gpu_conv2d_async(
+        ctx, input, weight, bias, strides, pads, dilations, group,
+    ))
 }
 
 /// Build the im2col column matrix for one (batch, group) slice.
@@ -818,6 +1145,26 @@ fn im2col(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The FLOP count must be computed in `u64`, not `usize`.
+    ///
+    /// On wasm32 `usize` is 32 bits, so a 2048³ GEMM (8.59 GFLOP) overflowed
+    /// the old `usize` product and made `gpu_matmul` decline the *largest*
+    /// multiplies while accepting small ones. This asserts the widened
+    /// arithmetic directly, so the regression cannot come back on a 64-bit host
+    /// where the bug is invisible.
+    #[test]
+    fn gemm_flops_does_not_overflow_a_32_bit_usize() {
+        assert_eq!(gemm_flops(2048, 2048, 2048), Some(8_589_934_592));
+        assert!(gemm_flops(2048, 2048, 2048).is_some_and(|f| f > u64::from(u32::MAX)));
+        assert!(gemm_flops(2048, 2048, 2048).is_some_and(|f| f >= GPU_THRESHOLD));
+        // Small shapes are unchanged, and still below the threshold.
+        assert_eq!(gemm_flops(32, 32, 32), Some(32_768));
+        assert!(gemm_flops(32, 32, 32).is_some_and(|f| f < GPU_THRESHOLD));
+        // Only a product that overflows `u64` declines.
+        assert_eq!(gemm_flops(usize::MAX, usize::MAX, 2), None);
+        assert_eq!(gemm_flops(0, 1 << 20, 1 << 20), Some(0));
+    }
 
     /// CPU reference matmul for verification.
     fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -886,7 +1233,7 @@ mod tests {
         // gpu_matmul_tiled requires flops >= threshold, so use large enough matrices
         // that pass the threshold: 32*32*32 = 32768 < 10M, so it returns None.
         // Use the inner function directly for testing.
-        let gpu_out = match gpu_matmul_tiled_inner(&ctx, &a, &b, m, k, n) {
+        let gpu_out = match block_on_gpu(gpu_matmul_tiled_inner(&ctx, &a, &b, m, k, n)) {
             Some(out) => out,
             None => return,
         };
@@ -915,7 +1262,7 @@ mod tests {
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32) * 0.2 - 0.8).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32) * 0.4 - 1.2).collect();
 
-        let gpu_out = match gpu_matmul_tiled_inner(&ctx, &a, &b, m, k, n) {
+        let gpu_out = match block_on_gpu(gpu_matmul_tiled_inner(&ctx, &a, &b, m, k, n)) {
             Some(out) => out,
             None => return,
         };

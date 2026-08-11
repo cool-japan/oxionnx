@@ -18,6 +18,10 @@ pub(super) fn equal_split(axis_len: usize, n: usize) -> Vec<usize> {
 mod basic;
 #[cfg(test)]
 mod dynamic_shape;
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_activation;
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_f16;
 #[cfg(test)]
 mod inplace;
 #[cfg(test)]

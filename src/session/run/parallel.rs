@@ -427,7 +427,7 @@ impl Session {
         resolved: &HashMap<String, Vec<usize>>,
     ) -> Result<bool, OnnxError> {
         for &provider in plan {
-            let start = std::time::Instant::now();
+            let start = crate::time_compat::Instant::now();
 
             let dispatched: Option<Vec<Tensor>> = match provider {
                 // Never planned (it is the terminal sentinel, not an accelerator);
@@ -919,7 +919,7 @@ impl Session {
                                 slots,
                                 claimed,
                             } = item;
-                            let start = std::time::Instant::now();
+                            let start = crate::time_compat::Instant::now();
 
                             // Native f16 elementwise kernel, when mixed precision
                             // claimed the node and one exists for this op.

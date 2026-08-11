@@ -841,7 +841,7 @@ fn parallel_sgemm_is_bitwise_identical_to_one_sequential_call() {
         let a = ramp(m * k, 23, 11, 0.25);
         let b = ramp(k * n, 31, 15, 0.5);
         let mut par = vec![0.0f32; m * n];
-        parallel_sgemm(m, k, n, &a, &b, &mut par);
+        parallel_sgemm(m, k, n, &a, &b, &mut par, n);
 
         let mut seq = vec![0.0f32; m * n];
         // SAFETY: a is [m,k], b is [k,n], seq is [m,n], all row-major.
@@ -864,6 +864,31 @@ fn parallel_sgemm_is_bitwise_identical_to_one_sequential_call() {
             );
         }
         assert_bitwise(&par, &seq, &format!("parallel_sgemm {m}x{k}x{n}"));
+
+        // Same call with a wider row stride — how the blocked im2col path
+        // writes one column block into the columns of `out` it owns. The
+        // result must still match, *and* the columns outside the `n`-wide
+        // window must be untouched: they belong to the neighbouring column
+        // blocks of the same convolution.
+        for ldc in [n + 1, n + 7, 2 * n + 3] {
+            let mut strided = vec![f32::NAN; m * ldc];
+            parallel_sgemm(m, k, n, &a, &b, &mut strided, ldc);
+            for row in 0..m {
+                assert_bitwise(
+                    &strided[row * ldc..row * ldc + n],
+                    &seq[row * n..(row + 1) * n],
+                    &format!("parallel_sgemm {m}x{k}x{n} ldc {ldc} row {row}"),
+                );
+                for (col, &v) in strided[row * ldc + n..(row + 1) * ldc].iter().enumerate() {
+                    assert!(
+                        v.is_nan(),
+                        "parallel_sgemm ldc {ldc} wrote outside its window \
+                         at row {row} column {}",
+                        n + col
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1212,5 +1237,452 @@ fn perf_probe_conv2d_batch1_group1() {
             best = best.min(dt);
         }
         println!("c={c:4} oc={oc:4} {h:3}x{w:3} k{k} s{s} p{p}: {best:>12.3?}");
+    }
+}
+
+// ── Column-blocked im2col ───────────────────────────────────────────────────
+//
+// Above `IM2COL_WORKSPACE_MAX_BYTES` the im2col workspace is built one column
+// block at a time instead of whole (`inswapper_128` otherwise asks for a
+// single 411 MB allocation per frame — an abort risk on wasm32, where a failed
+// `WebAssembly.Memory.grow` kills the module and the high-water mark never
+// comes back down). The claim is that this is *bit-identical*, not merely
+// close: the gather is exact, and `matrixmultiply`'s N loop is its outermost
+// loop, so splitting N externally cannot reorder any element's
+// K-accumulation. Both halves of that claim are asserted below.
+
+#[test]
+#[allow(unsafe_code)]
+fn sgemm_column_blocks_are_bitwise_identical_to_one_call() {
+    // The load-bearing premise of the blocked im2col path: computing C's
+    // columns in disjoint blocks — each `sgemm` writing into a strided view of
+    // the full C — must reproduce one wide `sgemm` exactly.
+    for &(m, k, n) in &[
+        (3_usize, 6272_usize, 1024_usize),
+        (256, 4608, 512),
+        (64, 27, 196),
+        (7, 13, 29),
+        (1, 5, 3),
+        (33, 129, 257),
+    ] {
+        let a = ramp(m * k, 23, 11, 0.25);
+        let b = ramp(k * n, 31, 15, 0.5);
+
+        let mut want = vec![0.0f32; m * n];
+        // SAFETY: a is [m,k], b is [k,n], want is [m,n], all row-major.
+        unsafe {
+            matrixmultiply::sgemm(
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                k as isize,
+                1,
+                b.as_ptr(),
+                n as isize,
+                1,
+                0.0,
+                want.as_mut_ptr(),
+                n as isize,
+                1,
+            );
+        }
+
+        for &block in &[1_usize, 2, 5, 64, 251, 1024] {
+            if block > n {
+                continue;
+            }
+            let mut got = vec![f32::NAN; m * n];
+            let mut start = 0;
+            while start < n {
+                let width = block.min(n - start);
+                // Gather the block's columns of B into a packed [k, width].
+                let mut b_block = vec![0.0f32; k * width];
+                for r in 0..k {
+                    b_block[r * width..(r + 1) * width]
+                        .copy_from_slice(&b[r * n + start..r * n + start + width]);
+                }
+                // SAFETY: `got` is [m, n] row-major; this writes the
+                // `width` columns starting at `start`, row stride `n`.
+                unsafe {
+                    matrixmultiply::sgemm(
+                        m,
+                        k,
+                        width,
+                        1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b_block.as_ptr(),
+                        width as isize,
+                        1,
+                        0.0,
+                        got[start..].as_mut_ptr(),
+                        n as isize,
+                        1,
+                    );
+                }
+                start += width;
+            }
+            assert_bitwise(&got, &want, &format!("sgemm {m}x{k}x{n} block {block}"));
+        }
+    }
+}
+
+#[test]
+fn im2col_block_cols_respects_the_workspace_cap() {
+    use crate::conv::conv2d::{im2col_block_cols, IM2COL_WORKSPACE_MAX_BYTES};
+
+    const CAP: usize = IM2COL_WORKSPACE_MAX_BYTES;
+
+    // Under the cap the full column matrix is kept in one piece — the
+    // historical code path, unchanged.
+    assert_eq!(im2col_block_cols(147, 16384, 128, CAP), 16384);
+    assert_eq!(im2col_block_cols(2304, 4096, 64, CAP), 4096);
+    assert_eq!(im2col_block_cols(0, 4096, 64, CAP), 4096);
+    assert_eq!(im2col_block_cols(9216, 0, 0, CAP), 0);
+
+    // Every `inswapper_128` convolution that exceeds the cap, as
+    // `(col_rows, col_cols, ow, expected_blocks)`.
+    let over_cap = [
+        (6272_usize, 16384_usize, 128_usize, 7_usize), // [3,128,7,7]  → 411 MB
+        (4608, 16384, 128, 5),                         // [256,512,3,3] → 302 MB
+        (9216, 4096, 64, 3),                           // [512,1024,3,3] → 151 MB
+        (2304, 16384, 128, 3),                         // [128,256,3,3] → 151 MB
+        (1152, 16384, 128, 2),                         // [256,128,3,3] →  76 MB
+    ];
+    for (col_rows, col_cols, ow, blocks) in over_cap {
+        let bw = im2col_block_cols(col_rows, col_cols, ow, CAP);
+        assert!(
+            col_rows * bw * 4 <= CAP,
+            "block {bw} of {col_rows} rows exceeds the {CAP}-byte cap"
+        );
+        assert_eq!(
+            bw % ow,
+            0,
+            "block {bw} is not a whole number of output rows"
+        );
+        assert_eq!(col_cols.div_ceil(bw), blocks, "block count for {col_rows}");
+    }
+
+    // A single output row wider than the cap still yields a usable width.
+    let bw = im2col_block_cols(1 << 20, 4096, 4096, CAP);
+    assert!((1..=16).contains(&bw), "degenerate cap width: {bw}");
+    assert!((1 << 20) * bw * 4 <= CAP);
+    // A cap of zero cannot be honoured; one column is the floor.
+    assert_eq!(im2col_block_cols(8, 100, 10, 0), 1);
+}
+
+/// Run one convolution with the workspace cap disabled (the monolithic im2col
+/// reference) and again at each of `caps`, asserting the outputs match bit for
+/// bit. Returns the number of column blocks the smallest cap produced.
+fn assert_blocked_matches_monolithic(case: Rank2Case, caps: &[usize], label: &str) -> usize {
+    use crate::conv::conv2d::{conv2d_into_slices_capped, im2col_block_cols};
+
+    let (in_shape, w_shape, strides, pads, dilations, group) = case;
+    let input = ramp(in_shape.iter().product(), 17, 8, 0.25);
+    let weight = ramp(w_shape.iter().product(), 11, 5, 0.5);
+    let bias = ramp(w_shape[0], 5, 2, 0.25);
+    let out_shape = crate::conv::spatial::compute_conv_out_shape(
+        "Conv", &in_shape, &w_shape, &strides, &pads, &dilations,
+    )
+    .expect("valid geometry");
+    let out_len: usize = out_shape.iter().product();
+    let (oh, ow) = (out_shape[2], out_shape[3]);
+    let col_rows = w_shape[1] * w_shape[2] * w_shape[3];
+
+    let mut want = vec![0.0f32; out_len];
+    conv2d_into_slices_capped(
+        &input,
+        &in_shape,
+        &weight,
+        &w_shape,
+        Some(&bias),
+        strides,
+        pads,
+        dilations,
+        group,
+        &mut want,
+        &out_shape,
+        usize::MAX,
+    );
+
+    let mut blocks = 1;
+    for &cap in caps {
+        let bw = im2col_block_cols(col_rows, oh * ow, ow, cap);
+        blocks = blocks.max((oh * ow).div_ceil(bw.max(1)));
+        let mut got = vec![f32::NAN; out_len];
+        conv2d_into_slices_capped(
+            &input,
+            &in_shape,
+            &weight,
+            &w_shape,
+            Some(&bias),
+            strides,
+            pads,
+            dilations,
+            group,
+            &mut got,
+            &out_shape,
+            cap,
+        );
+        assert_bitwise(&got, &want, &format!("{label} cap {cap} (width {bw})"));
+    }
+    blocks
+}
+
+#[test]
+fn blocked_im2col_matches_the_monolithic_path_bitwise() {
+    // Small shapes with the cap driven down far enough to force many blocks,
+    // including caps too small to hold a whole output row so the gather has to
+    // handle partial-row heads and tails. Covers strided, dilated, padded,
+    // grouped and batched (multi-job) convolutions — i.e. both the single-job
+    // and the `par_chunks_mut` job paths.
+    let caps: &[usize] = &[usize::MAX, 1 << 20, 4096, 512, 64, 1];
+    let cases: &[(&str, Rank2Case)] = &[
+        (
+            "padded 3x3",
+            ([1, 3, 9, 11], [4, 3, 3, 3], [1, 1], [1, 1, 1, 1], [1, 1], 1),
+        ),
+        (
+            "stride 2x1 asymmetric pad",
+            (
+                [1, 4, 13, 12],
+                [6, 4, 3, 3],
+                [2, 1],
+                [1, 2, 0, 1],
+                [1, 1],
+                1,
+            ),
+        ),
+        (
+            "dilated 2x3",
+            (
+                [1, 2, 12, 14],
+                [3, 2, 3, 2],
+                [1, 2],
+                [0, 0, 0, 0],
+                [2, 3],
+                1,
+            ),
+        ),
+        (
+            "grouped x3 padded",
+            ([1, 6, 9, 9], [9, 2, 3, 3], [1, 1], [2, 2, 2, 2], [1, 1], 3),
+        ),
+        (
+            "batched grouped (multi job)",
+            ([3, 4, 7, 8], [8, 2, 2, 3], [1, 1], [1, 1, 1, 1], [1, 1], 2),
+        ),
+        (
+            "batched strided dilated (multi job)",
+            (
+                [2, 4, 15, 15],
+                [4, 2, 3, 3],
+                [2, 2],
+                [1, 1, 1, 1],
+                [2, 2],
+                2,
+            ),
+        ),
+        (
+            "wide kernel, single output row",
+            ([1, 3, 7, 20], [5, 3, 7, 3], [1, 1], [0, 0, 0, 0], [1, 1], 1),
+        ),
+    ];
+    for &(label, case) in cases {
+        let blocks = assert_blocked_matches_monolithic(case, caps, label);
+        assert!(blocks > 1, "{label}: never actually blocked");
+    }
+}
+
+#[test]
+fn blocked_im2col_matches_at_the_production_cap() {
+    // The same geometry as `inswapper_128`'s final convolution ([3,128,7,7]
+    // over a 128×128 output, 411 MB of im2col) at half the output extent, so
+    // it still trips the 64 MiB cap — 102.8 MB, two blocks — while keeping the
+    // reference run affordable inside the test-suite.
+    use crate::conv::conv2d::{im2col_block_cols, IM2COL_WORKSPACE_MAX_BYTES};
+
+    let case: Rank2Case = ([1, 128, 70, 70], [3, 128, 7, 7], [1, 1], [0; 4], [1, 1], 1);
+    let bw = im2col_block_cols(6272, 64 * 64, 64, IM2COL_WORKSPACE_MAX_BYTES);
+    assert!(bw < 64 * 64, "shape no longer exercises blocking");
+    let blocks = assert_blocked_matches_monolithic(
+        case,
+        &[IM2COL_WORKSPACE_MAX_BYTES],
+        "inswapper final conv (half extent)",
+    );
+    assert_eq!(blocks, 2);
+}
+
+#[test]
+#[ignore = "allocates the 411 MB / 302 MB monolithic references it compares against"]
+fn blocked_im2col_matches_on_the_inswapper_worst_shapes() {
+    // The two convolutions that motivated the cap, at full size:
+    //   Conv_612  [3,128,7,7]   over [1,128,134,134] → 411.04 MB im2col
+    //   Conv_594  [256,512,3,3] over [1,512,128,128] → 301.99 MB im2col
+    let cases: &[(&str, Rank2Case)] = &[
+        (
+            "inswapper Conv_612 (411 MB)",
+            (
+                [1, 128, 134, 134],
+                [3, 128, 7, 7],
+                [1, 1],
+                [0; 4],
+                [1, 1],
+                1,
+            ),
+        ),
+        (
+            "inswapper Conv_594 (302 MB)",
+            (
+                [1, 512, 128, 128],
+                [256, 512, 3, 3],
+                [1, 1],
+                [1, 1, 1, 1],
+                [1, 1],
+                1,
+            ),
+        ),
+    ];
+    for &(label, case) in cases {
+        let blocks = assert_blocked_matches_monolithic(
+            case,
+            &[crate::conv::conv2d::IM2COL_WORKSPACE_MAX_BYTES],
+            label,
+        );
+        assert!(blocks > 1, "{label}: never actually blocked");
+    }
+}
+
+/// A/B timing probe for the workspace cap on the five `inswapper_128`
+/// convolutions that exceed it, plus two that do not (which must take the
+/// unchanged code path). Both sides run in one process off one build, since a
+/// cross-build comparison on a machine shared with sibling agents measures the
+/// load rather than the kernel. Run with `--run-ignored all`.
+#[test]
+#[ignore = "timing probe, not a correctness assertion"]
+fn perf_probe_conv2d_im2col_blocking() {
+    use crate::conv::conv2d::{conv2d_into_slices_capped, IM2COL_WORKSPACE_MAX_BYTES};
+    use std::time::{Duration, Instant};
+
+    /// `(label, input shape, weight shape, strides, pads)`.
+    type ProbeCase = (&'static str, [usize; 4], [usize; 4], [usize; 2], [usize; 4]);
+
+    let cases: &[ProbeCase] = &[
+        (
+            "Conv_612 411MB",
+            [1, 128, 134, 134],
+            [3, 128, 7, 7],
+            [1, 1],
+            [0; 4],
+        ),
+        (
+            "Conv_594 302MB",
+            [1, 512, 128, 128],
+            [256, 512, 3, 3],
+            [1, 1],
+            [1, 1, 1, 1],
+        ),
+        (
+            "Conv_590 151MB",
+            [1, 1024, 64, 64],
+            [512, 1024, 3, 3],
+            [1, 1],
+            [1, 1, 1, 1],
+        ),
+        (
+            "Conv_596 151MB",
+            [1, 256, 128, 128],
+            [128, 256, 3, 3],
+            [1, 1],
+            [1, 1, 1, 1],
+        ),
+        (
+            "Conv_042  76MB",
+            [1, 128, 128, 128],
+            [256, 128, 3, 3],
+            [1, 1],
+            [1, 1, 1, 1],
+        ),
+        (
+            "Conv_062  38MB (under cap)",
+            [1, 1024, 34, 34],
+            [1024, 1024, 3, 3],
+            [1, 1],
+            [0; 4],
+        ),
+        (
+            "Conv_040  10MB (under cap)",
+            [1, 3, 134, 134],
+            [128, 3, 7, 7],
+            [1, 1],
+            [0; 4],
+        ),
+    ];
+
+    println!("threads = {}", rayon::current_num_threads());
+    for &(label, in_shape, w_shape, strides, pads) in cases {
+        let input = ramp(in_shape.iter().product(), 251, 125, 0.015625);
+        let weight = ramp(w_shape.iter().product(), 127, 63, 0.0078125);
+        let out_shape = crate::conv::spatial::compute_conv_out_shape(
+            "Conv",
+            &in_shape,
+            &w_shape,
+            &strides,
+            &pads,
+            &[1, 1],
+        )
+        .expect("valid geometry");
+        let out_len: usize = out_shape.iter().product();
+        let mut out = vec![0.0f32; out_len];
+
+        // Interleave the two variants inside the repetition loop and report
+        // the minimum: sibling agents build in this tree, and a load spike
+        // that lands on one whole arm of a sequential A/B is indistinguishable
+        // from a regression. Adjacent runs share the spike.
+        let mut timing = [Duration::MAX; 2];
+        for _ in 0..9 {
+            for (slot, cap) in [usize::MAX, IM2COL_WORKSPACE_MAX_BYTES].iter().enumerate() {
+                let t = Instant::now();
+                conv2d_into_slices_capped(
+                    &input,
+                    &in_shape,
+                    &weight,
+                    &w_shape,
+                    None,
+                    strides,
+                    pads,
+                    [1, 1],
+                    1,
+                    &mut out,
+                    &out_shape,
+                    *cap,
+                );
+                let dt = t.elapsed();
+                std::hint::black_box(&out);
+                timing[slot] = timing[slot].min(dt);
+            }
+        }
+        let ratio = timing[1].as_secs_f64() / timing[0].as_secs_f64().max(1e-12);
+        let col_rows = w_shape[1] * w_shape[2] * w_shape[3];
+        let col_cols = out_shape[2] * out_shape[3];
+        let bw = crate::conv::conv2d::im2col_block_cols(
+            col_rows,
+            col_cols,
+            out_shape[3],
+            IM2COL_WORKSPACE_MAX_BYTES,
+        );
+        println!(
+            "{label:28}: monolithic {:>10.3?}  blocked {:>10.3?}  {:+6.2}%   \
+             workspace {:>6.1} MiB -> {:>5.1} MiB ({} blocks)",
+            timing[0],
+            timing[1],
+            (ratio - 1.0) * 100.0,
+            (col_rows * col_cols * 4) as f64 / (1024.0 * 1024.0),
+            (col_rows * bw * 4) as f64 / (1024.0 * 1024.0),
+            col_cols.div_ceil(bw),
+        );
     }
 }

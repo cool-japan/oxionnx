@@ -1,11 +1,10 @@
 //! GPU-accelerated softmax dispatch.
 
 use crate::context::GpuContext;
-use wgpu::util::DeviceExt;
 
 use super::common::{
-    checked_storage_bytes, plan_dispatch, read_back_and_recycle, ErrorScope, SoftmaxParams,
-    SOFTMAX_DIM_THRESHOLD,
+    block_on_gpu, checked_storage_bytes, plan_dispatch, read_back_and_recycle_async, ErrorScope,
+    SoftmaxParams, SOFTMAX_DIM_THRESHOLD,
 };
 
 // The kernel's own workgroup size (256, matching its `array<f32, 256>` shared
@@ -41,7 +40,11 @@ use super::common::{
 /// index in `checked_storage_bytes`).
 ///
 /// Returns `None` if the last dimension is below the threshold (caller should use CPU).
-pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Vec<f32>> {
+pub async fn gpu_softmax_async(
+    ctx: &GpuContext,
+    data: &[f32],
+    shape: &[usize],
+) -> Option<Vec<f32>> {
     if ctx.is_degraded() {
         return None;
     }
@@ -75,23 +78,33 @@ pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Ve
     // `wid.y * wg_per_row + wid.x`. It still declines when even a 2-D grid
     // cannot cover the rows, rather than silently skipping any.
     let grid = plan_dispatch(&ctx.limits, u64::try_from(num_rows).ok()?, 1)?;
+    // Input, output and read-back staging, all the same length here.
+    if !ctx.budget_admits(&[out_size, out_size, out_size]) {
+        return None;
+    }
 
     let scope = ErrorScope::begin(ctx);
 
-    let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("softmax_in"),
-        contents: bytemuck::cast_slice(&data[..total]),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let input_buf = ctx.upload_buffer(
+        "softmax_in",
+        bytemuck::cast_slice(&data[..total]),
+        wgpu::BufferUsages::STORAGE,
+    )?;
 
-    let output_buf = {
-        let mut pool = ctx.pool.lock().ok()?;
-        pool.get_buffer(
-            device,
-            out_size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        )
-    };
+    let output_buf = ctx.pooled_buffer(
+        out_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    )?;
+    // The pool may hand back a buffer up to 2x `out_size` -- see
+    // `GpuBufferPool::get_buffer` -- and `as_entire_binding()` would then bind
+    // that larger size, which can exceed `max_storage_buffer_binding_size`
+    // even though `out_size` itself was validated. Bind the exact range
+    // instead, as `conv2d::gpu_conv2d_implicit_resident_async`'s `output_binding` does.
+    let output_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &output_buf,
+        offset: 0,
+        size: wgpu::BufferSize::new(out_size),
+    });
 
     let params = SoftmaxParams {
         num_rows: u32::try_from(num_rows).ok()?,
@@ -99,18 +112,13 @@ pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Ve
         wg_per_row: grid.x,
         _pad: 0,
     };
-    let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("softmax_params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_buf = ctx.upload_buffer(
+        "softmax_params",
+        bytemuck::bytes_of(&params),
+        wgpu::BufferUsages::UNIFORM,
+    )?;
 
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("softmax_staging"),
-        size: out_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let staging_buf = ctx.staging_buffer("softmax_staging", out_size)?;
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("softmax_bg"),
@@ -122,7 +130,7 @@ pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Ve
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: output_buf.as_entire_binding(),
+                resource: output_binding,
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -149,9 +157,16 @@ pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Ve
     encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, out_size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    if !scope.finish(ctx) {
+    if !scope.finish_async(ctx).await {
         return None;
     }
 
-    read_back_and_recycle(ctx, &staging_buf, total, output_buf)
+    read_back_and_recycle_async(ctx, &staging_buf, total, output_buf).await
+}
+
+/// Blocking form of [`gpu_softmax_async`].
+///
+/// Declines outright on wasm32 (see `block_on_gpu`).
+pub fn gpu_softmax(ctx: &GpuContext, data: &[f32], shape: &[usize]) -> Option<Vec<f32>> {
+    block_on_gpu(gpu_softmax_async(ctx, data, shape))
 }

@@ -128,15 +128,18 @@ fn test_decide_placement_default() {
 fn test_is_gpu_capable_matmul() {
     use crate::execution_providers::is_gpu_capable;
     assert!(is_gpu_capable(&OpKind::MatMul));
-    // [a7-19] `is_gpu_capable` is now derived from `GPU_DISPATCH_OPS`, the
-    // exact set of ops `try_gpu_dispatch` has a real match arm for. `Gemm`
-    // has no arm (it falls through to the `_ => Ok(None)` catch-all), so
-    // asserting it GPU-capable encoded the old, three-way-disagreeing
-    // behaviour where `is_gpu_capable` claimed ops the dispatcher would
-    // immediately bounce back to CPU. See
+    // [a7-19] `is_gpu_capable` is derived from `GPU_DISPATCH_OPS`, the exact
+    // set of ops `try_gpu_dispatch` has a real match arm for. See
     // `execution_providers::is_gpu_capable_matches_try_gpu_dispatch_arms`
     // for the exhaustive version of this check.
-    assert!(!is_gpu_capable(&OpKind::Gemm));
+    //
+    // [r3a] `Gemm` asserted *not* capable until this wave, because it had no
+    // arm. It now dispatches to `gpu_gemm_nt` (transB=1), so the assertion
+    // flips rather than being deleted — an op silently leaving this list is
+    // exactly the drift the test exists to catch.
+    assert!(is_gpu_capable(&OpKind::Gemm));
+    // `Reshape` is the standing example of an op with no arm.
+    assert!(!is_gpu_capable(&OpKind::Reshape));
     assert!(is_gpu_capable(&OpKind::Conv));
     assert!(is_gpu_capable(&OpKind::Softmax));
     assert!(is_gpu_capable(&OpKind::Relu));

@@ -72,6 +72,9 @@ pub mod memory_tracker;
 #[cfg(feature = "ndarray")]
 pub mod ndarray_compat;
 pub mod optimizer;
+/// Cross-platform monotonic clock (`Instant` panics at runtime on
+/// wasm32-unknown-unknown; see the module docs). Internal only.
+mod time_compat;
 pub mod ops {
     pub use oxionnx_ops::*;
 }
@@ -117,10 +120,15 @@ pub use oxionnx_core::{DType, NodeInfo, TensorInfo, TensorStorage, TypedTensor};
 #[cfg(feature = "gpu")]
 pub use session::GpuExecutionProvider;
 pub use session::{
-    block_on, CancellationToken, ModelInfo, ModelMetadata, NodeProfile, OptLevel, RunFuture,
-    RunHandle, Session, SessionBuilder, SessionCacheHeader, SESSION_CACHE_FORMAT_VERSION,
-    SESSION_CACHE_MAGIC,
+    CancellationToken, ModelInfo, ModelMetadata, NodeProfile, OptLevel, Session, SessionBuilder,
+    SessionCacheHeader, SESSION_CACHE_FORMAT_VERSION, SESSION_CACHE_MAGIC,
 };
+// `run_async`/`spawn_run`/`block_on` start inference on a plain `std::thread`,
+// unsupported on wasm32-unknown-unknown (see `session::async_run`'s module
+// gate) -- not re-exported there so a caller reaching for them gets a
+// compile-time error instead of the runtime panic that used to happen.
+#[cfg(not(target_arch = "wasm32"))]
+pub use session::{block_on, RunFuture, RunHandle};
 pub use streaming::{GenerationConfig, KvCacheBinding, StreamStep, TokenStream};
 pub use tolerance::{compare_tensors, tensors_close, ToleranceReport};
 pub use typed_session::{Shape, TypedSession};

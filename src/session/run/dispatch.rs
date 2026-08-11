@@ -53,7 +53,7 @@ impl Session {
                     weights: Some(&self.weights),
                     registry: Some(&self.registry),
                 };
-                let start = std::time::Instant::now();
+                let start = crate::time_compat::Instant::now();
                 operator.execute_into_slots(&ctx, &mut slots)?;
                 let elapsed = start.elapsed();
                 for (out_name, tensor) in node.outputs.iter().zip(slots) {
@@ -66,7 +66,7 @@ impl Session {
             // Fall through to normal path if not all shapes known
         }
 
-        let start = std::time::Instant::now();
+        let start = crate::time_compat::Instant::now();
 
         let results = if can_inplace {
             // Take ownership of the first input for in-place mutation

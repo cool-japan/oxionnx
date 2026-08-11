@@ -1,7 +1,7 @@
 //! Attention variants: multi-query, grouped-query, and ALiBi attention.
 
 use super::core::softmax_last_dim;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 use super::gemm::should_parallelize;
 use super::gemm::{matmul_nn_into, matmul_nt_into};
 use oxionnx_core::{OnnxError, Tensor};
@@ -47,7 +47,7 @@ where
     }
     let scratch_len = seq_q * seq_k;
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     if should_parallelize(batch * num_heads, macs_per_head) {
         use rayon::prelude::*;
         output[..batch * num_heads * unit]
@@ -61,7 +61,7 @@ where
             );
         return;
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
     let _ = macs_per_head;
 
     let mut scores = vec![0.0f32; scratch_len];

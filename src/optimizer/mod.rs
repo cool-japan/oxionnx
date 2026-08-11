@@ -56,8 +56,9 @@ pub fn optimize(
 ///  4. **CSE** — merge duplicate sub-expressions.
 ///  5. **Fusion passes** — inference Dropout removal, MatMul+Add, Conv+BN,
 ///     Conv+Relu, Conv+ReLU6, SiLU, Div+Sqrt→Rsqrt, standalone BN folding,
-///     LayerNorm, Transpose/Reshape cancellation, MatMul+Transpose,
-///     Add+MatMul→Gemm, Gather composition, Conv+Add+Relu.
+///     LayerNorm, spatial (InstanceNorm-style) normalization chains,
+///     Transpose/Reshape cancellation, MatMul+Transpose, Add+MatMul→Gemm,
+///     Gather composition, Conv+Add+Relu.
 ///
 /// [`PassLevel::Extended`] runs step 3 and step 5; [`PassLevel::Basic`] runs
 /// step 3 only.  Every pass keeps the declared `output_names` produced.
@@ -144,6 +145,17 @@ pub fn optimize_with_input_shapes(
     let pre_fold_shapes = shape_inference::infer_shapes(&nodes, weights, input_shapes);
     let nodes = fusion::fold_batch_norm_inference(nodes, weights, &pre_fold_shapes);
     let nodes = fusion::fuse_layer_norm(nodes, weights, &pre_fold_shapes, output_names);
+    // Spatial normalization chains, *after* LayerNorm: on a 4-D tensor
+    // `axes=[2,3]` is also the trailing pair `[-2,-1]`, so running LayerNorm
+    // first gives it first refusal on any chain it can fold the affine term
+    // into.  `OxiInstanceNorm` is an optimizer-generated op, so — exactly as
+    // for `ConvAddRelu` below — only emit it when the active registry can
+    // dispatch it.
+    let nodes = if registry.get("OxiInstanceNorm").is_some() {
+        fusion::fuse_instance_norm(nodes, weights, &pre_fold_shapes, output_names)
+    } else {
+        nodes
+    };
     let nodes = fusion::cancel_consecutive_transpose(nodes, output_names);
     let nodes = fusion::fuse_matmul_transpose(nodes, output_names);
     let nodes = fusion::fuse_add_matmul_to_gemm(nodes, weights, &pre_fold_shapes, output_names);

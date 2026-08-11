@@ -1,8 +1,8 @@
 //! Bernoulli operator: elementwise Bernoulli sampling with a fast PRNG.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use oxionnx_core::{OnnxError, OpContext, Operator, Tensor};
+
+use crate::time_compat::{SystemTime, UNIX_EPOCH};
 
 /// A simple xorshift64* PRNG — no external crates.
 struct Xorshift64(u64);

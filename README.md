@@ -7,9 +7,14 @@
 
 OxiONNX is a high-performance ONNX inference engine written in pure Rust.
 It supports 188 ONNX operators, GPU acceleration via wgpu, SIMD optimization,
-and runs on any platform including WebAssembly.
+and runs in the browser on `wasm32-unknown-unknown` (CPU inference via
+`wasm-bindgen`; build with `-C target-feature=+simd128` to enable
+matrixmultiply's SIMD `sgemm` kernel) as well as every native target -- GPU
+acceleration ships for native targets today; an async WebGPU path for
+`wasm32` now compiles and is exercised by native tests, but is not yet
+wired into the browser bindings (see [Feature Flags](#feature-flags)).
 
-**150,561 lines of Rust | 2,946 tests | 0 clippy warnings**
+**143,426 lines of Rust | 3,212 tests | 0 clippy warnings**
 
 ## Features
 
@@ -23,7 +28,7 @@ and runs on any platform including WebAssembly.
 - **Graph optimization** -- Constant folding, operator fusion, CSE, dead code elimination
 - **Memory efficiency** -- Arena allocator, buffer pooling, strided tensor views
 - **Streaming inference** -- Token-by-token generation for autoregressive models: `session.generate(prompt, GenerationConfig)` returns a `TokenStream` iterator that runs one forward pass per `next()`, feeds the model's `present.*` key/value outputs back in as the next step's `past.*` inputs, and stops on EOS, on a token cap, or on cancellation. Greedy (argmax) selection only -- temperature / top-k / top-p / beam search are deliberately out of scope; set `emit_logits` and sample outside the crate. No tokenizer: token ids in, token ids out
-- **Async execution** -- Non-blocking inference via `Arc::clone(&session).run_async(inputs)`, which starts the model on a `std::thread` immediately and returns a `RunFuture`. Executor-agnostic (no async-runtime dependency at all): `.await` it under tokio/async-std/smol, or drive it with the crate's own dependency-free `block_on`. `spawn_run()` returns a blocking `RunHandle` for callers with no executor. The receiver is `Arc<Self>` because the worker thread outlives the call; thread-per-inference is the right tool for one long inference, not for many small concurrent ones
+- **Async execution** -- Non-blocking inference via `Arc::clone(&session).run_async(inputs)`, which starts the model on a `std::thread` immediately and returns a `RunFuture`. Executor-agnostic (no async-runtime dependency at all): `.await` it under tokio/async-std/smol, or drive it with the crate's own dependency-free `block_on`. `spawn_run()` returns a blocking `RunHandle` for callers with no executor. The receiver is `Arc<Self>` because the worker thread outlives the call; thread-per-inference is the right tool for one long inference, not for many small concurrent ones. Native targets only -- `wasm32-unknown-unknown` cannot spawn OS threads, so this whole module is compiled out there (a compile-time error on that target rather than the runtime panic it used to be); call `Session::run` synchronously instead
 - **Cancellation** -- `SessionBuilder::with_session_cancellation(token)` makes every operator the model uses check a `CancellationToken` before it runs, so `run()` unwinds with `OnnxError::Cancelled` at the first node boundary after `token.cancel()` -- on the sequential path, the rayon parallel path, and inside `If`/`Loop`/`Scan` bodies. The token is **session-scoped**: cancelling stops every run in flight on that session. For per-request cancellation of a generation, use `GenerationConfig::with_cancellation`, which is checked between decode steps. Nodes claimed by a GPU execution provider are dispatched before the registry and are not cancellation points
 - **Control flow** -- If/Loop/Scan operators with nested subgraph execution
 - **ONNX local functions** -- `FunctionProto` bodies are inlined into the graph at load time, in both the eager and streaming parsers, so models built from reusable function definitions execute like any other graph
@@ -32,7 +37,7 @@ and runs on any platform including WebAssembly.
 - **Opset-aware execution** -- `Softmax`/`LogSoftmax`/`Hardmax` branch on the model's declared `ai.onnx` opset (parsed from `opset_import`) instead of hardcoding opset-13+ semantics, so a pre-13 model gets the spec's default-axis-1-and-flatten-to-2D contract rather than the post-13 per-axis one
 - **Einsum ellipsis and broadcasting** -- the equation parser handles numpy-compatible `...` tokens (e.g. `...ij,...jk->...ik` for broadcast batched matmul) with numpy's right-aligned broadcasting rule, and a label shared across operands broadcasts when one side's extent is `1`; large contractions lower to `matrixmultiply::sgemm` via greedy pairwise decomposition instead of a scalar loop nest
 - **Model encryption** -- AES-GCM encrypted model files, keyed with CSPRNG-derived nonces
-- **WebAssembly** -- Run in the browser via wasm-bindgen
+- **WebAssembly** -- `wasm32-unknown-unknown` CPU inference via wasm-bindgen (`wasm` feature); load a model from bytes and run it with no native code path involved. `-C target-feature=+simd128` routes matrixmultiply's MatMul/Conv `sgemm` kernel through its `v128` SIMD path (measured ~3-4.3x over the scalar fallback). `Session::run_async`/`spawn_run` (thread-per-inference) are unavailable on this target -- wasm32-unknown-unknown cannot spawn OS threads -- call `Session::run` synchronously instead; GPU acceleration (`gpu` feature) now builds for `wasm32` too, with a working async execution path -- `Session::enable_gpu_async`/`run_gpu_async`, `GpuContext::try_new_async` acquiring a `wgpu::Backends::BROWSER_WEBGPU` adapter, kernels awaiting a real `map_async` read-back -- proven on native targets so far; it is not yet wired into these `wasm-bindgen` bindings (`WasmSession` still runs every GPU-eligible node on the CPU) or exercised in an actual browser
 - **no_std** -- Core types work without std (alloc only)
 - **Session caching** -- `session.save_optimized(path)` writes the **post-optimization** graph (nodes, rewritten weight table, value-info, model metadata, nested subgraphs) in a version-tagged, length-prefixed pure-Rust binary format; `Session::load_optimized(path)` / `SessionBuilder::load_optimized(path)` rebuilds it at `OptLevel::None`, so constant folding, CSE, fusion and dead-node elimination do not run again (the test suite proves this by counting operator executions during load: exactly zero). The encoding is deterministic, so a cache file can be content-hashed; a truncated, foreign or wrong-version file is always a typed `OnnxError::Parse`. Runtime settings (threads, providers, profiling, memory pool) are **not** cached -- they come from the builder that loads it
 - **Native dtype dispatch** -- `run_typed()` path executes 40+ operators natively (no f32 round-trip) via `TypedOpContext`; MatMul natively handles F32/F16/BF16/I8→I32/I32 dtypes
@@ -42,20 +47,20 @@ and runs on any platform including WebAssembly.
 
 ## Status
 
-| Crate | Status | Tests (pre-hardening-program baseline*) |
+| Crate | Status | Tests (all-features)* |
 |-------|--------|-------|
-| `oxionnx` (root) | Alpha | 613 passing |
-| `oxionnx-core` | Stable | 36 passing |
-| `oxionnx-ops` | Alpha | 624 passing |
-| `oxionnx-proto` | Stable | 42 passing |
-| `oxionnx-gpu` | Alpha | 17 passing |
-| `oxionnx-cuda` | Partial | 10 passing (GEMM/elementwise/softmax via OxiCUDA; Conv still stubbed and not advertised as supported) |
+| `oxionnx` (root) | Alpha | 1,089 passing (2 skipped) |
+| `oxionnx-core` | Stable | 69 passing |
+| `oxionnx-ops` | Alpha | 1,325 passing (8 skipped) |
+| `oxionnx-proto` | Stable | 134 passing |
+| `oxionnx-gpu` | Alpha | 240 passing |
+| `oxionnx-cuda` | Partial | 70 passing (GEMM/elementwise/softmax via OxiCUDA; Conv still stubbed and not advertised as supported) |
 | `oxionnx-directml` | Implemented (opt-in; GPU path not yet hardware-verified) | 242 tests, all Linux-executed or cross-target type-checked. Dual backend — DirectML operators + HLSL/D3D12 compute fallback — routing 15 ops: MatMul, Gemm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, ReduceSum, ReduceMean, ReduceMax, ReduceMin, Conv; kernels compile/lint-verified for Windows and proven on Linux vs a CPU oracle, but not yet run on GPU hardware |
-| `oxionnx-coreml` | Alpha | 8 passing on non-Apple hosts (compiles to a stub); 26 passing + 7 skipped on macOS/iOS/tvOS/visionOS (predict/predict_raw/predict_features, compute-plan + model metadata) |
+| `oxionnx-coreml` | Alpha | 8 passing on non-Apple hosts (compiles to a stub); 43 passing + 8 skipped on macOS/iOS/tvOS/visionOS (predict/predict_raw/predict_features, compute-plan + model metadata) |
 
-\* Per-crate figures predate the v0.1.5 hardening program (every crate gained tests during it, by an uneven amount) and do not sum to the total below; they are load-bearing only for relative crate maturity, not an absolute current count.
+\* Per-crate figures are all-features counts from this release (the `oxionnx-coreml` row uses its macOS figure, 43, since that is the host this run used) and sum exactly to the workspace total below: 1,089 + 69 + 1,325 + 134 + 240 + 70 + 242 + 43 = 3,212 passing; 2 + 0 + 8 + 0 + 0 + 0 + 0 + 8 = 18 skipped.
 
-**Total: 2,946 tests passing on Linux (`cargo nextest run --workspace --all-features`; the exact count drifts between runs as the workspace evolves under active development). 0 clippy warnings on the host target. Platform-gated suites run only on their target OS — `oxionnx-coreml`'s Apple-only paths and `oxionnx-directml`'s Windows FFI tests are not included here — so no single machine runs the entire cross-platform set. 150,561 lines of Rust (126,388 excluding blanks/comments).**
+**Total: 3,212 tests passing with all features (`cargo nextest run --workspace --all-features`, run on macOS; the exact count drifts between runs as the workspace evolves under active development), 2,984 with default features. 0 clippy warnings on the host target (`cargo clippy --all-features --all-targets -- -D warnings`). Platform-gated suites still run only on their target OS — this run's macOS host exercises `oxionnx-coreml`'s Apple-only paths, included above (8 of its tests still skip, needing a real `.mlpackage`), but not `oxionnx-directml`'s Windows FFI tests — so no single machine runs the entire cross-platform set. 170,415 lines of Rust (143,426 excluding blanks/comments).**
 
 ## Quick Start
 
@@ -115,7 +120,7 @@ OxiONNX implements 188 ONNX operators (plus 15 aliases: short-forms like `LayerN
 | `encryption` | AES-GCM model encryption |
 | `cuda` | CUDA GPU acceleration via OxiCUDA |
 | `mmap` | Memory-mapped weight loading |
-| `wasm` | WebAssembly browser bindings |
+| `wasm` | WebAssembly browser bindings -- CPU inference on `wasm32-unknown-unknown` via wasm-bindgen. Combining this with `gpu` now builds: `Session`'s `Send + Sync` requirement is wasm32-exempt and an async WebGPU path exists (`enable_gpu_async`/`run_gpu_async`, `BROWSER_WEBGPU` adapter, `map_async` read-back), proven on native targets only -- not yet wired into these bindings or run in a browser |
 | `ndarray` | ndarray interop for Tensor conversion |
 | `directml` | DirectML GPU acceleration (Windows, via D3D12) |
 | `coreml` | CoreML execution provider (Apple Silicon: macOS/iOS/tvOS/visionOS) |

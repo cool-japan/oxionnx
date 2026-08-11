@@ -9,6 +9,8 @@
 //! `package`, `macos_impl` and the sibling `tests` module still resolves
 //! exactly as it did when this was one file.
 
+use super::array_read::{read_raw_bytes, tensor_from_multi_array};
+use super::compile_cache;
 use super::*;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -79,7 +81,10 @@ unsafe impl Send for MlPackageModel {}
 unsafe impl Sync for MlPackageModel {}
 
 impl MlPackageModel {
-    /// Load a `.mlpackage` (will be compiled) or `.mlmodelc` (loaded as-is).
+    /// Load a `.mlpackage` (compiled once, then served from the
+    /// persistent compile cache — see
+    /// [`ensure_compiled`](Self::ensure_compiled)) or a `.mlmodelc`
+    /// (loaded as-is, no compilation involved).
     pub fn load(path: impl AsRef<Path>, compute_units: MlComputeUnits) -> Result<Self> {
         let path = path.as_ref();
         // Surface a clean error before crossing the FFI boundary.
@@ -93,7 +98,34 @@ impl MlPackageModel {
             });
         }
         let compiled = compile_if_needed(path)?;
-        let url = nsurl_for_dir(&compiled);
+        match Self::from_compiled(&compiled, compute_units) {
+            Ok(model) => Ok(model),
+            Err(err) => {
+                // A cache entry can become unloadable without the
+                // source bundle changing at all — a crash midway
+                // through a cross-device install, a `$TMPDIR` reaper
+                // that walked into the cache root, an OS upgrade that
+                // rejects an older `.mlmodelc`.  Left alone, that
+                // bricks the model for every future process.  Evict
+                // the entry and recompile exactly once; anything that
+                // is *not* one of our cache entries (a caller-supplied
+                // `.mlmodelc`, or the degraded framework-temp
+                // fallback) skips the retry, because recompiling
+                // would only reproduce the same failure.
+                if compile_cache::evict(path, &compiled) {
+                    let recompiled = compile_if_needed(path)?;
+                    Self::from_compiled(&recompiled, compute_units)
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Open an already-compiled `.mlmodelc` directory under
+    /// `compute_units` and cache its I/O feature names.
+    fn from_compiled(compiled: &Path, compute_units: MlComputeUnits) -> Result<Self> {
+        let url = nsurl_for_dir(compiled);
         let cfg = unsafe { MLModelConfiguration::new() };
         unsafe { cfg.setComputeUnits(compute_units.to_native()) };
         let model = unsafe {
@@ -107,9 +139,51 @@ impl MlPackageModel {
             model,
             input_names,
             output_names,
-            compiled_path: compiled,
+            compiled_path: compiled.to_path_buf(),
             compute_units,
         })
+    }
+
+    /// Compile `path` into the crate's persistent on-disk cache (if it
+    /// is not already there) and return the resulting `.mlmodelc`
+    /// directory, **without** loading the model.
+    ///
+    /// [`load`](Self::load) does this implicitly; calling it explicitly
+    /// is for pre-warming — an installer, a first-run setup step, or a
+    /// process that wants to pay the multi-second CoreML compile before
+    /// the first request rather than inside it.  A `.mlmodelc` path is
+    /// returned unchanged (nothing to compile, nothing to cache).
+    ///
+    /// ## Cache location
+    ///
+    /// * `$OXIONNX_COREML_CACHE_DIR` when set and non-empty, else
+    /// * `$HOME/Library/Caches/oxionnx-coreml`, else
+    /// * `<system temp dir>/oxionnx-coreml`.
+    ///
+    /// Entries are keyed by the bundle's file stem plus a fingerprint of
+    /// every file it contains (relative path, length, mtime), so editing
+    /// or replacing a `.mlpackage` produces a new entry rather than
+    /// silently reusing a stale compile.  Old entries are never pruned
+    /// automatically — the cache is a directory of self-describing
+    /// `<stem>-<fingerprint>.mlmodelc` trees and is safe to delete
+    /// wholesale at any time.
+    ///
+    /// Concurrent callers (threads or separate processes) racing on the
+    /// same key are safe: each compiles into its own temporary
+    /// directory and installs it with an atomic rename, and whichever
+    /// loses the race discards its copy and uses the winner's.
+    pub fn ensure_compiled(path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(CoreMLError::Io {
+                path: path.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "model bundle does not exist",
+                ),
+            });
+        }
+        compile_if_needed(path)
     }
 
     /// Load a model from an in-memory byte buffer.
@@ -772,13 +846,32 @@ fn nserror_to_coreml(err: Retained<NSError>) -> CoreMLError {
     CoreMLError::Framework { code, message: msg }
 }
 
-/// Compile a `.mlpackage` to `.mlmodelc` (cached in the system tmp dir
-/// by the framework).  `.mlmodelc` paths are returned as-is.
+/// Resolve `path` to a loadable `.mlmodelc` directory, compiling it
+/// exactly once per (bundle, content) pair and reusing that result
+/// forever after.  `.mlmodelc` paths are returned as-is.
+///
+/// See [`compile_cache`] for the cache layout, keying and concurrency
+/// story; [`compile_to_temp`] for why compiling on every load was both
+/// slow *and* a disk leak.
 fn compile_if_needed(path: &Path) -> Result<PathBuf> {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     if ext == "mlmodelc" {
         return Ok(path.to_path_buf());
     }
+    compile_cache::compile_cached(path, compile_to_temp)
+}
+
+/// Hand `path` to `MLModel::compileModelAtURL_error:` and return the
+/// framework-chosen `.mlmodelc` directory.
+///
+/// Apple allocates a **fresh** UUID-named directory under `$TMPDIR` for
+/// every single call and never reuses or reaps it — on a machine that
+/// had been running this runtime for a while, 7,408 orphaned
+/// `.mlmodelc` trees totalling 857 GB had accumulated there.  That is
+/// why [`compile_if_needed`] never hands this result straight to
+/// `MLModel`: [`compile_cache::compile_cached`] moves the directory
+/// into a stable cache location (or deletes it) on every path.
+fn compile_to_temp(path: &Path) -> Result<PathBuf> {
     let url = nsurl_for_dir(path);
     // `compileModelAtURL_error:` is the legacy synchronous compile API.
     // The newer async variant returns the same compiled URL but is
@@ -1058,207 +1151,6 @@ fn make_provider(
         )
         .map_err(nserror_to_coreml)
     }
-}
-
-/// Map a source `MLMultiArrayDataType` to the portable
-/// [`MlArrayDtype`] tag plus its per-element byte width, or reject it
-/// with [`CoreMLError::UnsupportedOutputDtype`].
-///
-/// Only `Float32` and `Float16` are supported today — exactly the set
-/// `tensor_from_multi_array` has always accepted.  `MLMultiArrayDataType`
-/// is a newtype-wrapped integer with associated consts (not a real
-/// Rust `enum`), so a catch-all arm is required for exhaustiveness.
-fn dtype_and_width(dt: MLMultiArrayDataType) -> Result<(MlArrayDtype, usize)> {
-    match dt {
-        MLMultiArrayDataType::Float32 => Ok((MlArrayDtype::F32, core::mem::size_of::<f32>())),
-        MLMultiArrayDataType::Float16 => Ok((MlArrayDtype::F16, core::mem::size_of::<u16>())),
-        _ => Err(CoreMLError::UnsupportedOutputDtype(format!("{dt:?}"))),
-    }
-}
-
-/// Extract an `MLMultiArray`'s contents verbatim into a portable
-/// [`RawArray`] — dtype preserved (no `Float16` → `f32`
-/// up-conversion), shape normalized to a tightly-packed C-contiguous
-/// byte run regardless of CoreML's internal strides.
-///
-/// This is the shared extraction core for both
-/// `tensor_from_multi_array` (which further converts the bytes to
-/// `f32`) and [`MlPackageModel::predict_raw`] (which returns the
-/// bytes as-is).
-///
-/// **Stride-aware copy.**  CoreML may allocate output buffers with
-/// non-C-contiguous strides for ANE / GPU alignment.  In practice this
-/// shows up on SCRFD: an output declared as shape `[800, 1]` is laid
-/// out with strides `[32, 1]` (each row padded to 32 elements for
-/// 64-byte cache-line alignment).  A naive `copy_nonoverlapping(N)`
-/// from `dataPointer()` reads padding bytes and silently scrambles the
-/// data — the symptom in OxiFace's `--device coreml` SCRFD detector
-/// was zero-detection on real face images even though `coremltools`'
-/// Python `predict()` returned correct values for the same model.
-///
-/// We copy the per-element *bytes* via
-/// `byte_ptr.offset(idx · stride · elem_bytes)` where `idx` is the
-/// C-major destination index decomposed via the declared `shape`,
-/// multiplied with the array's reported `strides()`.  On the
-/// C-contiguous fast path this is a single bulk `copy_nonoverlapping`;
-/// on the strided slow path it walks element by element.  Every copy
-/// here is `u8`-to-`u8` (never a typed pointer cast), so there is no
-/// alignment hazard regardless of `dtype`'s natural alignment — unlike
-/// interpreting the bytes as `f32`/`u16`, which
-/// `tensor_from_multi_array`'s conversion pass does safely via
-/// `from_ne_bytes` rather than a pointer cast, precisely to avoid
-/// assuming a `Vec<u8>`'s heap allocation is `f32`/`u16`-aligned (Rust
-/// only guarantees `align_of::<u8>() == 1` for it).
-pub(super) fn read_raw_bytes(arr: &MLMultiArray) -> Result<RawArray> {
-    let shape = read_shape(arr);
-    let strides = read_strides(arr);
-    let dt = unsafe { arr.dataType() };
-    let (dtype, elem_bytes) = dtype_and_width(dt)?;
-
-    // C-contiguous element count = product of shape (NOT `arr.count()`,
-    // which can include stride padding on some allocations).
-    let n_c_contig: usize = shape.iter().product();
-    let c_strides = c_contiguous_strides(&shape);
-    let is_c_contiguous = strides == c_strides;
-
-    // Allocate the destination outside the closure; the closure writes
-    // through a raw pointer.  The buffer is alive for the entire
-    // function (and therefore for the entire synchronous handler
-    // call).
-    let mut out: Vec<u8> = vec![0u8; n_c_contig * elem_bytes];
-    let dst_ptr: *mut u8 = out.as_mut_ptr();
-
-    // `block2::StackBlock` requires `Fn`, so the "did the handler run"
-    // signal goes through a `Cell<bool>`.  `getBytesWithHandler` is
-    // documented to always invoke its handler synchronously exactly
-    // once, but we don't trust that blindly — see the
-    // `Err(Internal(...))` fallback below.
-    let invoked: std::cell::Cell<bool> = std::cell::Cell::new(false);
-    let invoked_ref: &std::cell::Cell<bool> = &invoked;
-    let shape_ref: &Vec<usize> = &shape;
-    let strides_ref: &Vec<isize> = &strides;
-
-    let handler = block2::StackBlock::new(
-        |bytes: core::ptr::NonNull<core::ffi::c_void>, _size: isize| {
-            let base = bytes.as_ptr() as *const u8;
-            if is_c_contiguous {
-                // Fast path — bulk byte copy.  `base` and `dst_ptr`
-                // are both `u8`-typed, so this has no alignment
-                // requirement beyond `align_of::<u8>() == 1`,
-                // regardless of the logical element width.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(base, dst_ptr, n_c_contig * elem_bytes);
-                }
-            } else {
-                // Stride-aware slow path.  Walk a multi-dimensional
-                // index in C-major order; translate each step to a
-                // source *byte* offset using the declared
-                // (element-unit) strides, then copy exactly one
-                // element's worth of raw bytes — never interpreting
-                // them as a typed value, so there's no alignment
-                // hazard here either.
-                let mut idx: Vec<usize> = vec![0; shape_ref.len()];
-                for dst in 0..n_c_contig {
-                    let mut src_offset: isize = 0;
-                    for d in 0..shape_ref.len() {
-                        src_offset += idx[d] as isize * strides_ref[d];
-                    }
-                    unsafe {
-                        let src = base.offset(src_offset * elem_bytes as isize);
-                        let dst_elem = dst_ptr.add(dst * elem_bytes);
-                        std::ptr::copy_nonoverlapping(src, dst_elem, elem_bytes);
-                    }
-                    // Increment idx in C-major order (innermost first).
-                    for d in (0..shape_ref.len()).rev() {
-                        idx[d] += 1;
-                        if idx[d] < shape_ref[d] {
-                            break;
-                        }
-                        idx[d] = 0;
-                    }
-                }
-            }
-            invoked_ref.set(true);
-        },
-    );
-
-    unsafe { arr.getBytesWithHandler(&handler) };
-
-    if invoked.get() {
-        Ok(RawArray {
-            shape,
-            dtype,
-            data: out,
-        })
-    } else {
-        Err(CoreMLError::Internal(
-            "getBytesWithHandler did not invoke its handler".to_string(),
-        ))
-    }
-}
-
-/// Convert an output `MLMultiArray` to a tightly-packed C-contiguous
-/// `f32` [`Tensor`].  `Float32` sources copy through unchanged;
-/// `Float16` sources are up-converted per-element.  Built on
-/// [`read_raw_bytes`] — see that function's doc comment for the
-/// stride-aware extraction and the SCRFD cache-line-padding story
-/// that motivates it.
-pub(super) fn tensor_from_multi_array(arr: &MLMultiArray) -> Result<Tensor> {
-    let raw = read_raw_bytes(arr)?;
-    let data: Vec<f32> = match raw.dtype {
-        MlArrayDtype::F32 => raw
-            .data
-            .chunks_exact(4)
-            .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-        MlArrayDtype::F16 => raw
-            .data
-            .chunks_exact(2)
-            .map(|b| half::f16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32())
-            .collect(),
-        MlArrayDtype::F64 | MlArrayDtype::I32 | MlArrayDtype::I8 => {
-            // Unreachable in practice: `read_raw_bytes` calls
-            // `dtype_and_width`, which only ever returns `Ok` for
-            // F32/F16 — anything else already returned
-            // `Err(UnsupportedOutputDtype)` above. Surfaced as an
-            // `Internal` error rather than `unreachable!()` so a
-            // future change to `dtype_and_width`'s coverage fails
-            // loudly as a `Result`, not a panic.
-            return Err(CoreMLError::Internal(format!(
-                "read_raw_bytes produced dtype {:?}, but only F32/F16 are ever returned \
-                 for MLMultiArray sources — this indicates an internal invariant violation",
-                raw.dtype
-            )));
-        }
-    };
-    Ok(Tensor::new(data, raw.shape))
-}
-
-fn read_shape(arr: &MLMultiArray) -> Vec<usize> {
-    let s = unsafe { arr.shape() };
-    let n = s.len();
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let v = s.objectAtIndex(i);
-        // NSNumber::longLongValue is the safe path for any integer
-        // underlying type.
-        let iv = v.longLongValue();
-        out.push(if iv < 0 { 0 } else { iv as usize });
-    }
-    out
-}
-
-/// Read `MLMultiArray::strides()` as a plain `Vec<isize>` (in elements,
-/// not bytes — same convention CoreML uses).
-fn read_strides(arr: &MLMultiArray) -> Vec<isize> {
-    let s = unsafe { arr.strides() };
-    let n = s.len();
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let v = s.objectAtIndex(i);
-        out.push(v.longLongValue() as isize);
-    }
-    out
 }
 
 // ────────────────────────────────────────────────────────────────────── //

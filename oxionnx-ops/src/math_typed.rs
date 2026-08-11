@@ -349,7 +349,7 @@ pub(crate) fn matmul_f32_into(
     let b_batch_stride = k * n;
     out.resize(batch_size * mn, 0.0f32);
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     if batch_size >= 4 {
         use rayon::prelude::*;
         out.par_chunks_mut(mn).enumerate().for_each(|(b_idx, dst)| {
@@ -396,7 +396,7 @@ pub(crate) fn matmul_f32_into(
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
     for b_idx in 0..batch_size {
         let a_off = (b_idx % a_batches) * a_batch_stride;
         let b_off = (b_idx % b_batches) * b_batch_stride;

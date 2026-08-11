@@ -18,7 +18,7 @@
 
 use oxionnx_core::{OnnxError, Tensor};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
 use rayon::prelude::*;
 
 use super::conv2d::{conv2d_into_slices, sgemm_maybe_parallel};
@@ -301,11 +301,14 @@ pub(crate) fn conv_nd_into(
         return;
     }
 
-    let total_jobs = n * group;
-
     // Multiple independent (batch, group) slices → one rayon job each, exactly
-    // as the rank-2 kernel does.
-    #[cfg(not(target_arch = "wasm32"))]
+    // as the rank-2 kernel does. A serial wasm32 build has no rayon (see the
+    // `wasm-threads` feature in `Cargo.toml` for that boundary) and always
+    // takes the "single slice (or WASM)" path below instead, so `total_jobs`
+    // would otherwise be computed and never read there.
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
+    let total_jobs = n * group;
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     if total_jobs > 1 {
         let job = |idx: usize| -> Vec<f32> {
             let batch = idx / group;
@@ -545,7 +548,7 @@ fn im2col_nd_maybe_parallel(
     batch: usize,
     col: &mut [f32],
 ) {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
     {
         let ksize: usize = kernel.iter().product();
         let col_cols: usize = out_spatial.iter().product();

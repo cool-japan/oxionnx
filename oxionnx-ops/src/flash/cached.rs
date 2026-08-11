@@ -187,7 +187,7 @@ pub fn cached_flash_attention(
         };
 
         if d_v != 0 {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-threads"))]
             if crate::attention::gemm::should_parallelize(
                 batch * num_heads,
                 full_seq * (head_dim + d_v),
@@ -203,7 +203,7 @@ pub fn cached_flash_attention(
                     head_step(bh, &mut scores, out_row);
                 }
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
             {
                 let mut scores = vec![0.0f32; full_seq];
                 for (bh, out_row) in output.chunks_mut(d_v).enumerate() {

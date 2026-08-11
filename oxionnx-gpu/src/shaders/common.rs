@@ -100,7 +100,8 @@ pub(super) struct TransposeParams {
 // the matmul path in `compute.rs` and the shader paths here share one
 // implementation (and one bounded, non-panicking failure mode).
 pub(super) use crate::device_guard::{
-    checked_storage_bytes, plan_dispatch, read_back_and_recycle, DispatchGrid, ErrorScope,
+    block_on_gpu, checked_storage_bytes, finish_output_async, plan_dispatch,
+    read_back_and_recycle_async, DispatchGrid, ErrorScope,
 };
 
 /// Workgroup size (threads along X) used by every element-wise-style kernel.

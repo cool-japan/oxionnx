@@ -136,13 +136,25 @@ pub enum OpPlacement {
 pub enum ProviderKind {
     /// Pure-Rust CPU execution (always available as fallback).
     Cpu,
-    /// wgpu compute backend on native platforms — Vulkan, Metal or DX12
-    /// (requires the `gpu` feature).
+    /// wgpu compute backend — Vulkan, Metal or DX12 natively, WebGPU in a
+    /// browser (requires the `gpu` feature).
     ///
-    /// [a7-10] Not available in the browser: the kernels are synchronous and
-    /// end in a blocking read-back, which WebGPU cannot do, so
-    /// `GpuContext::try_new_async` declines on `wasm32` and a session selecting
-    /// this provider there runs on the CPU instead.
+    /// # wasm32 / WebGPU
+    ///
+    /// Available, but only through the asynchronous entry points. A browser
+    /// thread may not block on a GPU fence, so on `wasm32`:
+    ///
+    /// * the context must be acquired with
+    ///   [`crate::Session::enable_gpu_async`] (session construction cannot
+    ///   block on `requestAdapter`, so a session starts without a device), and
+    /// * inference must run through [`crate::Session::run_gpu_async`].
+    ///
+    /// A `wasm32` caller that selects this provider and then calls the
+    /// synchronous [`crate::Session::run`] gets correct results computed
+    /// entirely on the CPU: the synchronous dispatcher declines every node
+    /// there rather than encoding work it could never read back. [a7-10] was
+    /// the previous, stronger version of that rule — it declined at context
+    /// creation, because no async path existed at all.
     #[cfg(feature = "gpu")]
     Gpu,
     /// NVIDIA CUDA backend (requires `cuda` feature).
@@ -416,6 +428,19 @@ pub(crate) const GPU_DISPATCH_OPS: &[OpKind] = &[
     OpKind::BatchNorm,
     OpKind::Transpose,
     OpKind::ReduceMean,
+    // [r3a] Added when `try_gpu_dispatch_async` grew arms for them. Each of
+    // these is only reachable *because* it is listed here: `is_gpu_capable`
+    // is what `decide_placement`/`gpu_accelerator_gate` consult before the
+    // dispatcher is ever called, so a match arm without an entry in this
+    // array is unreachable code that no test can distinguish from a kernel
+    // that always declines.
+    OpKind::Sub,
+    OpKind::Div,
+    OpKind::PRelu,
+    OpKind::Pad,
+    OpKind::Resize,
+    OpKind::Gemm,
+    OpKind::OxiInstanceNorm,
 ];
 
 /// Check if an operator has a **wgpu** (`gpu` feature) implementation.
@@ -812,6 +837,16 @@ mod tests {
             OpKind::BatchNorm,
             OpKind::Transpose,
             OpKind::ReduceMean,
+            // [r3a] Gained real arms in this wave. `Sub`/`Div`/`Gemm` moved
+            // up from the "must NOT be capable" list below, which is the
+            // whole point of that list existing: the move is visible here.
+            OpKind::Sub,
+            OpKind::Div,
+            OpKind::PRelu,
+            OpKind::Pad,
+            OpKind::Resize,
+            OpKind::Gemm,
+            OpKind::OxiInstanceNorm,
         ] {
             assert!(
                 is_gpu_capable(&op),
@@ -824,9 +859,13 @@ mod tests {
             OpKind::Flatten,
             OpKind::Gather,
             OpKind::Shape,
-            OpKind::Div,
-            OpKind::Gemm,
-            OpKind::Sub,
+            // [r3a] InSwapper's two remaining CPU op types (48 tiny nodes
+            // between them) and SCRFD's shape plumbing. Listed here so that
+            // giving either an arm without also listing it above — the exact
+            // dead-arm trap this pair of lists guards — fails loudly.
+            OpKind::Slice,
+            OpKind::Unsqueeze,
+            OpKind::Concat,
         ] {
             assert!(
                 !is_gpu_capable(&op),

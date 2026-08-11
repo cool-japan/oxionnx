@@ -56,7 +56,7 @@ streaming parsers are defensive by default:
 
 ```toml
 [dependencies]
-oxionnx-proto = "0.1.5"
+oxionnx-proto = "0.1.6"
 ```
 
 ```rust

@@ -15,7 +15,6 @@ categories = ["science", "mathematics"]
 
 [dependencies]
 oxionnx-core = { workspace = true }
-oxifft = { workspace = true }
 matrixmultiply = { workspace = true }
 half = { workspace = true }
 
@@ -24,6 +23,41 @@ half = { workspace = true }
 [features]
 default = []
 simd = []
+# Restore rayon's intra-operator parallelism on wasm32.
+#
+# Off by default, and deliberately so: it only links on a browser build made
+# with `-C target-feature=+atomics,+bulk-memory` and a `-Z build-std` rebuild
+# of `std` (nightly), and the resulting module needs `SharedArrayBuffer` —
+# i.e. a cross-origin-isolated page — plus a `wasm-bindgen-rayon`
+# `initThreadPool()` call before the first operator runs. The plain
+# stable-toolchain wasm build must stay serial, so this cannot be a default.
+#
+# On every non-wasm32 target the feature is inert: the `dep:rayon` it turns on
+# lives in the wasm32 target table only, and native already depends on rayon
+# unconditionally (below), so `--features wasm-threads` on native changes
+# neither the dependency graph nor a single `cfg`.
+wasm-threads = ["dep:rayon"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = { workspace = true }
+# `threading` (rayon) is a `compile_error!` in oxifft on wasm32 -- see the
+# `default-features = false` note on the workspace `oxifft` entry for why this
+# split has to live here rather than as a plain feature list.
+oxifft = { workspace = true, features = ["std", "threading"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Optional twin of the native `rayon` above, switched on by `wasm-threads`.
+#
+# `web_spin_lock` is load-bearing, not a tuning knob: rayon's latches block on
+# `memory.atomic.wait32`, which *traps* when executed on the browser's main
+# thread. Every entry point here (`swap_frame`, `detect`, …) is called from
+# the main thread, so without this feature the first `par_iter` would abort
+# the module. It swaps those waits for `wasm_sync`'s spin-then-yield latches.
+rayon = { workspace = true, optional = true, features = ["web_spin_lock"] }
+# NOTE: oxifft stays single-threaded here even under `wasm-threads` — its
+# `threading` feature is a hard `compile_error!` on wasm32 regardless of how
+# std was built.
+oxifft = { workspace = true, features = ["std"] }
+# `SystemTime::now()` (unseeded Random*/Bernoulli ops, see `src/time_compat.rs`)
+# panics at runtime on wasm32-unknown-unknown; web-time is the drop-in fix.
+web-time = { workspace = true }

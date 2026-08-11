@@ -52,16 +52,51 @@ if let Some(version) = metadata.get("version") {
 
 ### Loading
 
-* [`MlPackageModel::load`] — load a `.mlpackage` (compiled at load time)
-  or an existing `.mlmodelc` bundle.  Returns `CoreMLError::Io` for
-  missing paths and `CoreMLError::Framework` for any `NSError` the
-  framework raises during load.
+* [`MlPackageModel::load`] — load a `.mlpackage` (compiled **once**, then
+  served from the persistent compile cache described below) or an
+  existing `.mlmodelc` bundle (loaded as-is, nothing to compile).
+  Returns `CoreMLError::Io` for missing paths and
+  `CoreMLError::Framework` for any `NSError` the framework raises during
+  load.
+* [`MlPackageModel::ensure_compiled`] — compile a `.mlpackage` into the
+  cache and return the resulting `.mlmodelc` path *without* loading it,
+  for installers and first-run setup steps that want to pay the compile
+  before the first request rather than inside it.
 * [`MlPackageModel::load_from_bytes`] — always returns
   `CoreMLError::UnsupportedFormat`.  `.mlpackage`/`.mlmodelc` bundles
   are directory trees, not a single serialized blob, so there is no
   bytes-based loading path; materialize the bundle to disk and call
   [`MlPackageModel::load`] instead.  Provided for API parity with
   `Session::from_bytes`.
+
+#### Compile cache
+
+`MLModel::compileModelAtURL_error:` compiles a `.mlpackage` into a fresh
+UUID-named directory under `$TMPDIR` on **every** call, and never reuses
+or deletes it.  This crate therefore compiles once and moves the result
+into a stable, content-keyed location:
+
+```text
+$OXIONNX_COREML_CACHE_DIR                 # if set and non-empty
+$HOME/Library/Caches/oxionnx-coreml       # otherwise
+<system temp dir>/oxionnx-coreml          # last resort
+    └── <bundle stem>-<fingerprint>.mlmodelc
+```
+
+The fingerprint folds the relative path, length and mtime of every file
+in the source bundle, so replacing a `.mlpackage` produces a new entry
+rather than reusing a stale compile.  Entries are self-describing and
+the cache is safe to delete wholesale at any time; nothing is pruned
+automatically.  Concurrent processes racing on the same key each install
+via an atomic rename, so a reader sees either a complete entry or none.
+If the cache cannot be used at all (read-only volume, full disk) the
+load still succeeds — it falls back to the framework's temporary
+directory.
+
+Beyond skipping the compile itself, the stable path is what lets Apple's
+own ANE program cache hit across process launches: on an M3, loading
+ArcFace + SCRFD + InSwapper costs ~4.3 s from a never-seen path and
+~0.14 s once the cache is warm.
 
 ### Inference
 
@@ -168,35 +203,35 @@ not need to fence its own code paths.
 
 ## Tests
 
-26 tests run by default.  7 additional tests need a real `.mlpackage`
+43 tests run by default.  8 additional tests need a real `.mlpackage`
 and are gated with `#[ignore]` so the workspace test run does not
-require model files:
-
-```bash
-# Convert the OxiFace ArcFace model to /tmp/w600k_r50.mlpackage first.
-cargo test -p oxionnx-coreml -- --ignored --test-threads=1
-```
-
-Six of the seven (in `src/package/tests.rs`) load that hardcoded
-`/tmp/w600k_r50.mlpackage` path directly.  The seventh — the
-concurrency stress test in `tests/concurrent_predict.rs`, which fires
-real concurrent `predict` calls from 8 threads against one shared
-`Arc<MlPackageModel>` — instead reads its model path from the
+require model files.  Every one of them reads its bundle path from the
 `OXIONNX_COREML_TEST_MODEL` environment variable and skips gracefully
-(prints a note, does not fail) when it is unset, so it needs the
-variable set to actually exercise anything:
+(prints a note, does not fail) when it is unset or points nowhere:
 
 ```bash
-OXIONNX_COREML_TEST_MODEL=/tmp/w600k_r50.mlpackage \
-    cargo test -p oxionnx-coreml --test concurrent_predict -- --ignored
+OXIONNX_COREML_TEST_MODEL=/path/to/w600k_r50.mlpackage \
+    cargo test -p oxionnx-coreml -- --ignored --test-threads=1
 ```
 
-The non-ignored tests cover `predict_features`'s dispatch across every
-supported CoreML feature type (including all four pixel formats),
-`model_metadata`'s defensive string-extraction helpers, the
+They cover the ArcFace load/predict/metadata/compute-plan round trips
+(`src/package/tests.rs`), the concurrency stress test in
+`tests/concurrent_predict.rs` (8 threads × 20 `predict` calls against
+one shared `Arc<MlPackageModel>`), and the compile-cache end-to-end test
+in `tests/compile_cache.rs` (two consecutive resolutions compile once,
+produce one cache entry, and leave nothing in `$TMPDIR`).
+
+The non-ignored tests cover the stride-normalizing output readers
+against deliberately padded `MLMultiArray` layouts — including SCRFD's
+exact `[N, 1] / [N, 4] / [N, 10]` shapes with 32-element row padding —
+cross-checked against a naive reference gather; the compile cache's
+keying, race resolution, eviction and degradation paths;
+`predict_features`'s dispatch across every supported CoreML feature type
+(including all four pixel formats); `model_metadata`'s defensive
+string-extraction helpers; the
 `compute_plan_summary`/`compute_plan_breakdown` merge and reconciliation
-logic, the no-copy/owned-array deallocator paths, error mapping for
-missing files, and the documented `load_from_bytes` rejection.
+logic; the no-copy/owned-array deallocator paths; error mapping for
+missing files; and the documented `load_from_bytes` rejection.
 
 ## License
 

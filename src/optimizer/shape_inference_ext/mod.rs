@@ -88,7 +88,10 @@ pub(crate) fn infer_ext_node_shapes(
         }
 
         // ── Normalization ops (same shape as input[0]) ──────────────
-        OpKind::InstanceNorm | OpKind::LpNorm | OpKind::MeanVarianceNormalization => {
+        OpKind::InstanceNorm
+        | OpKind::OxiInstanceNorm
+        | OpKind::LpNorm
+        | OpKind::MeanVarianceNormalization => {
             let shape = get_input_shape(node, 0, known)?;
             Some(vec![shape])
         }
