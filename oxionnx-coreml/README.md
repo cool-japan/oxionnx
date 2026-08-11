@@ -184,7 +184,7 @@ Implemented for macOS, iOS, tvOS, and visionOS
 `cfg`.  Validation differs by platform, though:
 
 * **macOS** is the primary platform this crate's own test suite
-  actually executes on (26 tests run by default — see
+  actually executes on (43 tests run by default — see
   [Tests](#tests) below).
 * **iOS** (`aarch64-apple-ios`) is compile-validated directly by this
   crate — `cargo build`, `cargo clippy`, and `cargo test --no-run` all

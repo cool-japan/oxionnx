@@ -180,6 +180,8 @@ Other workspace members:
 - `oxionnx-ops` — CPU operator kernels
 - `oxionnx-proto` — ONNX protobuf parser
 - `oxionnx-gpu` — wgpu/WebGPU backend
+- `oxionnx-directml` — DirectML (Windows D3D12) execution provider
+- `oxionnx-coreml` — Apple CoreML execution provider
 - `oxionnx` — top-level session API
 
 ## License

@@ -3,7 +3,7 @@ members = ["oxionnx-core", "oxionnx-ops", "oxionnx-proto", "oxionnx-gpu", "oxion
 resolver = "2"
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team Kitasan)"]
 license = "Apache-2.0"
@@ -13,14 +13,14 @@ homepage = "https://github.com/cool-japan/oxionnx"
 rust-version = "1.75"
 
 [workspace.dependencies]
-oxionnx-core = { path = "oxionnx-core", version = "0.1.6" }
+oxionnx-core = { path = "oxionnx-core", version = "0.1.7" }
 ndarray = { version = "0.17" }
-oxionnx-ops = { path = "oxionnx-ops", version = "0.1.6" }
-oxionnx-proto = { path = "oxionnx-proto", version = "0.1.6" }
-oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.6" }
-oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.6" }
-oxionnx-directml = { path = "oxionnx-directml", version = "0.1.6" }
-oxionnx-coreml = { path = "oxionnx-coreml", version = "0.1.6" }
+oxionnx-ops = { path = "oxionnx-ops", version = "0.1.7" }
+oxionnx-proto = { path = "oxionnx-proto", version = "0.1.7" }
+oxionnx-gpu = { path = "oxionnx-gpu", version = "0.1.7" }
+oxionnx-cuda = { path = "oxionnx-cuda", version = "0.1.7" }
+oxionnx-directml = { path = "oxionnx-directml", version = "0.1.7" }
+oxionnx-coreml = { path = "oxionnx-coreml", version = "0.1.7" }
 # OxiCUDA stack
 #
 # `default-features = false` here (rather than leaving it unspecified) is load

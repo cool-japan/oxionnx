@@ -35,9 +35,13 @@ streaming parsers are defensive by default:
   of silently dropped; protobuf group wire types are skipped instead of
   aborting the parse; the varint decoder no longer truncates bits above 64
   on a 10-byte varint.
-- `GraphProto.sparse_initializer`/`value_info` and `AttributeProto.tensors`/
-  `graphs`/`sparse_tensor`/`type_proto`/`ref_attr_name` are parsed instead
-  of silently dropped.
+- `GraphProto.value_info` and `AttributeProto.tensors`/`graphs`/
+  `ref_attr_name` are parsed instead of silently dropped.
+  `GraphProto.sparse_initializer` and `AttributeProto.sparse_tensor`/
+  `type_proto` are not yet supported -- rather than silently dropping the
+  data (which for `sparse_initializer` would leave the graph referencing a
+  tensor that never materializes) or misparsing it, a model that uses them
+  fails to load with a diagnosable error naming the field.
 - Weight decode covers uint8/int8/bool/double/bfloat16 initializers without
   zero-filling, and negative or overflowing `dims` are rejected with a typed
   error instead of being cast to a huge `usize`.
@@ -56,7 +60,7 @@ streaming parsers are defensive by default:
 
 ```toml
 [dependencies]
-oxionnx-proto = "0.1.6"
+oxionnx-proto = "0.1.7"
 ```
 
 ```rust

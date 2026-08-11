@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 OxiONNX is a high-performance ONNX inference engine written in pure Rust.
-It supports 188 ONNX operators, GPU acceleration via wgpu, SIMD optimization,
+It supports 189 ONNX operators, GPU acceleration via wgpu, SIMD optimization,
 and runs in the browser on `wasm32-unknown-unknown` (CPU inference via
 `wasm-bindgen`; build with `-C target-feature=+simd128` to enable
 matrixmultiply's SIMD `sgemm` kernel) as well as every native target -- GPU
@@ -19,8 +19,8 @@ wired into the browser bindings (see [Feature Flags](#feature-flags)).
 ## Features
 
 - **Pure Rust** -- Zero C/C++/Fortran dependencies. Safe, portable, auditable.
-- **188 ONNX operators** -- Math, NN, Conv, Shape, Indexing, Comparison, RNN, Attention, ML; real-world detection models run, including YOLOv8 and YOLO11 (opset 11+)
-- **GPU acceleration** -- wgpu compute shaders for MatMul, Softmax, ReLU, etc.
+- **189 ONNX operators** -- Math, NN, Conv, Shape, Indexing, Comparison, RNN, Attention, ML; real-world detection models run, including YOLOv8 and YOLO11 (opset 11+)
+- **GPU acceleration** -- wgpu compute shaders for MatMul, Gemm (incl. transposed-B `gemm_nt`), Conv2D (direct implicit-GEMM kernel with no im2col materialization, ~692 GFLOP/s at InSwapper-128's 128x128 decoder layer on M3), Softmax, ReLU, PRelu, Resize, broadcast elementwise, etc. Session-lifetime weight residency caches `Conv`'s `W`/`B` and `Gemm`'s `B`/`C` initializers on the device after their first upload (`Session::gpu_resident_bytes()`; e.g. InSwapper-128's 502.7 MB/frame of convolution weights now cross the host<->device bus once per session instead of once per dispatch), and run-scoped activation residency lets one GPU node's output stay device-resident for the next GPU consumer to bind in place instead of a read-back plus re-upload at every node boundary (toggle via `Session::activation_residency_enabled()`/`set_activation_residency()`). A measured two-tier size gate (`gpu_min_transfer_elements`) declines to dispatch memory-bound elementwise ops whose operands must still cross the bus -- several measured strictly slower on the GPU than the rayon CPU kernel by more than an order of magnitude (up to ~36x for `Relu`) -- so turning on the `gpu` feature does not by itself guarantee a speedup on every op; residency and this size gate are what keep `OpPlacement::Auto` from trading a CPU win for a GPU loss
 - **SIMD optimization** -- NEON (aarch64) and AVX2 (x86_64) for element-wise ops
 - **Multi-dtype** -- f32, f16, bf16, i8, i32, i64 with automatic type promotion
 - **INT8 quantization** -- Quantized MatMul with per-channel scale/zero-point
@@ -40,7 +40,7 @@ wired into the browser bindings (see [Feature Flags](#feature-flags)).
 - **WebAssembly** -- `wasm32-unknown-unknown` CPU inference via wasm-bindgen (`wasm` feature); load a model from bytes and run it with no native code path involved. `-C target-feature=+simd128` routes matrixmultiply's MatMul/Conv `sgemm` kernel through its `v128` SIMD path (measured ~3-4.3x over the scalar fallback). `Session::run_async`/`spawn_run` (thread-per-inference) are unavailable on this target -- wasm32-unknown-unknown cannot spawn OS threads -- call `Session::run` synchronously instead; GPU acceleration (`gpu` feature) now builds for `wasm32` too, with a working async execution path -- `Session::enable_gpu_async`/`run_gpu_async`, `GpuContext::try_new_async` acquiring a `wgpu::Backends::BROWSER_WEBGPU` adapter, kernels awaiting a real `map_async` read-back -- proven on native targets so far; it is not yet wired into these `wasm-bindgen` bindings (`WasmSession` still runs every GPU-eligible node on the CPU) or exercised in an actual browser
 - **no_std** -- Core types work without std (alloc only)
 - **Session caching** -- `session.save_optimized(path)` writes the **post-optimization** graph (nodes, rewritten weight table, value-info, model metadata, nested subgraphs) in a version-tagged, length-prefixed pure-Rust binary format; `Session::load_optimized(path)` / `SessionBuilder::load_optimized(path)` rebuilds it at `OptLevel::None`, so constant folding, CSE, fusion and dead-node elimination do not run again (the test suite proves this by counting operator executions during load: exactly zero). The encoding is deterministic, so a cache file can be content-hashed; a truncated, foreign or wrong-version file is always a typed `OnnxError::Parse`. Runtime settings (threads, providers, profiling, memory pool) are **not** cached -- they come from the builder that loads it
-- **Native dtype dispatch** -- `run_typed()` path executes 40+ operators natively (no f32 round-trip) via `TypedOpContext`; MatMul natively handles F32/F16/BF16/I8→I32/I32 dtypes
+- **Native dtype dispatch** -- `run_typed()` path executes 40+ operators natively (no f32 round-trip) via `TypedOpContext`; MatMul and Gemm natively handle F32/F16/BF16/I8→I32/I32 dtypes, and Conv/ConvTranspose, Attention/MultiHeadAttention, and LSTM/GRU also have dedicated native F32/F16/BF16 typed kernels (cast-compute-cast with an f32 accumulator) beyond the original pilot set
 - **DirectML backend** -- Windows D3D12 execution provider (`directml` feature) with CPU fallback on other platforms; opt-in (`OXIONNX_DIRECTML=1` / `.with_directml(true)`), compile- and lint-verified for Windows and proven on Linux against a CPU oracle, but not yet executed on GPU hardware
 - **Zero-copy output reuse** -- Operators write into pre-allocated output slots via `execute_into_slots`; a large subset of hot operators (elementwise, activations, normalization, reduce, pooling, shape, indexing, attention, conv, RNN) have hand-coded zero-copy slot-write kernels that avoid the intermediate copy and preserve pointer identity across inference runs with `IoBinding`. Operators without a hand-coded kernel fall back to a correct copy-based default (`execute()` then `copy_from_slice`)
 - **Graph introspection** -- Enumerate a model's compute nodes (op type, inputs, outputs, attributes) via `Session::nodes()` / `NodeInfo`
@@ -95,7 +95,7 @@ let session = Session::builder()
 
 ## Supported Operators
 
-OxiONNX implements 188 ONNX operators (plus 15 aliases: short-forms like `LayerNorm`/`RMSNorm`/`Silu`/`CeLU`, plus the 11-name `ai.onnx.ml.*` domain) -- 203 op-type strings resolve through the registry in total.
+OxiONNX implements 189 ONNX operators (plus 15 aliases: short-forms like `LayerNorm`/`RMSNorm`/`Silu`/`CeLU`, plus the 11-name `ai.onnx.ml.*` domain) -- 204 op-type strings resolve through the registry in total.
 
 | Category | Count | Examples |
 |----------|-------|---------|
@@ -130,7 +130,7 @@ OxiONNX implements 188 ONNX operators (plus 15 aliases: short-forms like `LayerN
 ```
 oxionnx (root)           -- Session, optimizer, execution engine
   oxionnx-core           -- Tensor, DType, Graph, Operator trait, OnnxError
-  oxionnx-ops            -- 188 operator implementations
+  oxionnx-ops            -- 189 operator implementations
   oxionnx-proto          -- Pure Rust ONNX protobuf parser
   oxionnx-gpu            -- wgpu compute backend (optional)
   oxionnx-cuda           -- CUDA dispatch layer via OxiCUDA (optional)

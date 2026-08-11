@@ -25,7 +25,8 @@ it produced the right numbers". Be precise about what is and is not known:
 and type-checks; the numbers have never been checked against a GPU."
 
 Because of this, **the GPU path is off by default even on Windows.** You must opt in with
-`OXIONNX_DIRECTML=1` (or `SessionBuilder::with_directml(true)`). See "Activation" below for
+`OXIONNX_DIRECTML=1` — a `SessionBuilder::with_directml(true)` programmatic equivalent is
+**[Planned]**, not yet exposed by `oxionnx`'s `SessionBuilder`. See "Activation" below for
 why: a GPU kernel bug does not crash, it returns plausible-looking wrong numbers.
 
 ### The hardware gate
@@ -61,7 +62,7 @@ Every switch is off by default, and each defaults off for a reason.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OXIONNX_DIRECTML=1` | **off** | Acquire a GPU at all. Without it `DirectMLContext::try_new()` returns `None`, the session holds `dml: None`, and every node runs on the CPU. `SessionBuilder::with_directml(true)` is the programmatic equivalent. |
+| `OXIONNX_DIRECTML=1` | **off** | Acquire a GPU at all. Without it `DirectMLContext::try_new()` returns `None`, the session holds `dml: None`, and every node runs on the CPU. A `SessionBuilder::with_directml(true)` programmatic equivalent is **[Planned]** — not yet implemented in `oxionnx`'s `SessionBuilder`. |
 | `OXIONNX_DIRECTML_VERIFY=1` | off | Shadow-compare **every** dispatched op against the CPU oracle. A mismatch is treated as a kernel *failure*: the wrong numbers are **discarded**, not returned. Roughly doubles the cost of every claimed node — a diagnostic mode, not a production one. |
 | `OXIONNX_DIRECTML_STRICT=1` | off | A kernel *failure* becomes a hard `Err` instead of a silent CPU fallback. A *declined* op still falls back — declining is not failing. |
 | `OXIONNX_DIRECTML_ALLOW_WARP=1` | off | Permit the software (WARP) adapter. Skipped by default: WARP is a CPU rasteriser, so a "GPU" backend silently running on it would be *slower* than the tuned CPU kernels it exists to beat. |
@@ -127,7 +128,7 @@ Windows GPU backend.
 
 ```toml
 [dependencies]
-oxionnx = { version = "0.1.6", features = ["directml"] }
+oxionnx = { version = "0.1.7", features = ["directml"] }
 ```
 
 ## Usage
@@ -136,12 +137,13 @@ The provider is wired in by the session; you do not construct it yourself.
 
 ```rust,no_run
 use oxionnx::Session;
+use std::path::Path;
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 // With the `directml` feature enabled, the session acquires a DirectML context on Windows
 // *when the user has opted in* (`OXIONNX_DIRECTML=1`), and falls back to CPU everywhere and
 // everywhen else.  The GPU path is off by default — see "Activation".
-let session = Session::load("model.onnx")?;
+let session = Session::from_file(Path::new("model.onnx"))?;
 # Ok(())
 # }
 ```
@@ -180,10 +182,17 @@ has been run against a GPU. See the verification status at the top of this file.
 | `ReduceMean` | **single resolved axis only** (empty/multi-axis `axes` declines), `keepdims` default `1` | declined → CPU |
 | `ReduceMax` | **single resolved axis only** (empty/multi-axis `axes` declines), `keepdims` default `1` | declined → CPU |
 | `ReduceMin` | **single resolved axis only** (empty/multi-axis `axes` declines), `keepdims` default `1` | declined → CPU |
-| `Conv` | **rank-4 (2-D) only**, `auto_pad=NOTSET`, optional bias `B`, strides/dilations/pads/group at ONNX defaults (1/1/0/1) | declined → CPU |
+| `Conv` | **rank-4 (2-D) only**, `auto_pad` must be `NOTSET`/absent (`SAME_UPPER`/`SAME_LOWER`/`VALID` decline), optional bias `B` (`[C_out]`); strides/pads/dilations/group accept any structurally-valid value, not only the ONNX defaults (stride 1, pad 0, dilation 1, group 1) | declined → CPU |
 
 Every operand must be non-empty (`numel() > 0`) — a `[0, 128]` tensor is routine after an
 empty batch, and `CreateCommittedResource` with `Width = 0` fails outright.
+
+`Conv` carries one more restriction the table can't show: there is no HLSL convolution
+shader (see the `kernels::conv` module docs), so it accelerates only when a context
+resolved to `BackendKind::DirectMl`. On the less common machines where `DirectML.dll` is
+absent and `try_new()` falls back to `BackendKind::Hlsl`, every other claimed op above
+still runs on the GPU, but `Conv` alone declines to the CPU. `DirectMLContext::backend_kind()`
+reports which engine a live context resolved to.
 
 ### Why the restrictions are this tight
 

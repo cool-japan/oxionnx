@@ -4,6 +4,8 @@ All notable changes to OxiONNX will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.7] - Unreleased
+
 ## [0.1.6] - 2026-08-11
 
 ### Added

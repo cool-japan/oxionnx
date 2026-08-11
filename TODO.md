@@ -1,10 +1,10 @@
-# OxiONNX 0.1.6 -- Pure Rust ONNX Inference Engine
+# OxiONNX 0.1.7 -- Pure Rust ONNX Inference Engine
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
 **Author:** COOLJAPAN OU (Team Kitasan)
 
-**Current stats (2026-08-11):** ~143,426 SLoC (Rust code, tokei) | 190 OpKind variants | 188 registered operators (203 op-type strings incl. aliases) | 3,212 tests passing | workspace layout (8 crates)
+**Current stats (2026-08-11):** ~143,426 SLoC (Rust code, tokei) | 190 OpKind variants | 189 registered operators (204 op-type strings incl. aliases) | 3,212 tests passing | workspace layout (8 crates)
 **Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)
 **Zero C/C++ dependencies.**
 
@@ -504,7 +504,7 @@ changing the `Operator::execute` return contract.
 
 ---
 
-## 16. v0.1.5 — Phase D, E, F Promotion (In Progress)
+## 16. v0.1.5 — Phase D, E, F Promotion — COMPLETE
 
 ### Phase D — Operator-Native TypedTensor Dispatch (pilot)
 - [x] Infrastructure: `TypedOpContext`, `native_dtypes()`, `execute_typed()` hooks on `Operator` trait (all with backward-compat defaults) — `oxionnx-core/src/operator.rs`, `operator_typed.rs`, `operator_slots.rs`
