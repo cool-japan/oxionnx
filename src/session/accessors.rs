@@ -324,6 +324,60 @@ impl Session {
         }
     }
 
+    /// Device bytes this session's context currently has allocated, idle pooled
+    /// buffers included.
+    ///
+    /// `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_live_bytes(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.live_gpu_bytes())
+    }
+
+    /// Device bytes held by idle buffers waiting to be reused — a subset of
+    /// [`Self::gpu_live_bytes`] that no dispatch is reading.
+    ///
+    /// Run-over-run growth here is the memory-boundedness question that decides
+    /// whether recycling is affordable, so it is exposed rather than inferred.
+    /// `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pooled_bytes(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.pooled_gpu_bytes())
+    }
+
+    /// Idle buffers this session's context is pooling, and the count bound it
+    /// keeps them under. `(0, 0)` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pooled_buffers(&self) -> (usize, usize) {
+        self.gpu.as_ref().map_or((0, 0), |gpu| gpu.pooled_buffers())
+    }
+
+    /// The byte retention bound this session's context keeps its idle pooled
+    /// buffers under. `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pool_byte_budget(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.pool_byte_budget())
+    }
+
+    /// Buffer requests this session's context served from an idle pooled entry,
+    /// cumulative. `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pool_reuses(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.pool_reuses())
+    }
+
+    /// Buffer requests this session's context had to ask the driver for,
+    /// cumulative. `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pool_allocations(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.pool_allocations())
+    }
+
     /// Cumulative host→device bytes this session's context has uploaded —
     /// weights, activations and parameter blocks alike.
     ///

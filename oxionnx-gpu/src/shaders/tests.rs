@@ -3,8 +3,8 @@
 use crate::context::GpuBufferPool;
 use crate::context::GpuContext;
 use crate::shaders::{
-    gpu_batch_norm, gpu_gelu, gpu_layer_norm, gpu_reduce_mean, gpu_relu, gpu_sigmoid, gpu_softmax,
-    gpu_transpose,
+    gpu_batch_norm, gpu_broadcast_add, gpu_conv2d_implicit, gpu_gelu, gpu_gemm_nt, gpu_layer_norm,
+    gpu_reduce_mean, gpu_relu, gpu_sigmoid, gpu_softmax, gpu_transpose, ConvActivation,
 };
 
 /// After a dispatch, the only device memory this crate still holds is what the
@@ -615,4 +615,82 @@ fn test_gpu_reduce_mean() {
             "reduce_mean mismatch at {i}: got {result_val}, expected {expected}",
         );
     }
+}
+
+/// [w4] Dropping a [`GpuContext`] takes this thread's entries for *its* device
+/// out of all five device-keyed pipeline caches.
+///
+/// # Why this is order-independent
+///
+/// It only ever asks about the device it constructed itself
+/// (`thread_local_entries_for_device`), never about the caches' totals. Under
+/// `--test-threads=1` every test on the thread shares these thread-locals, so a
+/// total would be a statement about whichever context ran last; a per-device
+/// count is a statement about this one. The device handle is cloned before the
+/// drop purely so the question can still be asked afterwards — cloning a
+/// `wgpu::Device` is an `Arc` bump, and the clone is what keeps the *device*
+/// alive here, not a cache entry.
+///
+/// What this does **not** claim: that another thread's caches were touched.
+/// They are unreachable from a `Drop` by construction, and
+/// `insert_for_current_device` remains their eviction rule. See
+/// `shaders::purge_thread_local_caches_for`.
+#[test]
+fn dropping_a_context_purges_this_threads_pipeline_caches() {
+    let ctx = match GpuContext::try_new() {
+        Some(ctx) => ctx,
+        None => return,
+    };
+    let device = ctx.device.clone();
+
+    // Populate as many of the five caches as this adapter allows.
+    // `gpu_broadcast_add` compiles through `kernel_support`'s `PIPELINES`; a
+    // convolution populates `CONV2D_PIPELINE`; a half-precision `gemm_nt` on an
+    // adapter that supports `shader-f16` populates `GEMM_F16_READY`.
+    //
+    // The two *negative* caches (`CONV2D_F16_UNAVAILABLE`, `GEMM_F16_UNAVAILABLE`)
+    // are deliberately not reachable from here: an entry lands in one only when
+    // an `f16` shader fails to compile on this device, which no test can provoke
+    // on an adapter where it succeeds. They take the identical
+    // `purge_thread_local` call as the three caches this does cover.
+    let a = vec![1.0f32; 64 * 64];
+    let b = vec![2.0f32; 64];
+    let _ = gpu_broadcast_add(&ctx, &a, &[64, 64], &b, &[1, 64]);
+    let input = oxionnx_core::Tensor::new(vec![0.25f32; 32 * 32 * 32], vec![1, 32, 32, 32]);
+    let weight = oxionnx_core::Tensor::new(vec![0.05f32; 32 * 32 * 3 * 3], vec![32, 32, 3, 3]);
+    let _ = gpu_conv2d_implicit(
+        &ctx,
+        &input,
+        &weight,
+        None,
+        [1, 1],
+        [1, 1, 1, 1],
+        [1, 1],
+        1,
+        ConvActivation::None,
+    );
+    if ctx.set_f16_compute(true) {
+        let (m, k, n) = (32usize, 512usize, 512usize);
+        let ga: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.01).collect();
+        let gb: Vec<f32> = (0..n * k).map(|i| (i % 13) as f32 * 0.02).collect();
+        let _ = gpu_gemm_nt(&ctx, &ga, m, k, &gb, n, None, 1.0, 0.0);
+    }
+
+    let populated = crate::shaders::thread_local_entries_for_device(&device);
+    if populated == 0 {
+        eprintln!("skip: the adapter declined every dispatch, so no pipeline was cached");
+        return;
+    }
+    // Printed rather than asserted at an exact value: how many entries the
+    // dispatches above leave behind depends on what this adapter accepted, and
+    // pinning the number would make the test a statement about one machine.
+    eprintln!("  {populated} cached entries for this device before the drop");
+
+    drop(ctx);
+    assert_eq!(
+        crate::shaders::thread_local_entries_for_device(&device),
+        0,
+        "dropping a context must leave none of its {populated} cached pipelines \
+         behind on this thread",
+    );
 }

@@ -754,6 +754,28 @@ async fn conv2d_pipeline_f16_async(
     Some(cached_pipeline(device, true, || built))
 }
 
+/// \[w4\] Drop this thread's `CONV2D_PIPELINE` and `CONV2D_F16_UNAVAILABLE`
+/// entries for a device that is going away.
+///
+/// Both caches, because both hold a `wgpu::Device` handle and both therefore
+/// keep it alive — the negative cache stores the device precisely so that a
+/// later, different device cannot land in a freed slot and compare equal. See
+/// `kernel_support::purge_thread_local` for why this is same-thread
+/// best-effort on top of the retain-on-insert rule rather than instead of it.
+pub(super) fn purge_device(device: &wgpu::Device) {
+    super::kernel_support::purge_thread_local(&CONV2D_PIPELINE, |cached| &cached.device == device);
+    super::kernel_support::purge_thread_local(&CONV2D_F16_UNAVAILABLE, |cached| cached == device);
+}
+
+/// \[w4\] Entries this thread holds for `device` across both caches. Test-only.
+#[cfg(test)]
+pub(super) fn cached_entries_for_device(device: &wgpu::Device) -> usize {
+    super::kernel_support::thread_local_matches(&CONV2D_PIPELINE, |cached| &cached.device == device)
+        + super::kernel_support::thread_local_matches(&CONV2D_F16_UNAVAILABLE, |cached| {
+            cached == device
+        })
+}
+
 // ========================================================================
 // Shape planning
 // ========================================================================

@@ -250,7 +250,7 @@ impl Session {
                     .await?
                 {
                     self.decrement_refs_state(node, state, ref_counts, output_set);
-                    activations.release_after(index);
+                    activations.release_after(index, self.gpu.as_deref());
                     continue;
                 }
             }
@@ -268,7 +268,7 @@ impl Session {
             if mixed_precision_node
                 && self.try_native_f16_node(node, state, ref_counts, output_set, resolved)?
             {
-                activations.release_after(index);
+                activations.release_after(index, self.gpu.as_deref());
                 continue;
             }
 
@@ -303,15 +303,18 @@ impl Session {
             }
 
             self.decrement_refs_state(node, state, ref_counts, output_set);
-            activations.release_after(index);
+            activations.release_after(index, self.gpu.as_deref());
         }
         crate::session::gpu_residency::note_activation_peak(activations.peak_bytes());
         // Nothing should be left: every name in the plan has a last consumer,
-        // and every node released after itself. Dropping the map destroys
-        // whatever a future edit does leave behind rather than carrying it into
-        // the next frame, which is what makes the live-byte assertion in
-        // `tests::gpu_activation_residency` a statement about the mechanism and
-        // not about this loop remembering to clean up.
+        // and every node released after itself. Dropping the map **destroys**
+        // whatever a future edit does leave behind — deliberately not the
+        // recycling `release_after` performs, because a value that reaches here
+        // is one the last-use schedule lost track of, and the honest thing to do
+        // with it is return its bytes to the driver rather than hand them to the
+        // pool as if they had been released on schedule. That is what makes the
+        // live-byte assertion in `session::tests::gpu_activation` a statement
+        // about the mechanism and not about this loop remembering to clean up.
         drop(activations);
         Ok(())
     }
@@ -445,7 +448,7 @@ impl Session {
                 gpu_ctx.upload_device_tensor("promoted_operand", &tensor.data, &tensor.shape)
             {
                 crate::session::gpu_residency::note_activation_upload(tensor.data.len());
-                activations.insert_promoted(&name, device);
+                activations.insert_promoted(&name, device, Some(gpu_ctx));
             }
         }
     }
@@ -616,7 +619,7 @@ impl Session {
                         });
                     }
                 }
-                activations.insert_output(name, tensor);
+                activations.insert_output(name, tensor, Some(gpu_ctx));
                 Ok(true)
             }
         }

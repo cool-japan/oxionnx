@@ -21,6 +21,48 @@ mod transpose;
 #[cfg(test)]
 mod tests;
 
+/// \[w4\] Drop every entry this thread holds for `device` across all five
+/// device-keyed thread-local caches: `kernel_support`'s `PIPELINES`,
+/// `conv2d`'s `CONV2D_PIPELINE` and `CONV2D_F16_UNAVAILABLE`, and `gemm`'s
+/// `GEMM_F16_UNAVAILABLE` and `GEMM_F16_READY`.
+///
+/// Called from [`crate::GpuContext`]'s `Drop`. Every one of those caches stores
+/// the `wgpu::Device` handle itself — handle equality is `Arc` identity, and
+/// only holding the handle stops a later, different device from comparing equal
+/// by landing in a freed slot — so every entry keeps its device alive. The
+/// retain-on-insert rule in `kernel_support::insert_for_current_device` already
+/// bounds each cache at one device, but it runs only on an insert, leaving a
+/// dropped context's handle resident on a thread that has stopped dispatching
+/// until that thread's next compile. This is the other half.
+///
+/// **Same-thread, and best-effort.** It reaches the caches of whichever thread
+/// runs the `Drop`, never another's; entries a worker thread populated for this
+/// device stay until that thread's next insert evicts them, which is by
+/// construction (a thread-local is not addressable from another thread, and
+/// these caches cannot be global — `wgpu::Device` is neither `Send` nor `Sync`
+/// on wasm32). Retain-on-insert therefore remains the backstop and is not
+/// weakened by this existing. See `kernel_support::purge_thread_local` for the
+/// two teardown cases it must not panic in.
+pub(crate) fn purge_thread_local_caches_for(device: &wgpu::Device) {
+    kernel_support::purge_device(device);
+    conv2d::purge_device(device);
+    gemm::purge_device(device);
+}
+
+/// \[w4\] Entries this thread holds for `device` across all five caches, i.e.
+/// what [`purge_thread_local_caches_for`] would remove. Test-only.
+///
+/// Counting *for a named device* rather than in total is what makes an
+/// assertion on it order-independent: a test can only ever ask about the
+/// context it constructed itself, so nothing another test left on the thread
+/// can move the answer.
+#[cfg(test)]
+pub(crate) fn thread_local_entries_for_device(device: &wgpu::Device) -> usize {
+    kernel_support::cached_entries_for_device(device)
+        + conv2d::cached_entries_for_device(device)
+        + gemm::cached_entries_for_device(device)
+}
+
 pub use broadcast_binary::{
     gpu_broadcast_add, gpu_broadcast_div, gpu_broadcast_mul, gpu_broadcast_sub,
 };

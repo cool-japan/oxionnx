@@ -207,6 +207,25 @@ async fn gemm_nt_pipeline_f16_async(
     Some(built)
 }
 
+/// \[w4\] Drop this thread's `GEMM_F16_UNAVAILABLE` and `GEMM_F16_READY` entries
+/// for a device that is going away.
+///
+/// Both are lists of `wgpu::Device` handles — a remembered verdict, positive or
+/// negative — so both keep their device alive until the thread's next insert.
+/// See `kernel_support::purge_thread_local` for why this is same-thread
+/// best-effort on top of the retain-on-insert rule rather than instead of it.
+pub(super) fn purge_device(device: &wgpu::Device) {
+    super::kernel_support::purge_thread_local(&GEMM_F16_UNAVAILABLE, |cached| cached == device);
+    super::kernel_support::purge_thread_local(&GEMM_F16_READY, |cached| cached == device);
+}
+
+/// \[w4\] Entries this thread holds for `device` across both caches. Test-only.
+#[cfg(test)]
+pub(super) fn cached_entries_for_device(device: &wgpu::Device) -> usize {
+    super::kernel_support::thread_local_matches(&GEMM_F16_UNAVAILABLE, |cached| cached == device)
+        + super::kernel_support::thread_local_matches(&GEMM_F16_READY, |cached| cached == device)
+}
+
 /// GPU-accelerated `out = alpha * A @ B^T + beta * C`.
 ///
 /// `a` is `[m, k]` row-major, `b` is `[n, k]` row-major (`B^T` is applied by

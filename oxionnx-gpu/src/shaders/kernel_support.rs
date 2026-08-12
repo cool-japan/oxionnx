@@ -186,6 +186,78 @@ pub(super) fn insert_for_current_device<T>(
     cache.push(entry);
 }
 
+/// \[w4\] Drop this thread's entries for a device that is going away, from one
+/// thread-local device-keyed cache.
+///
+/// # What this closes, and what it deliberately does not
+///
+/// [`insert_for_current_device`] bounds every cache at a single device, but it
+/// only runs *on an insert*. So a dropped context's handle survives in whatever
+/// caches this thread populated for it until the thread's next compile — a
+/// bounded residue, but one that keeps a `wgpu::Device` alive for an
+/// arbitrarily long time on a thread that has stopped dispatching. Calling this
+/// from [`crate::GpuContext`]'s `Drop` closes that window.
+///
+/// It is **same-thread best-effort, on top of** the retain-on-insert rule,
+/// which remains the backstop and is not being replaced. `Drop` runs on
+/// whichever thread drops the context — which, thanks to
+/// `oxionnx::session::gpu_owner`, is the thread that *created* it, but that
+/// says nothing about other threads. Entries a worker thread populated for this
+/// device are unreachable from here by construction: a thread-local is not
+/// addressable from another thread, and making these caches globally
+/// addressable is exactly what their doc comments explain they must not be
+/// (`wgpu::Device` is neither `Send` nor `Sync` on wasm32). Those entries are
+/// still evicted by the next insert on their own thread.
+///
+/// Two ways this can be reached with nothing to do, both handled rather than
+/// prevented:
+///
+/// * the thread-local has already been destroyed — a context dropped during
+///   thread teardown, after TLS destructors have run. `LocalKey::with` panics
+///   there, and a panic inside a `Drop` while unwinding aborts the process, so
+///   this uses `try_with`;
+/// * the cache is already mutably borrowed, which would mean a `GpuContext` is
+///   being dropped from inside one of these caches' own closures. Nothing in
+///   this crate does that, and `try_borrow_mut` makes the impossible case a
+///   no-op instead of a panic.
+pub(super) fn purge_thread_local<T>(
+    cache: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>,
+    belongs_to_dropped_device: impl Fn(&T) -> bool,
+) {
+    let _ = cache.try_with(|cell| {
+        if let Ok(mut entries) = cell.try_borrow_mut() {
+            entries.retain(|entry| !belongs_to_dropped_device(entry));
+        }
+    });
+}
+
+/// \[w4\] Entries of one thread-local cache that match `matches`, or `0` when the
+/// thread-local is gone. Test-only; see `shaders::thread_local_entries_for_device`.
+#[cfg(test)]
+pub(super) fn thread_local_matches<T>(
+    cache: &'static std::thread::LocalKey<std::cell::RefCell<Vec<T>>>,
+    matches: impl Fn(&T) -> bool,
+) -> usize {
+    cache
+        .try_with(|cell| {
+            cell.try_borrow()
+                .map_or(0, |entries| entries.iter().filter(|e| matches(e)).count())
+        })
+        .unwrap_or(0)
+}
+
+/// \[w4\] Drop this thread's `PIPELINES` entries for `device`. See
+/// [`purge_thread_local`].
+pub(super) fn purge_device(device: &wgpu::Device) {
+    purge_thread_local(&PIPELINES, |cached| &cached.device == device);
+}
+
+/// \[w4\] `PIPELINES` entries this thread holds for `device`. Test-only.
+#[cfg(test)]
+pub(super) fn cached_entries_for_device(device: &wgpu::Device) -> usize {
+    thread_local_matches(&PIPELINES, |cached| &cached.device == device)
+}
+
 /// Build a single-entry-point compute pipeline from WGSL source, or return the
 /// one already compiled for this `(device, label, entry_point, src)`.
 ///

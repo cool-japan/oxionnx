@@ -1018,6 +1018,46 @@ impl GpuContext {
     pub fn pooled_gpu_bytes(&self) -> u64 {
         self.pool.lock().map_or(0, |pool| pool.pooled_bytes())
     }
+
+    /// \[w4\] Idle buffers the pool is holding, and the count bound it is holding
+    /// them under.
+    ///
+    /// The pair matters more than either number: with activation recycling a
+    /// graph that returns more buffers per frame than it requests walks the
+    /// pool up to its retention bound and is then held there by LRU eviction,
+    /// so "is this a steady state or a leak" is answered by whether the count
+    /// has reached the bound — not by whether it stopped moving.
+    #[must_use]
+    pub fn pooled_buffers(&self) -> (usize, usize) {
+        self.pool
+            .lock()
+            .map_or((0, 0), |pool| (pool.available_count(), pool.max_buffers()))
+    }
+
+    /// \[w4\] The pool's byte retention bound — the other half of
+    /// [`Self::pooled_buffers`]'s count bound.
+    #[must_use]
+    pub fn pool_byte_budget(&self) -> u64 {
+        self.pool.lock().map_or(0, |pool| pool.byte_budget())
+    }
+
+    /// \[w4\] Buffer requests the pool has served from an idle entry, cumulative.
+    ///
+    /// With [`Self::pool_allocations`] this is the whole account of what a
+    /// change in activation disposition does to allocation churn: the request
+    /// count is their sum and is a property of the graph, so only the split
+    /// between them can move.
+    #[must_use]
+    pub fn pool_reuses(&self) -> u64 {
+        self.pool.lock().map_or(0, |pool| pool.reuses())
+    }
+
+    /// \[w4\] Buffer requests the pool has had to ask the driver for, cumulative.
+    /// See [`Self::pool_reuses`].
+    #[must_use]
+    pub fn pool_allocations(&self) -> u64 {
+        self.pool.lock().map_or(0, |pool| pool.allocations())
+    }
 }
 
 // ========================================================================
@@ -1176,11 +1216,21 @@ impl GpuContext {
     /// Hand a finished activation's allocation back to the reusable-buffer pool
     /// instead of destroying it.
     ///
-    /// Not what the run loop does at an activation's last consumer — it *drops*
-    /// the value there, so the bytes leave the budget immediately and a run
-    /// ends with the live total back at its resident-weight baseline. This
-    /// exists for a caller that would rather trade that property for cheaper
-    /// allocation on the next frame.
+    /// \[w4\] This is what the session's run loop does at an activation's last
+    /// consumer (`session::gpu_activations`'s `RunActivations::dispose`, which
+    /// carries the A/B that chose it): measured against destroying, it is
+    /// 2% faster on InSwapper-128 and 11–28% faster on a chain of small
+    /// activations, byte-identical in 200 of 200 measured pairs.
+    ///
+    /// The bytes stay in [`Self::live_gpu_bytes`] until the pool evicts them,
+    /// so a caller asserting "a finished run is back at its resident-weight
+    /// baseline" must clear or reclaim the pool first. Nothing is stranded by
+    /// that: [`Self::pooled_gpu_bytes`] is reclaimed before any allocation is
+    /// declined, so a pooled buffer can never be the reason a node falls back
+    /// to the CPU.
+    ///
+    /// A poisoned pool mutex costs the recycling and nothing else — the tensor
+    /// is destroyed, exactly as it was before this became the default.
     pub fn recycle_device_tensor(&self, tensor: DeviceTensor) {
         if let Ok(mut pool) = self.pool.lock() {
             pool.return_buffer(tensor.into_buffer());
@@ -1440,5 +1490,13 @@ impl Drop for GpuContext {
         // alive, rather than leaving it to field drop glue that runs after this
         // function returns.
         self.resident.clear();
+        // [w4] The compiled-pipeline caches are thread-locals that store the
+        // device handle, so each entry keeps this device alive. Retain-on-insert
+        // bounds them at one device but only fires on the *next* compile, which
+        // may never come on a thread that has stopped dispatching. Purge this
+        // thread's entries for this device now; other threads' entries are
+        // unreachable from here by construction and keep relying on
+        // retain-on-insert.
+        crate::shaders::purge_thread_local_caches_for(&self.device);
     }
 }

@@ -16,11 +16,18 @@
 //!
 //! Node order is fixed for a run, so the last consumer of every name is known
 //! before the first node executes ([`RunActivations::new`] computes it). An
-//! activation is dropped the moment its last consumer's node finishes, which
-//! *destroys* its buffer and returns its bytes to the budget — see
-//! [`oxionnx_gpu::TrackedBuffer`]. A run therefore ends with the live-byte
-//! total back at its resident-weight baseline, with nothing to sweep and no
-//! eviction policy to tune.
+//! activation is released the moment its last consumer's node finishes, with
+//! nothing to sweep and no eviction policy to tune.
+//!
+//! Releasing means handing the allocation to the context's reusable-buffer
+//! pool ([`RunActivations::dispose`], which carries the measurements behind
+//! that choice), so the very next node that needs an output buffer of that size
+//! takes it instead of asking the driver for a new one. The bytes stay in the
+//! live total until the pool's own LRU/byte bounds evict them, or until the
+//! pool is cleared or reclaimed — see [`oxionnx_gpu::TrackedBuffer`] for what
+//! actually frees device memory. A run therefore ends with the live-byte total
+//! back at its resident-weight baseline **plus** whatever the pool is holding,
+//! which is by construction reusable, bounded and reclaimable.
 //!
 //! # What may stay on the device
 //!
@@ -44,7 +51,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::graph::Node;
-use oxionnx_gpu::DeviceTensor;
+use oxionnx_gpu::{DeviceTensor, GpuContext};
 
 /// One device-resident value, plus what the session needs to know about it.
 struct ResidentValue {
@@ -169,39 +176,163 @@ impl RunActivations {
     }
 
     /// Record a node output that stayed on the device.
-    pub(crate) fn insert_output(&mut self, name: &str, tensor: DeviceTensor) {
-        self.insert(name, tensor, true);
+    ///
+    /// `ctx` disposes of any value this displaces — see [`Self::dispose`].
+    pub(crate) fn insert_output(
+        &mut self,
+        name: &str,
+        tensor: DeviceTensor,
+        ctx: Option<&GpuContext>,
+    ) {
+        self.insert(name, tensor, true, ctx);
     }
 
     /// Record a host operand this run uploaded so its consumer could dispatch
     /// with every operand in place.
-    pub(crate) fn insert_promoted(&mut self, name: &str, tensor: DeviceTensor) {
-        self.insert(name, tensor, false);
+    pub(crate) fn insert_promoted(
+        &mut self,
+        name: &str,
+        tensor: DeviceTensor,
+        ctx: Option<&GpuContext>,
+    ) {
+        self.insert(name, tensor, false, ctx);
     }
 
-    fn insert(&mut self, name: &str, tensor: DeviceTensor, node_output: bool) {
-        self.values.insert(
+    fn insert(
+        &mut self,
+        name: &str,
+        tensor: DeviceTensor,
+        node_output: bool,
+        ctx: Option<&GpuContext>,
+    ) {
+        // A name is written twice only when a model reuses one for an
+        // initializer *and* a node output — legal ONNX, and explicitly handled
+        // by `materialize_resident_inputs`'s `holds_node_output` check. The
+        // displaced allocation must go the same way a released one does, or
+        // that one graph shape would leak a buffer per frame.
+        //
+        // `session::tests::gpu_activation` builds that shape and runs it on a
+        // device: `a_node_output_shadowing_a_promoted_initializer_wins_the_name`
+        // reaches this branch, `displacing_a_promoted_operand_recycles_its_-
+        // buffer_into_the_pool` watches the handoff byte for byte, and
+        // `repeated_shadowed_runs_neither_grow_the_pool_nor_leak_the_displaced_-
+        // buffer` is the per-frame accounting.
+        let displaced = self.values.insert(
             name.to_string(),
             ResidentValue {
                 tensor,
                 node_output,
             },
         );
+        if let Some(old) = displaced {
+            Self::dispose(old.tensor, ctx);
+        }
         self.peak_bytes = self.peak_bytes.max(self.live_bytes());
     }
 
-    /// Drop every activation whose last consumer was node `index`.
+    /// Release every activation whose last consumer was node `index`.
     ///
     /// Called once per node, after the node has run — including after a node
     /// that declined and ran on the CPU, because "last consumer" is a property
     /// of the graph, not of where the node executed.
-    pub(crate) fn release_after(&mut self, index: usize) {
+    ///
+    /// `ctx` is the session's device, when it has one, and decides *how* the
+    /// value is released: see [`Self::dispose`]. It is threaded in per call
+    /// rather than held as a field because `ManagedGpuContext` is owned by the
+    /// `Session` and only ever borrowed — see `super::gpu_owner` for why that
+    /// ownership is not negotiable.
+    pub(crate) fn release_after(&mut self, index: usize, ctx: Option<&GpuContext>) {
         if self.values.is_empty() {
             return;
         }
-        let last_use = &self.last_use;
-        self.values
-            .retain(|name, _| last_use.get(name).copied() != Some(index));
+        // `HashMap::retain` — what this used to be — drops the removed values
+        // inside its own closure, which is exactly what recycling must not do:
+        // there is nowhere in a `retain` predicate to hand a `DeviceTensor` to
+        // the pool. So the names are collected first and removed one at a time.
+        //
+        // The obvious way to avoid the intermediate is `HashMap::extract_if`,
+        // which yields the removed `(key, value)` pairs and would need neither
+        // the `Vec` nor the `String` clones. It stabilized in Rust 1.88 and this
+        // workspace declares `rust-version = "1.75"`, so it is not available
+        // here. The cost of not having it is one `String` clone per name
+        // released at this node plus one `Vec` allocation on the nodes that
+        // release anything — `collect` over a filtered iterator allocates
+        // nothing when the filter matches nothing — against a scan of the live
+        // map that `retain` performed anyway. Measured inside the frame times
+        // in `Self::dispose`, so it is already priced in.
+        let doomed: Vec<String> = self
+            .values
+            .keys()
+            .filter(|name| self.last_use.get(*name).copied() == Some(index))
+            .cloned()
+            .collect();
+        for name in doomed {
+            if let Some(value) = self.values.remove(&name) {
+                Self::dispose(value.tensor, ctx);
+            }
+        }
+    }
+
+    /// Give a finished activation's allocation back to the reusable-buffer
+    /// pool, or destroy it when there is no context to give it to.
+    ///
+    /// # Why recycling, and what it cost to find out
+    ///
+    /// \[w4\] Wave 1 destroyed here, which returns the bytes to the byte budget
+    /// immediately and makes "a finished run is back at its resident-weight
+    /// baseline" true without clearing the pool. Recycling instead keeps the
+    /// allocation in [`GpuContext::pooled_gpu_bytes`] — still live, still
+    /// counted, but idle and reusable — so the next node that needs an output
+    /// buffer of that size takes it instead of asking the driver.
+    ///
+    /// The two were measured against each other as an interleaved, paired A/B
+    /// inside one process (`examples/w4_recycle_ab.rs`), 25 pairs per process,
+    /// four processes per case with the within-iteration order alternating:
+    ///
+    /// * **InSwapper-128**, residency + `f16` on: paired median
+    ///   recycle/destroy `0.976`–`0.981`, recycling faster in 90 of 100 pairs.
+    ///   Pool hit rate 96.1% against 4.9%; 7 driver allocations per frame
+    ///   against 86.
+    /// * **A 48-node chain of 64 KiB activations**, where nothing is
+    ///   compute-bound: paired median `0.724`–`0.889`, recycling faster in 98
+    ///   of 100 pairs. Pool hit rate 98.9% against 3.1%.
+    /// * Outputs were **byte-identical** in all 200 pairs, which is the
+    ///   property that matters: a recycled buffer holds the previous tensor's
+    ///   bytes rather than the driver's zeroes, so a kernel that failed to write
+    ///   its whole output range would diverge here.
+    ///
+    /// The cost, which is real and is a *ceiling* rather than a trend:
+    /// InSwapper's idle pooled total settles at 84.59 MiB rather than 0.38 MiB,
+    /// with the pool holding **64 of its 64 permitted entries** — it walks up to
+    /// the count bound and is then held there by LRU eviction, at 84.59 MiB of
+    /// a 256 MiB
+    /// [`DEFAULT_POOL_BYTE_BUDGET`](oxionnx_gpu::DEFAULT_POOL_BYTE_BUDGET). The
+    /// small chain, which returns as many buffers per frame as it takes, needs
+    /// only 2 entries and 0.12 MiB, so the ceiling is reached by graphs that
+    /// hand the pool more than they ask of it, not by every graph.
+    ///
+    /// How *large* that ceiling is, when it is reached, is `min(64 entries,
+    /// 256 MiB)` — and which of the two binds depends on the activation size
+    /// mix. InSwapper's 128x128 activations hit the count bound at 84.59 MiB;
+    /// a segmentation-scale graph whose activations run to 4 MiB would hit the
+    /// byte bound instead and hold a quarter gibibyte idle. Both are the pool's
+    /// documented design, not a consequence of recycling, and both are
+    /// reclaimed before a decline — but a caller sizing a device budget should
+    /// read the ceiling as 256 MiB, not as the 84.59 MiB this model happens to
+    /// produce.
+    ///
+    /// Either way it is reclaimable: `GpuBufferPool::reclaim_for` empties idle
+    /// entries before any allocation is declined, so a pooled buffer can never
+    /// be the reason a node falls back to the CPU. In the steady state the pool
+    /// serves **100%** of a frame's buffer requests on both graphs.
+    ///
+    /// `None` is the no-device case, where there is no pool to recycle into and
+    /// the value could not have been produced in the first place.
+    fn dispose(tensor: DeviceTensor, ctx: Option<&GpuContext>) {
+        match ctx {
+            Some(ctx) => ctx.recycle_device_tensor(tensor),
+            None => drop(tensor),
+        }
     }
 
     /// Device bytes currently held by run-scoped activations.

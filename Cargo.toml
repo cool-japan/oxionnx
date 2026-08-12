@@ -32,12 +32,12 @@ oxionnx-coreml = { path = "oxionnx-coreml", version = "0.1.7" }
 # Cargo.toml, its only consumer, for the per-target feature split this enables.
 # Consequence: any consumer crate writing `oxifft.workspace = true` inherits zero default features and must name the ones it needs explicitly, or it silently gets none.
 oxifft = { version = "0.4.2", default-features = false }
-oxicuda-driver = { version = "0.5.3" }
-oxicuda-memory = { version = "0.5.3" }
-oxicuda-blas = { version = "0.5.3" }
-oxicuda-dnn = { version = "0.5.3" }
-oxicuda-ptx = { version = "0.5.3" }
-oxicuda-launch = { version = "0.5.3" }
+oxicuda-driver = { version = "0.5.4" }
+oxicuda-memory = { version = "0.5.4" }
+oxicuda-blas = { version = "0.5.4" }
+oxicuda-dnn = { version = "0.5.4" }
+oxicuda-ptx = { version = "0.5.4" }
+oxicuda-launch = { version = "0.5.4" }
 thiserror = "2"
 half = "2.7"
 matrixmultiply = "0.3"
