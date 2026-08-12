@@ -212,11 +212,15 @@ impl RunActivations {
         // that one graph shape would leak a buffer per frame.
         //
         // `session::tests::gpu_activation` builds that shape and runs it on a
-        // device: `a_node_output_shadowing_a_promoted_initializer_wins_the_name`
-        // reaches this branch, `displacing_a_promoted_operand_recycles_its_-
-        // buffer_into_the_pool` watches the handoff byte for byte, and
-        // `repeated_shadowed_runs_neither_grow_the_pool_nor_leak_the_displaced_-
-        // buffer` is the per-frame accounting.
+        // device. Three tests there, one claim each:
+        //
+        //   a_node_output_shadowing_a_promoted_initializer_wins_the_name
+        //   displacing_a_promoted_operand_recycles_its_buffer_into_the_pool
+        //   repeated_shadowed_runs_neither_grow_the_pool_nor_leak_the_displaced_buffer
+        //
+        // The first proves a real graph run reaches this branch, the second
+        // watches the handoff byte for byte, the third is the per-frame
+        // accounting that a leak here would break.
         let displaced = self.values.insert(
             name.to_string(),
             ResidentValue {

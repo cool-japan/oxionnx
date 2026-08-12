@@ -470,21 +470,28 @@ fn released_activations_are_reused_and_the_pool_stays_bounded() {
                  means some kernel is reading its output buffer before writing it",
             ),
         }
-        let (held, cap) = ctx.pooled_buffers();
+        let (held, cap) = session.gpu_pooled_buffers();
         assert!(
             held <= cap,
             "frame {frame}: the pool holds {held} buffers against a {cap} bound",
         );
         assert!(
-            ctx.pooled_gpu_bytes() <= byte_budget,
+            session.gpu_pooled_bytes() <= byte_budget,
             "frame {frame}: the pool holds {} B against a {byte_budget} B budget",
-            ctx.pooled_gpu_bytes(),
+            session.gpu_pooled_bytes(),
         );
-        pooled_bytes.push(ctx.pooled_gpu_bytes());
+        assert!(
+            session.gpu_pooled_bytes() <= session.gpu_live_bytes(),
+            "frame {frame}: idle pooled bytes are a subset of the live total, \
+             which is what makes clearing the pool a reclamation and not a leak",
+        );
+        pooled_bytes.push(session.gpu_pooled_bytes());
     }
 
-    let reuses = ctx.pool_reuses().saturating_sub(reuses_before);
-    let allocations = ctx.pool_allocations().saturating_sub(allocations_before);
+    let reuses = session.gpu_pool_reuses().saturating_sub(reuses_before);
+    let allocations = session
+        .gpu_pool_allocations()
+        .saturating_sub(allocations_before);
     assert!(
         reuses > allocations,
         "a warm session must serve most buffer requests from the pool, or \
@@ -869,14 +876,12 @@ fn a_node_output_shadowing_a_promoted_initializer_wins_the_name() {
     let off_y = off_outputs.get("y").expect("output with residency off");
     let on_y = on_outputs.get("y").expect("output with residency on");
     assert_eq!(on_y.shape, vec![1, C, HW, HW]);
-    assert_eq!(
-        on_y.data, off_y.data,
-        "residency moved `w` onto the device and displaced a promoted operand \
-         to do it; neither may change a single bit of the result",
-    );
 
-    // The value check, in a form no accumulation order can blur. `h4` is
-    // `|h3|`, so it is non-negative everywhere:
+    // The value check first, because it is the one claim here that stands on
+    // the resident run **alone** — a bug shared by both regimes would satisfy
+    // the bit-identity comparison below and be caught only by this. It is also
+    // in a form no accumulation order can blur: `h4` is `|h3|`, so it is
+    // non-negative everywhere, and therefore
     //
     // * reading the **node output** gives `y = leaky(h3) * |h3|`, which is
     //   `-0.1 * h3^2` — strictly negative — wherever `h3 < 0`;
@@ -893,6 +898,12 @@ fn a_node_output_shadowing_a_promoted_initializer_wins_the_name() {
          (leaky(h3) * |h3|, negative wherever h3 < 0), not the initializer \
          ({SHADOW_INITIALIZER} * |h3|, non-negative everywhere): only \
          {negatives} of {ELEMS} outputs are negative",
+    );
+
+    assert_eq!(
+        on_y.data, off_y.data,
+        "residency moved `w` onto the device and displaced a promoted operand \
+         to do it; neither may change a single bit of the result",
     );
 
     assert_eq!(
@@ -921,9 +932,11 @@ fn a_node_output_shadowing_a_promoted_initializer_wins_the_name() {
          whose output is named `{SHADOWED}` and therefore displaces the \
          promoted initializer",
     );
-    // Slot by slot: `mul_promote` binds h1 and w, `conv2` binds h2, `shadow`
-    // and `abs` bind h3, `mul_consume` binds w and h4.
-    assert_eq!(on_stats.resident_operands, 7);
+    assert_eq!(
+        on_stats.resident_operands, 7,
+        "slot by slot: `mul_promote` binds h1 and w, `conv2` binds h2, \
+         `shadow` and `abs` bind h3, `mul_consume` binds w and h4",
+    );
     // `>=` rather than `==`: a buffer taken from the reusable-buffer pool may
     // reserve more than it needs (`DeviceTensor::reserved_bytes`), and the peak
     // is measured in reserved bytes. The direction that matters is the lower
@@ -976,8 +989,13 @@ fn repeated_shadowed_runs_neither_grow_the_pool_nor_leak_the_displaced_buffer() 
     };
     ctx.set_activation_residency(true);
 
-    let (_, max_buffers) = ctx.pooled_buffers();
-    let byte_budget = ctx.pool_byte_budget();
+    // Read through the `Session` accessors rather than the context's own
+    // methods. They are this wave's public window onto exactly the question
+    // this test asks, and a delegation typo in one of them — `gpu_pooled_bytes`
+    // wired to `live_gpu_bytes`, say — is invisible to the compiler and would
+    // otherwise ship uncovered.
+    let (_, max_buffers) = session.gpu_pooled_buffers();
+    let byte_budget = session.gpu_pool_byte_budget();
     assert!(
         max_buffers > 0 && byte_budget > 0,
         "the context's pool must have real retention bounds to test against",
@@ -986,8 +1004,8 @@ fn repeated_shadowed_runs_neither_grow_the_pool_nor_leak_the_displaced_buffer() 
     // Enough frames to walk the count bound and then sit on it, checking the
     // bounds at every step rather than only at the end.
     let frames = max_buffers * 2;
-    let reuses_before = ctx.pool_reuses();
-    let allocations_before = ctx.pool_allocations();
+    let reuses_before = session.gpu_pool_reuses();
+    let allocations_before = session.gpu_pool_allocations();
     let mut first_output: Option<Vec<f32>> = None;
     let mut pooled_bytes = Vec::with_capacity(frames);
     for frame in 0..frames {
@@ -1035,7 +1053,7 @@ fn repeated_shadowed_runs_neither_grow_the_pool_nor_leak_the_displaced_buffer() 
          {reuses} reused against {allocations} allocated over {frames} frames",
     );
     assert_eq!(
-        ctx.pooled_buffers().0,
+        session.gpu_pooled_buffers().0,
         max_buffers,
         "this graph gives the pool one more buffer per frame than it takes — \
          the displaced `{SHADOWED}` — so over {frames} frames the count must \
@@ -1060,13 +1078,15 @@ fn repeated_shadowed_runs_neither_grow_the_pool_nor_leak_the_displaced_buffer() 
     if let Ok(mut pool) = ctx.pool.lock() {
         pool.clear();
     }
+    assert_eq!(session.gpu_pooled_bytes(), 0, "the pool was just cleared",);
     assert_eq!(
-        ctx.live_gpu_bytes(),
+        session.gpu_live_bytes(),
         ctx.resident_bytes(),
         "after {frames} runs the only device bytes left must be the \
          session-lifetime weights: live={} resident={}. One displaced buffer \
-         leaked per frame would leave {} B more.",
-        ctx.live_gpu_bytes(),
+         leaked per frame would leave at least {} B more (measured: exactly \
+         that plus the warm-up run's).",
+        session.gpu_live_bytes(),
         ctx.resident_bytes(),
         frames * ELEMS * std::mem::size_of::<f32>(),
     );
