@@ -12,6 +12,20 @@ documentation = "https://docs.rs/oxionnx"
 homepage = "https://github.com/cool-japan/oxionnx"
 rust-version = "1.75"
 
+[patch.crates-io]
+# DEV-ONLY, temporary: point at the local OxiCUDA checkout while the Linux/CUDA
+# correctness (GEMM occupancy, Winograd/fused-conv safety gates) and performance
+# fixes from this session's investigation land there. oxicuda-* stays pinned to
+# the published 0.5.4 in [workspace.dependencies] below; this patch only swaps
+# the resolved source. Remove once oxicuda publishes a release carrying these
+# fixes and oxionnx's version pins are bumped to match.
+oxicuda-driver = { path = "../oxicuda/crates/oxicuda-driver" }
+oxicuda-memory = { path = "../oxicuda/crates/oxicuda-memory" }
+oxicuda-blas = { path = "../oxicuda/crates/oxicuda-blas" }
+oxicuda-dnn = { path = "../oxicuda/crates/oxicuda-dnn" }
+oxicuda-ptx = { path = "../oxicuda/crates/oxicuda-ptx" }
+oxicuda-launch = { path = "../oxicuda/crates/oxicuda-launch" }
+
 [workspace.dependencies]
 oxionnx-core = { path = "oxionnx-core", version = "0.1.7" }
 ndarray = { version = "0.17" }

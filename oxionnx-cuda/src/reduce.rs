@@ -14,7 +14,6 @@
 //! loop) was limited to.
 
 use oxicuda_blas::reduction::{reduce_axis, ReductionOp};
-use oxicuda_memory::DeviceBuffer;
 
 use crate::context::CudaContext;
 use crate::error::CudaDispatchError;
@@ -85,9 +84,24 @@ pub fn cuda_reduce(
         return Ok(None);
     };
 
-    let mut d_input: DeviceBuffer<f32> = DeviceBuffer::alloc(data.len())?;
-    d_input.copy_from_host(data)?;
-    let mut d_output: DeviceBuffer<f32> = DeviceBuffer::zeroed(output_len)?;
+    // `reduce_axis` launches on `handle.stream()` where `handle` is
+    // `ctx.dnn.blas()` — i.e. the BLAS sub-handle's *own* stream, separate
+    // from `ctx.dnn.stream()` (see `DnnHandle::build`'s doc comment). Issuing
+    // the upload, the zero-fill and the readback on that *same* stream is what
+    // orders them against the kernel with no fence at all; the predecessor of
+    // this code had to `synchronize_all()` mid-dispatch precisely because its
+    // copies rode a different stream from its kernel.
+    let stream = ctx.dnn.blas().stream();
+
+    let mut d_input = ctx.scratch(data.len())?;
+    d_input.upload(data, stream)?;
+    // Zero-filled, exactly as the `DeviceBuffer::zeroed` this replaces was —
+    // the output is a recycled allocation now, so whatever the previous
+    // borrower left in it must not be visible to the reduction kernel or to
+    // the readback. Stream-ordered, so it costs a queued memset rather than
+    // `zeroed`'s context-wide fence.
+    let mut d_output = ctx.scratch(output_len)?;
+    d_output.zero_fill(stream)?;
 
     reduce_axis(
         ctx.dnn.blas(),
@@ -95,22 +109,21 @@ pub fn cuda_reduce(
         outer_u32,
         axis_len_u32,
         inner_u32,
-        &d_input,
-        &mut d_output,
+        d_input.buffer(),
+        d_output.buffer_mut(),
     )
     .map_err(|e| CudaDispatchError::Blas(e.to_string()))?;
 
-    // `reduce_axis` launches on `handle.stream()` — the same stream `ctx.dnn`
-    // owns — without synchronizing internally; block until the kernel
-    // completes before reading results back to the host (mirrors
-    // `matmul::cuda_matmul`'s explicit synchronize-then-copy-back pattern).
-    ctx.dnn
-        .stream()
-        .synchronize()
-        .map_err(CudaDispatchError::Driver)?;
-
     let mut result = vec![0.0_f32; output_len];
-    d_output.copy_to_host(&mut result)?;
+    d_output.download(&mut result, stream)?;
+    // The one fence in the dispatch: everything above was enqueued on
+    // `stream`, in order.
+    stream.synchronize().map_err(CudaDispatchError::Driver)?;
+    // ...and only now may these allocations go back to the pool. See
+    // `PooledBuffer`'s "a borrow is only recycled once its stream work is
+    // known to be done".
+    d_input.retire();
+    d_output.retire();
     Ok(Some(result))
 }
 

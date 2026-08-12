@@ -31,3 +31,48 @@ tracing = { workspace = true }
 
 [features]
 default = []
+# On-device GPU validation tests (`#[cfg(feature = "gpu-tests")]` in
+# `src/lib.rs`'s test module). Mirrors the identical convention in
+# `oxicuda-driver`/`oxicuda-blas`/`oxicuda-dnn`: off by default because this
+# crate's own CI has no CUDA-capable host (see the `context` module docs),
+# run manually with `cargo test -p oxionnx-cuda --features gpu-tests` on a
+# machine with a real NVIDIA GPU.
+gpu-tests = []
+
+# The `tests/*_gpu.rs` integration-test binaries below are gated on the same
+# feature via `required-features`, so a plain `cargo test -p oxionnx-cuda`
+# (no `--features gpu-tests`) does not build or run them at all -- keeping
+# them off the auto-discovered default `[[test]]` target Cargo would
+# otherwise create for any `tests/*.rs` file is REQUIRED, not cosmetic:
+# without this, on any host that happens to have a CUDA driver and device 0
+# (this workspace's own dev machine included), a bare `cargo test -p
+# oxionnx-cuda` -- no feature flag, no `OXIONNX_CUDA` env var -- silently
+# allocates GPU memory and launches real kernels the moment it reaches these
+# files, contradicting this crate's own documented contract (`context`
+# module docs: "default cargo test/CI never touches a GPU"). Confirmed on
+# this machine: before this `required-features` line existed,
+# `matmul_shape_sweep_gpu` ran three real on-device tests against the
+# machine's RTX A4000 under a plain `cargo test -p oxionnx-cuda`.
+[[test]]
+name = "matmul_shape_sweep_gpu"
+path = "tests/matmul_shape_sweep_gpu.rs"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "verify_path_gpu"
+path = "tests/verify_path_gpu.rs"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "batched_matmul_gpu"
+path = "tests/batched_matmul_gpu.rs"
+required-features = ["gpu-tests"]
+
+# Steady-state per-call dispatch cost on a real device. Carries
+# `required-features` for exactly the reason the test targets above do: it
+# allocates GPU memory and launches real kernels the moment it runs, so a host
+# that has not opted into `gpu-tests` must not even build it.
+[[example]]
+name = "dispatch_bench"
+path = "examples/dispatch_bench.rs"
+required-features = ["gpu-tests"]

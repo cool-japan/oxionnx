@@ -41,6 +41,7 @@
 use oxionnx_core::graph::OpKind;
 
 use crate::context::{parse_env_flag, FailurePolicy};
+use crate::conv::ConvParams;
 use crate::error::CudaDispatchError;
 
 // ─── the verify gate ────────────────────────────────────────────────────────
@@ -212,6 +213,127 @@ pub fn ref_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
                 acc += f64::from(a[i * k + p]) * f64::from(b[p * n + j]);
             }
             out[i * n + j] = acc as f32;
+        }
+    }
+    out
+}
+
+/// Naive NCHW cross-correlation (the `cuDNN`/ONNX `Conv` convention — no
+/// 180-degree kernel flip), honouring padding, stride, dilation, and
+/// groups, with an optional per-output-channel bias.
+///
+/// `input` is `[N, C, H, W]` (`in_shape`), `weight` is `[K, C/groups, R, S]`
+/// (`weight_shape`) — the exact layout the ONNX `Conv` operator (and
+/// [`crate::conv::cuda_conv`], which uploads this same layout to the GPU)
+/// uses. `bias`, when present, is `[K]`, added once per output channel and
+/// broadcast across every batch and spatial position.
+///
+/// Only `params.pads`' first two elements (`[pad_top, pad_left]`) are read.
+/// That is not a shortcut: every call site in this crate reaches this
+/// oracle only after [`crate::conv::cuda_conv`] has already declined any
+/// node whose padding is asymmetric (`pads[0] != pads[2] || pads[1] !=
+/// pads[3]` — see the [`crate::conv`] module docs' "What still declines"
+/// section), so `pads[2]`/`pads[3]` are guaranteed to equal
+/// `pads[0]`/`pads[1]` by the time this oracle ever runs in this crate.
+///
+/// `O(N*K*P*Q*(C/groups)*R*S)` with an `f64` accumulator per output
+/// element, cast to `f32` only once, at the very end — deliberately
+/// unoptimised, the same discipline as [`ref_matmul`]: this exists to be
+/// obviously correct, not fast.
+///
+/// # Panics
+/// Indexes `input`/`weight`/`bias`/`in_shape`/`weight_shape` directly with
+/// no bounds- or length-checking, the same discipline as [`ref_matmul`]: a
+/// caller-supplied shape/data-length mismatch (or a `params.group` of `0`)
+/// panics rather than silently computing garbage. Every call site in this
+/// crate derives its arguments from a `ConvProblem` that
+/// [`crate::conv::cuda_conv`] has already validated end-to-end (rank-4
+/// shapes, non-zero dims, `group` dividing both channel counts, the filter
+/// fitting the padded input) before this oracle ever runs, so a panic here
+/// means the caller passed shapes it never validated — a bug in the caller,
+/// not a normal outcome.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn ref_conv(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    in_shape: &[usize],
+    weight_shape: &[usize],
+    params: &ConvParams,
+) -> Vec<f32> {
+    let n = in_shape[0];
+    let in_channels = in_shape[1];
+    let in_h = in_shape[2];
+    let in_w = in_shape[3];
+    let out_channels = weight_shape[0];
+    let in_ch_per_group = weight_shape[1];
+    let filter_h = weight_shape[2];
+    let filter_w = weight_shape[3];
+
+    let [stride_h, stride_w] = params.strides;
+    let [pad_h, pad_w, _pad_bottom, _pad_right] = params.pads;
+    let [dil_h, dil_w] = params.dilations;
+    let group = params.group;
+    let out_ch_per_group = out_channels / group;
+
+    // Standard convolution output-size formula (matches
+    // `oxicuda_dnn::conv::descriptor::ConvProblem::output_dims`'s
+    // `ConvolutionDescriptor::output_size`, and this crate's own
+    // `conv::tests::gpu_numeric::ConvCase::out_hw`):
+    // `floor((dim + 2*pad - dilation*(k-1) - 1) / stride) + 1`.
+    let eff_h = dil_h * (filter_h - 1) + 1;
+    let eff_w = dil_w * (filter_w - 1) + 1;
+    let out_h = (in_h + 2 * pad_h - eff_h) / stride_h + 1;
+    let out_w = (in_w + 2 * pad_w - eff_w) / stride_w + 1;
+
+    let mut out = vec![0.0_f32; n * out_channels * out_h * out_w];
+    for ni in 0..n {
+        for ki in 0..out_channels {
+            // Which group this output channel belongs to -- `weight`'s
+            // leading `[K, ...]` dim is laid out group-major (the first
+            // `out_ch_per_group` filters belong to group 0, the next
+            // `out_ch_per_group` to group 1, and so on), matching ONNX's
+            // `Conv` spec and `oxicuda_dnn`'s own kernel bodies.
+            let g = ki / out_ch_per_group;
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let mut acc = 0.0_f64;
+                    for cg in 0..in_ch_per_group {
+                        let ci = g * in_ch_per_group + cg;
+                        for ri in 0..filter_h {
+                            // Implicit zero-padding: an input coordinate
+                            // that lands outside `[0, in_h)`/`[0, in_w)`
+                            // contributes nothing, rather than being an
+                            // error -- this is what makes the padding
+                            // "same"-style output sizes correct.
+                            let ih = oh as isize * stride_h as isize - pad_h as isize
+                                + ri as isize * dil_h as isize;
+                            if ih < 0 || ih as usize >= in_h {
+                                continue;
+                            }
+                            let ih = ih as usize;
+                            for si in 0..filter_w {
+                                let iw = ow as isize * stride_w as isize - pad_w as isize
+                                    + si as isize * dil_w as isize;
+                                if iw < 0 || iw as usize >= in_w {
+                                    continue;
+                                }
+                                let iw = iw as usize;
+                                let in_idx = ((ni * in_channels + ci) * in_h + ih) * in_w + iw;
+                                let f_idx =
+                                    ((ki * in_ch_per_group + cg) * filter_h + ri) * filter_w + si;
+                                acc += f64::from(input[in_idx]) * f64::from(weight[f_idx]);
+                            }
+                        }
+                    }
+                    if let Some(bv) = bias {
+                        acc += f64::from(bv[ki]);
+                    }
+                    let o_idx = ((ni * out_channels + ki) * out_h + oh) * out_w + ow;
+                    out[o_idx] = acc as f32;
+                }
+            }
         }
     }
     out
@@ -468,6 +590,148 @@ mod tests {
         let a = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let b = [7.0_f32, 8.0, 9.0, 10.0, 11.0, 12.0];
         assert_eq!(ref_matmul(&a, &b, 2, 3, 2), vec![58.0, 64.0, 139.0, 154.0]);
+    }
+
+    // ── ref_conv ─────────────────────────────────────────────────────────────
+    //
+    // Every expected output below was hand-derived AND independently
+    // cross-checked with a from-scratch Python re-implementation of the same
+    // naive algorithm before being pasted in here, catching (during that
+    // cross-check) one hand-arithmetic mistake of my own on a discarded
+    // extra case -- a reminder of exactly why this whole module exists.
+
+    fn unit_params() -> ConvParams {
+        ConvParams {
+            strides: [1, 1],
+            pads: [0, 0, 0, 0],
+            dilations: [1, 1],
+            group: 1,
+        }
+    }
+
+    #[test]
+    fn ref_conv_is_cross_correlation_not_true_convolution() {
+        // input (3x3): [[1,2,3],[4,5,6],[7,8,9]], weight (2x2): [[1,2],[3,4]].
+        // Deliberately asymmetric so a 180-degree kernel flip would change
+        // the answer -- proving this computes cross-correlation (the ONNX
+        // `Conv` / cuDNN convention), not textbook convolution.
+        //   out[0][0] = 1*1+2*2+4*3+5*4 = 1+4+12+20 = 37
+        //   out[0][1] = 2*1+3*2+5*3+6*4 = 2+6+15+24 = 47
+        //   out[1][0] = 4*1+5*2+7*3+8*4 = 4+10+21+32 = 67
+        //   out[1][1] = 5*1+6*2+8*3+9*4 = 5+12+24+36 = 77
+        // (a flipped kernel [[4,3],[2,1]] would instead give 23 at [0][0].)
+        let input = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let weight = [1.0_f32, 2.0, 3.0, 4.0];
+        let out = ref_conv(
+            &input,
+            &weight,
+            None,
+            &[1, 1, 3, 3],
+            &[1, 1, 2, 2],
+            &unit_params(),
+        );
+        assert_eq!(out, vec![37.0, 47.0, 67.0, 77.0]);
+    }
+
+    #[test]
+    fn ref_conv_adds_bias_once_per_output_channel() {
+        // Same geometry as above, plus bias=[100] on the single output channel:
+        // every element of the no-bias result shifts by exactly 100.
+        let input = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let weight = [1.0_f32, 2.0, 3.0, 4.0];
+        let bias = [100.0_f32];
+        let out = ref_conv(
+            &input,
+            &weight,
+            Some(&bias),
+            &[1, 1, 3, 3],
+            &[1, 1, 2, 2],
+            &unit_params(),
+        );
+        assert_eq!(out, vec![137.0, 147.0, 167.0, 177.0]);
+    }
+
+    #[test]
+    fn ref_conv_honours_stride() {
+        // 5x5 input (row-major 1..25), 2x2 kernel [[1,0],[0,1]], stride=2, no
+        // padding: out[oh][ow] = in[2*oh][2*ow] + in[2*oh+1][2*ow+1].
+        //   out[0][0] = in[0][0]+in[1][1] =  1+ 7 =  8
+        //   out[0][1] = in[0][2]+in[1][3] =  3+ 9 = 12
+        //   out[1][0] = in[2][0]+in[3][1] = 11+17 = 28
+        //   out[1][1] = in[2][2]+in[3][3] = 13+19 = 32
+        let input: Vec<f32> = (1..=25).map(|v| v as f32).collect();
+        let weight = [1.0_f32, 0.0, 0.0, 1.0];
+        let mut params = unit_params();
+        params.strides = [2, 2];
+        let out = ref_conv(&input, &weight, None, &[1, 1, 5, 5], &[1, 1, 2, 2], &params);
+        assert_eq!(out, vec![8.0, 12.0, 28.0, 32.0]);
+    }
+
+    #[test]
+    fn ref_conv_zero_pads_the_border_with_correct_offset_direction() {
+        // 2x2 input [[1,2],[3,4]], 3x3 kernel that is a one-hot at tap
+        // (r=0, s=0) (all other taps zero), pad=1, stride=1 ("same" output
+        // size, 2x2). With `ih = oh - 1 + 0` / `iw = ow - 1 + 0`, the
+        // top-left tap only ever lands inside the real 2x2 image (rather
+        // than the zero border) when oh=ow=1, reading `input[0][0]=1`;
+        // every other output position reads purely padding, i.e. 0. This
+        // pins down both that out-of-range taps contribute zero AND that
+        // `pad` is subtracted (not added) when computing the input
+        // coordinate -- a sign error here would shift which corner is
+        // nonzero instead of merely failing everywhere.
+        let input = [1.0_f32, 2.0, 3.0, 4.0];
+        #[rustfmt::skip]
+        let weight = [
+            1.0_f32, 0.0, 0.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0,
+        ];
+        let mut params = unit_params();
+        params.pads = [1, 1, 1, 1];
+        let out = ref_conv(&input, &weight, None, &[1, 1, 2, 2], &[1, 1, 3, 3], &params);
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn ref_conv_honours_dilation() {
+        // Same 5x5 input as the stride test, 2x2 kernel [[1,0],[0,1]],
+        // dilation=2 (effective kernel size 3), stride=1, no padding -> 3x3
+        // output. out[oh][ow] = in[oh][ow] + in[oh+2][ow+2] (the dilated tap
+        // skips one row/col instead of the stride test's adjacent one):
+        //   out[0][0]=in[0][0]+in[2][2]= 1+13=14   out[0][1]= 2+14=16   out[0][2]= 3+15=18
+        //   out[1][0]=in[1][0]+in[3][2]= 6+18=24   out[1][1]= 7+19=26   out[1][2]= 8+20=28
+        //   out[2][0]=in[2][0]+in[4][2]=11+23=34   out[2][1]=12+24=36   out[2][2]=13+25=38
+        let input: Vec<f32> = (1..=25).map(|v| v as f32).collect();
+        let weight = [1.0_f32, 0.0, 0.0, 1.0];
+        let mut params = unit_params();
+        params.dilations = [2, 2];
+        let out = ref_conv(&input, &weight, None, &[1, 1, 5, 5], &[1, 1, 2, 2], &params);
+        assert_eq!(
+            out,
+            vec![14.0, 16.0, 18.0, 24.0, 26.0, 28.0, 34.0, 36.0, 38.0]
+        );
+    }
+
+    #[test]
+    fn ref_conv_honours_groups_keeping_each_groups_channels_independent() {
+        // 1x1 spatial, in_channels=4, out_channels=4, groups=2: group 0 owns
+        // input channels [0,1] and output channels [0,1]; group 1 owns input
+        // channels [2,3] and output channels [2,3]. input=[1,2,3,4],
+        // weight[k][cg] = k0:[1,1] k1:[2,2] k2:[3,3] k3:[4,4].
+        //   out[0] = in[0]*1+in[1]*1 = 1+2 =  3   (group 0, sees channels 0,1)
+        //   out[1] = in[0]*2+in[1]*2 = 2+4 =  6   (group 0, sees channels 0,1)
+        //   out[2] = in[2]*3+in[3]*3 = 9+12= 21   (group 1, sees channels 2,3)
+        //   out[3] = in[2]*4+in[3]*4 =12+16= 28   (group 1, sees channels 2,3)
+        // A broken group offset (e.g. every output channel reading input
+        // channels [0,1] regardless of its group) would instead give
+        // [3, 6, 9, 12] for out[2..4] -- a different, wrong answer, so this
+        // discriminates a real groups bug rather than passing vacuously.
+        let input = [1.0_f32, 2.0, 3.0, 4.0];
+        let weight = [1.0_f32, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0];
+        let mut params = unit_params();
+        params.group = 2;
+        let out = ref_conv(&input, &weight, None, &[1, 4, 1, 1], &[4, 2, 1, 1], &params);
+        assert_eq!(out, vec![3.0, 6.0, 21.0, 28.0]);
     }
 
     // ── ref_reduce ───────────────────────────────────────────────────────────

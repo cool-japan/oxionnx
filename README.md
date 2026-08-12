@@ -54,7 +54,7 @@ wired into the browser bindings (see [Feature Flags](#feature-flags)).
 | `oxionnx-ops` | Alpha | 1,325 passing (8 skipped) |
 | `oxionnx-proto` | Stable | 134 passing |
 | `oxionnx-gpu` | Alpha | 240 passing |
-| `oxionnx-cuda` | Partial | 70 passing (GEMM/elementwise/softmax via OxiCUDA; Conv still stubbed and not advertised as supported) |
+| `oxionnx-cuda` | Partial | 70 passing (GEMM/elementwise/softmax/Conv via OxiCUDA; Conv dispatches directly to `oxicuda-dnn`'s `Conv1x1`/`DepthwiseConv`/`ImplicitGemmConv` engines and is advertised by `is_supported_op`) |
 | `oxionnx-directml` | Implemented (opt-in; GPU path not yet hardware-verified) | 242 tests, all Linux-executed or cross-target type-checked. Dual backend — DirectML operators + HLSL/D3D12 compute fallback — routing 15 ops: MatMul, Gemm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, ReduceSum, ReduceMean, ReduceMax, ReduceMin, Conv; kernels compile/lint-verified for Windows and proven on Linux vs a CPU oracle, but not yet run on GPU hardware |
 | `oxionnx-coreml` | Alpha | 8 passing on non-Apple hosts (compiles to a stub); 43 passing + 8 skipped on macOS/iOS/tvOS/visionOS (predict/predict_raw/predict_features, compute-plan + model metadata) |
 

@@ -1176,31 +1176,53 @@ mod tests {
         }
     }
 
-    /// `Auto` consults each backend's *own* op-support predicate.  CUDA has no
-    /// `Conv` kernel (`oxionnx_cuda::is_supported_op(Conv) == false`) even though
-    /// wgpu does, so a convolution must never be gated to CUDA — the round trip
-    /// would be pure waste.
+    /// `Auto` consults each backend's *own* op-support predicate.  CUDA has a
+    /// real `Conv` kernel (`oxionnx_cuda::is_supported_op(Conv) == true`, backed
+    /// by direct dispatch to `oxicuda-dnn`'s `Conv1x1` / `DepthwiseConv` /
+    /// `ImplicitGemmConv` engines), so a convolution must be gated *to* CUDA —
+    /// that is the whole point of having the kernel.
+    ///
+    /// The op sets still differ, which is why the gate consults each backend's
+    /// own predicate rather than the wgpu-flavoured `is_gpu_capable`:
+    /// `ReduceMean` is the surviving exemplar (wgpu and DirectML implement it,
+    /// CUDA does not), and it must *not* be gated to CUDA.  This test asserted
+    /// the opposite for `Conv` until CUDA gained the kernel; it is inverted
+    /// rather than deleted because a silent regression here means every
+    /// convolution in every graph quietly stops being CUDA-accelerated.
     #[cfg(feature = "cuda")]
     #[test]
-    fn auto_never_gates_conv_to_cuda() {
+    fn auto_gates_conv_to_cuda_but_not_an_op_cuda_lacks() {
         use crate::execution_providers::OpPlacement;
 
         let placement = OpPlacement::Auto {
             gpu_threshold_bytes: 0,
         };
         assert!(
-            !accelerator_gate(ProviderKind::Cuda, &OpKind::Conv, 1 << 20, &placement),
-            "CUDA has no Conv kernel; gating Conv to it guarantees a wasted round trip",
+            accelerator_gate(ProviderKind::Cuda, &OpKind::Conv, 1 << 20, &placement),
+            "CUDA has a Conv kernel; the gate must let convolutions through to it",
+        );
+        assert!(
+            !accelerator_gate(ProviderKind::Cuda, &OpKind::ReduceMean, 1 << 20, &placement),
+            "CUDA has no ReduceMean kernel; gating it there guarantees a wasted round trip",
         );
 
-        // wgpu does have one, so with `gpu` also compiled in it takes the node.
+        // wgpu has both, so with `gpu` also compiled in it stays in the chain
+        // for either op.
         #[cfg(feature = "gpu")]
-        assert!(accelerator_gate(
-            ProviderKind::Gpu,
-            &OpKind::Conv,
-            1 << 20,
-            &placement
-        ));
+        {
+            assert!(accelerator_gate(
+                ProviderKind::Gpu,
+                &OpKind::Conv,
+                1 << 20,
+                &placement
+            ));
+            assert!(accelerator_gate(
+                ProviderKind::Gpu,
+                &OpKind::ReduceMean,
+                1 << 20,
+                &placement
+            ));
+        }
     }
 
     /// An op no compiled backend implements stays on the CPU however large it is.

@@ -50,6 +50,7 @@ pub mod error;
 pub mod matmul;
 pub mod reduce;
 pub mod reference;
+pub mod residency;
 pub mod softmax;
 
 pub use context::CudaContext;
@@ -75,17 +76,27 @@ use context::FailurePolicy;
 /// | dispatch arm                              | claimable | backing kernel                             |
 /// |-------------------------------------------|-----------|--------------------------------------------|
 /// | `MatMul`, `Gemm`                          | **yes**   | [`matmul::cuda_matmul`]                    |
-/// | `Conv`                                    | **no**    | [`conv::cuda_conv`] — always `Ok(None)`    |
+/// | `Conv`                                    | **yes**   | [`conv::cuda_conv`] — dispatches *directly* to `oxicuda-dnn`'s `Conv1x1` / `DepthwiseConv` / `ImplicitGemmConv` (never `conv_forward`'s auto-selector) |
 /// | 16 unary activations (`Relu` … `LeakyRelu`) | **yes** | [`elementwise::cuda_elementwise`]          |
 /// | `Add`, `Sub`, `Mul`, `Div`                | **yes**   | [`elementwise::cuda_binary_elementwise`]   |
 /// | `ReduceSum`, `ReduceMax`                  | **yes**   | [`reduce::cuda_reduce`]                    |
 /// | `Softmax`                                 | **yes**   | [`softmax::cuda_softmax`]                  |
 ///
-/// `Conv` is deliberately excluded: [`try_cuda_dispatch`] does have a `Conv`
-/// arm, but it delegates to [`conv::cuda_conv`], which unconditionally returns
-/// `Ok(None)` because no CUDA convolution kernel exists (see the [`conv`] module
-/// docs).  Reporting `Conv` as supported would send every convolution on a
-/// pointless GPU round-trip that always falls back to the CPU anyway.
+/// ## `Conv`
+///
+/// [`conv::cuda_conv`] hands the node to exactly one of three
+/// individually-validated `oxicuda-dnn` forward-convolution engines —
+/// [`Conv1x1`](oxicuda_dnn::conv::fprop::direct::Conv1x1),
+/// [`DepthwiseConv`](oxicuda_dnn::conv::fprop::direct::DepthwiseConv), or
+/// [`ImplicitGemmConv`](oxicuda_dnn::conv::fprop::implicit_gemm::ImplicitGemmConv)
+/// — picked by its own small, GPU-free, unit-tested rule. It deliberately
+/// does **not** call `oxicuda_dnn::conv::api::conv_forward`, whose
+/// `select_algorithm` auto-selector can route into the Winograd fprop path;
+/// see the [`conv`] module docs' "Why not `conv_forward`" for the full
+/// reasoning. Like every other claimable op, the `Conv` arm's output is
+/// shadow-verifiable: [`mod@reference`]'s `ref_conv` CPU oracle backs its
+/// `verify_or_fallback` call, so `OXIONNX_CUDA_VERIFY=1` covers a `Conv`
+/// dispatch exactly as it covers MatMul/elementwise/reduce/Softmax.
 ///
 /// # Necessary, not sufficient
 ///
@@ -94,8 +105,9 @@ use context::FailurePolicy;
 /// - `is_supported_op(op) == true` means a kernel exists *for that op kind*.
 ///   [`try_cuda_dispatch`] may still decline an individual node whose
 ///   *configuration* is out of range — e.g. `Softmax` with a row wider than 1024,
-///   a reduction over a non-flat axis, or a broadcasting `Add` where the two
-///   operand shapes differ.  Callers must still handle `Ok(None)`.
+///   a reduction over a non-flat axis, a broadcasting `Add` where the two
+///   operand shapes differ, or a `Conv` with asymmetric `pads` (see the [`conv`]
+///   module docs' "What still declines").  Callers must still handle `Ok(None)`.
 ///
 /// # Example
 ///
@@ -104,8 +116,12 @@ use context::FailurePolicy;
 ///
 /// assert!(oxionnx_cuda::is_supported_op(&OpKind::MatMul));
 /// assert!(oxionnx_cuda::is_supported_op(&OpKind::Relu));
-/// // No CUDA convolution kernel exists — Conv always runs on the CPU.
-/// assert!(!oxionnx_cuda::is_supported_op(&OpKind::Conv));
+/// // `cuda_conv` dispatches straight to oxicuda-dnn's Conv1x1 /
+/// // DepthwiseConv / ImplicitGemmConv engines, and is shadow-verified
+/// // against `reference::ref_conv` like every other claimable op. An
+/// // individual node can still be declined at dispatch time (asymmetric
+/// // padding, non-4-D shapes, ...) -- see "Necessary, not sufficient".
+/// assert!(oxionnx_cuda::is_supported_op(&OpKind::Conv));
 /// // No dispatch arm at all.
 /// assert!(!oxionnx_cuda::is_supported_op(&OpKind::Reshape));
 /// ```
@@ -115,6 +131,8 @@ pub fn is_supported_op(op: &OpKind) -> bool {
         // ── matmul.rs: `OpKind::MatMul | OpKind::Gemm` arm ───────────────────
         OpKind::MatMul
             | OpKind::Gemm
+            // ── conv.rs: `OpKind::Conv` arm ──────────────────────────────────
+            | OpKind::Conv
             // ── elementwise.rs: unary activation arm (16 ops) ────────────────
             | OpKind::Relu
             | OpKind::Sigmoid
@@ -143,7 +161,63 @@ pub fn is_supported_op(op: &OpKind) -> bool {
             // ── softmax.rs ───────────────────────────────────────────────────
             | OpKind::Softmax
     )
-    // NOTE: `OpKind::Conv` is intentionally absent — see the doc comment above.
+}
+
+/// Make `ctx`'s CUDA context current **on the calling OS thread**,
+/// unconditionally, before any driver/BLAS/DNN call reachable from
+/// [`try_cuda_dispatch`].
+///
+/// # Why this must run on every dispatch, not just once at construction
+///
+/// A CUDA context's "current-ness" is a property of the **OS thread** —
+/// set by `cuCtxSetCurrent` — not a property of the [`CudaContext`] value
+/// itself. [`CudaContext::try_new_with`] activates the context exactly
+/// once, on whichever thread happens to be *building* it, but nothing
+/// requires that to be the thread that later calls `try_cuda_dispatch`.
+///
+/// A real caller hits this today: `oxiface-convert`'s
+/// `Converter::load_models_concurrently` loads the SCRFD detector and
+/// ArcFace embedder on `std::thread::scope`-spawned worker threads (while
+/// InSwapper loads on the calling thread), and each model's `oxionnx::Session`
+/// builds its own `CudaContext` as part of that load. `thread::scope` joins
+/// the workers before returning, so by the time inference actually runs —
+/// on whatever thread calls into the `Converter` — the two threads that
+/// built SCRFD's and ArcFace's contexts are gone. Their contexts are now
+/// current on *no* thread: `ctx.dnn`'s stream, BLAS handle, and PTX-kernel
+/// launches all resolve against "whatever context is current on this
+/// thread" rather than a context reference they carry themselves, so the
+/// memory-allocation and kernel-launch calls `cuda_matmul` et al. make
+/// (`cuMemAlloc`/`cuLaunchKernel`-family, via `oxicuda-memory`'s
+/// `DeviceBuffer` and `oxicuda-blas`'s GEMM dispatch) fail — permanently,
+/// since nothing downstream of construction ever re-activates the context.
+/// Confirmed on real hardware while validating this fix: the calling
+/// thread's exact driver error depends on what (if anything) else is
+/// current there — a thread that never activated *any* context observes
+/// `CUDA_ERROR_INVALID_CONTEXT` ("CUDA: invalid context"); a thread with a
+/// *different* context current can instead observe
+/// `CUDA_ERROR_INVALID_HANDLE` ("CUDA: invalid handle") on a resource that
+/// belongs to this one. Both are the same root cause. Notably,
+/// `Stream::synchronize`'s `cuStreamSynchronize` call (also reachable from
+/// `ctx.dnn`) does *not* fail this way on this driver even with no context
+/// current on the calling thread — synchronization is more permissive than
+/// allocation/launch — so it is not by itself evidence that a context is
+/// usable. InSwapper's own context, built on and dispatched from the same
+/// thread, is unaffected by any of this — which is what makes the bug easy
+/// to miss in ad hoc testing that only exercises a single model.
+///
+/// `cuCtxSetCurrent` is a thread-local pointer write: no allocation, no
+/// device round-trip. Paying it unconditionally on every dispatch —
+/// including the common case where `ctx` is already current on the calling
+/// thread — is negligible next to the alternative of a context that
+/// silently, permanently stops working the moment its builder thread exits.
+///
+/// # Errors
+/// Propagates the underlying driver error (e.g. a corrupted or already-
+/// destroyed context) as an [`OnnxError::Internal`].
+fn activate_context(ctx: &CudaContext) -> Result<(), OnnxError> {
+    ctx.driver_context()
+        .set_current()
+        .map_err(|e| OnnxError::from(CudaError::from(e)))
 }
 
 /// Attempt to dispatch a single ONNX node to the CUDA backend.
@@ -155,12 +229,45 @@ pub fn is_supported_op(op: &OpKind) -> bool {
 ///
 /// [`is_supported_op`] is the cheap pre-filter for this function: when it
 /// returns `false`, this function is guaranteed to return `Ok(None)`.
+///
+/// # Thread affinity
+///
+/// Unlike a raw driver context, callers do **not** need to dispatch from
+/// the same OS thread that built `ctx`: this function re-activates `ctx`
+/// on the calling thread itself (see the private `activate_context` helper
+/// just above this function) before doing anything else, defensively, on
+/// every call. See its doc comment for the concrete scenario (concurrent
+/// model loading) that makes this necessary.
+///
+/// # `weights` is treated as invariant, and that is a contract
+///
+/// `ctx` caches device copies of the tensors it finds in `weights`, keyed by
+/// name, for its whole lifetime — that is what stops a graph initializer from
+/// crossing the bus once per node per frame (see [`mod@residency`]). The
+/// contract that makes it sound is the one `oxionnx::Session` already
+/// satisfies by construction: **a name in `weights` denotes the same bytes for
+/// as long as `ctx` lives.** A session builds its initializer map once at load
+/// time and never mutates it, so this holds for every caller that goes through
+/// `Session::run`.
+///
+/// A direct caller that violates it — passing one context two different weight
+/// maps that share a name — is *usually* caught rather than silently served
+/// stale numbers: an entry also records the address and length of the host
+/// allocation it was uploaded from, and a mismatch demotes that operand to a
+/// per-dispatch upload without disturbing the cache. That is a backstop, not a
+/// guarantee (an allocator may hand a freed address straight back). A caller
+/// that needs to swap weights should build a new context, or call
+/// [`CudaContext::release_device_caches`] between the two.
+///
+/// `intermediates` is never cached: those bytes are this run's activations.
 pub fn try_cuda_dispatch(
     node: &Node,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
     ctx: &CudaContext,
 ) -> Result<Option<Vec<Tensor>>, OnnxError> {
+    activate_context(ctx)?;
+
     let resolve = |name: &str| -> Option<&Tensor> {
         if name.is_empty() {
             None
@@ -256,22 +363,6 @@ pub fn try_cuda_dispatch(
                         return Ok(None);
                     }
 
-                    // Prepare (possibly transposed) data — transposed per
-                    // the operand's *own* batch count, not the (possibly
-                    // larger) broadcast `batch`: `a.data`/`b.data` hold only
-                    // `a_batches`/`b_batches` slices, and transposing past
-                    // that would read out of bounds.
-                    let a_data = if trans_a {
-                        transpose_2d_batched(&a.data, a_batches, a.shape[an - 2], a.shape[an - 1])
-                    } else {
-                        a.data.clone()
-                    };
-                    let b_data = if trans_b {
-                        transpose_2d_batched(&b.data, b_batches, b.shape[bn - 2], b.shape[bn - 1])
-                    } else {
-                        b.data.clone()
-                    };
-
                     // Checked size math: these are all derived from
                     // model-supplied shape dims, so a corrupted/adversarial
                     // shape must overflow into a decline, never a panic or a
@@ -291,39 +382,162 @@ pub fn try_cuda_dispatch(
                     // Bounds-check up front rather than trusting
                     // `Tensor::new`'s debug-only length invariant (a
                     // malformed model can violate it in a release build).
-                    if a_data.len() < a_needed || b_data.len() < b_needed {
+                    if a.data.len() < a_needed || b.data.len() < b_needed {
                         return Ok(None);
                     }
 
-                    let mut out = Vec::with_capacity(out_total);
-                    for i in 0..batch {
-                        let a_start = (i % a_batches) * slice_a;
-                        let b_start = (i % b_batches) * slice_b;
-                        // `.get()` rather than direct indexing: never index
-                        // a model-derived slice range without a bounds
-                        // check, even though `a_needed`/`b_needed` above
-                        // already guarantee this succeeds.
-                        let (Some(a_slice), Some(b_slice)) = (
-                            a_data.get(a_start..a_start + slice_a),
-                            b_data.get(b_start..b_start + slice_b),
-                        ) else {
-                            return Ok(None);
-                        };
-                        let mut c = matmul::cuda_matmul(ctx, a_slice, b_slice, m, k, n)
-                            .map_err(OnnxError::from)?;
-                        if !verify_or_fallback("MatMul/Gemm", &c, || {
-                            Some(reference::ref_matmul(a_slice, b_slice, m, k, n))
-                        })? {
-                            return Ok(None);
-                        }
+                    // ── Operand residency ─────────────────────────────────
+                    //
+                    // A `MatMul`/`Gemm` operand that resolved out of `weights`
+                    // rather than `intermediates` is a graph initializer: the
+                    // same bytes on frame 1 and frame 10 000. `initializer_id`
+                    // says so, keyed additionally by the *form* the GEMM needs,
+                    // because a `transA`/`transB` node consumes the transpose
+                    // of those bytes rather than the bytes themselves and the
+                    // two must never share a cache slot.
+                    let a_id = initializer_id(
+                        node.inputs.first().map(String::as_str),
+                        weights,
+                        intermediates,
+                        a,
+                        operand_form(trans_a),
+                    );
+                    let b_id = initializer_id(
+                        node.inputs.get(1).map(String::as_str),
+                        weights,
+                        intermediates,
+                        b,
+                        operand_form(trans_b),
+                    );
 
-                        // Apply alpha scaling.
-                        if (alpha - 1.0).abs() > f32::EPSILON {
-                            for v in &mut c {
-                                *v *= alpha;
-                            }
+                    // Ask the device before building anything. A resident
+                    // transposed weight means the `transpose_2d_batched` call
+                    // below -- an O(k*n) host copy, ~12 MiB of memcpy for
+                    // ArcFace's head -- does not happen at all this frame.
+                    let a_resident =
+                        a_id.and_then(|id| ctx.resident_operand(id, matmul::A_LABEL, a_needed));
+                    let b_resident =
+                        b_id.and_then(|id| ctx.resident_operand(id, matmul::B_LABEL, b_needed));
+
+                    // Materialise only what still has to cross the bus, and
+                    // only when it genuinely differs from the tensor's own
+                    // bytes. Transposition is done per the operand's *own*
+                    // batch count, not the (possibly larger) broadcast
+                    // `batch`: `a.data`/`b.data` hold only
+                    // `a_batches`/`b_batches` slices, and transposing past
+                    // that would read out of bounds.
+                    //
+                    // The untransposed case borrows `a.data` in place. It used
+                    // to `.clone()` it -- a full host copy of every operand on
+                    // every dispatch, which for a 49 MiB weight is a memcpy the
+                    // size of the upload it was feeding.
+                    //
+                    // `|| verify_on` is not an optimisation gap, it closes one:
+                    // the oracle below has to see the same bytes the GPU
+                    // multiplied, and for a *resident* transposed weight those
+                    // bytes exist only on the device. Under `OXIONNX_CUDA_VERIFY=1`
+                    // the transpose is therefore rebuilt anyway -- a diagnostic
+                    // mode that already recomputes every op on the CPU is the
+                    // right place to pay it, and skipping it would silently
+                    // compare against the untransposed operand and report a
+                    // mismatch on a correct dispatch.
+                    let verify_on = reference::verify_enabled();
+                    let a_transposed =
+                        (trans_a && (a_resident.is_none() || verify_on)).then(|| {
+                            transpose_2d_batched(
+                                &a.data,
+                                a_batches,
+                                a.shape[an - 2],
+                                a.shape[an - 1],
+                            )
+                        });
+                    let b_transposed =
+                        (trans_b && (b_resident.is_none() || verify_on)).then(|| {
+                            transpose_2d_batched(
+                                &b.data,
+                                b_batches,
+                                b.shape[bn - 2],
+                                b.shape[bn - 1],
+                            )
+                        });
+
+                    let a_operand = match a_resident {
+                        Some(resident) => matmul::GemmOperand::from_resident(resident),
+                        None => matmul::GemmOperand::from_host(
+                            a_transposed.as_deref().unwrap_or(&a.data),
+                            a_id,
+                        ),
+                    };
+                    let b_operand = match b_resident {
+                        Some(resident) => matmul::GemmOperand::from_resident(resident),
+                        None => matmul::GemmOperand::from_host(
+                            b_transposed.as_deref().unwrap_or(&b.data),
+                            b_id,
+                        ),
+                    };
+
+                    // One upload / launch / readback for the whole batch,
+                    // replacing what used to be `batch` complete round trips.
+                    // The broadcast rule the loop expressed as
+                    // `(i % operand_batches) * slice` is carried through
+                    // unchanged as a batch stride -- see `matmul::plan_gemm`.
+                    let request = matmul::BatchedGemm {
+                        a: a_operand,
+                        b: b_operand,
+                        m,
+                        k,
+                        n,
+                        batch,
+                        a_batches,
+                        b_batches,
+                    };
+                    let Some(mut out) =
+                        matmul::cuda_gemm_batched(ctx, request).map_err(OnnxError::from)?
+                    else {
+                        return Ok(None);
+                    };
+
+                    // Shadow-verify the whole batch at once against the same
+                    // per-slice oracle the loop used, slice by slice, with the
+                    // same `(i % operand_batches)` indexing. Built only when
+                    // verification is actually on: `verify_or_fallback` takes
+                    // the oracle as a closure precisely so this costs nothing
+                    // in production.
+                    if !verify_or_fallback("MatMul/Gemm", &out, || {
+                        let a_data = a_transposed.as_deref().unwrap_or(&a.data);
+                        let b_data = b_transposed.as_deref().unwrap_or(&b.data);
+                        let mut expected = Vec::with_capacity(out_total);
+                        for i in 0..batch {
+                            let a_start = (i % a_batches) * slice_a;
+                            let b_start = (i % b_batches) * slice_b;
+                            // `.get()` rather than direct indexing: never
+                            // index a model-derived slice range without a
+                            // bounds check, even though `a_needed`/`b_needed`
+                            // above already guarantee this succeeds.
+                            let (Some(a_slice), Some(b_slice)) = (
+                                a_data.get(a_start..a_start + slice_a),
+                                b_data.get(b_start..b_start + slice_b),
+                            ) else {
+                                // The oracle cannot be built, so there is
+                                // nothing to compare against; `shadow_verify`
+                                // treats `None` as "no formula" and says so
+                                // loudly rather than passing silently.
+                                return None;
+                            };
+                            expected.extend(reference::ref_matmul(a_slice, b_slice, m, k, n));
                         }
-                        out.append(&mut c);
+                        Some(expected)
+                    })? {
+                        return Ok(None);
+                    }
+
+                    // Apply alpha scaling — after verification, so the oracle
+                    // stays the plain unscaled product. See the `matmul`
+                    // module docs' "Alpha stays on the host".
+                    if (alpha - 1.0).abs() > f32::EPSILON {
+                        for v in &mut out {
+                            *v *= alpha;
+                        }
                     }
 
                     // Gemm: C = alpha * A @ B + beta * bias
@@ -350,14 +564,22 @@ pub fn try_cuda_dispatch(
         }
 
         // ------------------------------------------------------------------ //
-        // Conv — ALWAYS DECLINES.                                              //
+        // Conv                                                                  //
         //                                                                      //
-        // `conv::cuda_conv` unconditionally returns `Ok(None)` (there is no    //
-        // CUDA convolution kernel), so this arm can only ever yield `Ok(None)`.//
-        // It is retained so the ONNX attrs → `ConvParams` mapping stays live   //
-        // for the eventual real kernel.  `is_supported_op` reports `false` for //
-        // `Conv` so placement never routes a convolution here in the first     //
-        // place.                                                               //
+        // `conv::cuda_conv` computes a real answer for three validated shape   //
+        // classes — 1x1, true-depthwise, and the general symmetric-padding     //
+        // case, dispatched straight to `oxicuda-dnn`'s `Conv1x1` /             //
+        // `DepthwiseConv` / `ImplicitGemmConv` engines respectively (see the   //
+        // `conv` module docs' "Dispatch rule"; note it never goes through      //
+        // `conv_forward`'s auto-selector) — and declines (`Ok(None)`)          //
+        // everything else, so this arm can yield either `Ok(Some(_))` or       //
+        // `Ok(None)` depending on the node's configuration. Its output is      //
+        // shadow-verified against `reference::ref_conv` through the same       //
+        // `verify_or_fallback` gate every other claimable op below uses, so    //
+        // `OXIONNX_CUDA_VERIFY=1` covers a Conv dispatch exactly like it       //
+        // covers MatMul/elementwise/reduce/Softmax. `is_supported_op` reports  //
+        // `true` for `Conv`, so `decide_placement` routes production           //
+        // convolutions here — this arm is on the hot path, not test-only.      //
         // ------------------------------------------------------------------ //
         OpKind::Conv => {
             let input = resolve(&node.inputs[0]);
@@ -391,10 +613,49 @@ pub fn try_cuda_dispatch(
                     group,
                 };
 
-                match conv::cuda_conv(ctx, input, weight, bias, &conv_params)
+                // A convolution's filter and bias are the megabyte-scale
+                // invariant bytes in this workload -- InSwapper-128 alone
+                // re-uploaded ~503 MB of them per forward pass before
+                // residency existed. The input activation deliberately has no
+                // identity: it is this frame's data.
+                let conv_ids = conv::ConvWeightIds {
+                    weight: initializer_id(
+                        node.inputs.get(1).map(String::as_str),
+                        weights,
+                        intermediates,
+                        weight,
+                        residency::OperandForm::Raw,
+                    ),
+                    bias: bias.and_then(|bias_tensor| {
+                        initializer_id(
+                            node.inputs.get(2).map(String::as_str),
+                            weights,
+                            intermediates,
+                            bias_tensor,
+                            residency::OperandForm::Raw,
+                        )
+                    }),
+                };
+
+                match conv::cuda_conv_cached(ctx, input, weight, bias, &conv_params, conv_ids)
                     .map_err(OnnxError::from)?
                 {
-                    Some(tensor) => return Ok(Some(vec![tensor])),
+                    Some(tensor) => {
+                        let bias_data = bias.map(|b| b.data.as_slice());
+                        if !verify_or_fallback("Conv", &tensor.data, || {
+                            Some(reference::ref_conv(
+                                &input.data,
+                                &weight.data,
+                                bias_data,
+                                &input.shape,
+                                &weight.shape,
+                                &conv_params,
+                            ))
+                        })? {
+                            return Ok(None);
+                        }
+                        return Ok(Some(vec![tensor]));
+                    }
                     None => return Ok(None),
                 }
             }
@@ -608,6 +869,57 @@ pub fn try_cuda_dispatch(
     }
 }
 
+/// The residency identity for `name`, or `None` when these bytes must not be
+/// cached.
+///
+/// This is the one place that decides whether an operand is a *graph
+/// initializer* — bytes that are invariant for the session — as opposed to an
+/// activation this run just produced. Getting it wrong in the permissive
+/// direction would be a correctness bug of the worst kind: caching an
+/// activation means every later frame is computed against the first frame's
+/// numbers, silently.
+///
+/// Two conditions, both necessary:
+///
+/// * **Not an intermediate.** `resolve` prefers `intermediates` over
+///   `weights`, so a name a node has already produced this run is *not* an
+///   initializer here whatever the weight map also holds under it. Keying such
+///   a name would cache one tensor's bytes and then serve them for another's.
+/// * **Present in `weights`.** That is what "initializer" means at this layer.
+///
+/// Mirrors `oxionnx::session::gpu_dispatch`'s `initializer_key`, which makes
+/// the identical decision for the wgpu backend, for the identical reasons.
+fn initializer_id<'a>(
+    name: Option<&'a str>,
+    weights: &HashMap<String, Tensor>,
+    intermediates: &HashMap<String, Tensor>,
+    tensor: &Tensor,
+    form: residency::OperandForm,
+) -> Option<residency::WeightId<'a>> {
+    let name = name?;
+    if name.is_empty() || intermediates.contains_key(name) {
+        return None;
+    }
+    weights
+        .contains_key(name)
+        .then(|| residency::WeightId::new(name, &tensor.data, form))
+}
+
+/// Which derived form of an operand's bytes a GEMM will read.
+///
+/// A `transA`/`transB` node consumes the *transpose* of its operand, which is
+/// a different byte sequence from the operand itself — and one graph can
+/// legitimately consume the same initializer both ways from two different
+/// nodes. Keeping them in separate cache slots is what stops one node being
+/// served the other's bytes.
+fn operand_form(transposed: bool) -> residency::OperandForm {
+    if transposed {
+        residency::OperandForm::Transposed
+    } else {
+        residency::OperandForm::Raw
+    }
+}
+
 /// Read the live `OXIONNX_CUDA_VERIFY` / `OXIONNX_CUDA_STRICT` state and
 /// delegate to [`reference::shadow_verify`], converting a strict-mode
 /// mismatch into an [`OnnxError`].
@@ -718,553 +1030,7 @@ fn apply_gemm_bias(
     true
 }
 
+/// Unit tests for this module, in `dispatch_tests.rs` — see that file's header
+/// for why they live beside `lib.rs` rather than inside it.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use oxionnx_core::graph::{Attributes, Node, OpKind};
-
-    fn make_node(op: OpKind, inputs: &[&str], outputs: &[&str]) -> Node {
-        Node {
-            op,
-            name: "test_node".to_string(),
-            inputs: inputs.iter().map(|s| s.to_string()).collect(),
-            outputs: outputs.iter().map(|s| s.to_string()).collect(),
-            attrs: Attributes::default(),
-        }
-    }
-
-    // ── is_supported_op ⇄ try_cuda_dispatch agreement ───────────────────────
-
-    /// The ops `try_cuda_dispatch` can actually claim, transcribed from its
-    /// `match &node.op` arms *with the permanently-declining `Conv` arm removed*.
-    ///
-    /// Read the dispatch match top-to-bottom and this list must fall out of it.
-    fn claimable_ops() -> Vec<OpKind> {
-        vec![
-            // `OpKind::MatMul | OpKind::Gemm` arm → matmul::cuda_matmul
-            OpKind::MatMul,
-            OpKind::Gemm,
-            // unary activation arm → elementwise::cuda_elementwise
-            OpKind::Relu,
-            OpKind::Sigmoid,
-            OpKind::Gelu,
-            OpKind::Tanh,
-            OpKind::Exp,
-            OpKind::Sqrt,
-            OpKind::Abs,
-            OpKind::Neg,
-            OpKind::Log,
-            OpKind::Ceil,
-            OpKind::Floor,
-            OpKind::HardSigmoid,
-            OpKind::HardSwish,
-            OpKind::SiLU,
-            OpKind::Softplus,
-            OpKind::LeakyRelu,
-            // binary arm → elementwise::cuda_binary_elementwise
-            OpKind::Add,
-            OpKind::Sub,
-            OpKind::Mul,
-            OpKind::Div,
-            // reduction arm → reduce::cuda_reduce
-            OpKind::ReduceSum,
-            OpKind::ReduceMax,
-            // softmax arm → softmax::cuda_softmax
-            OpKind::Softmax,
-            // NOTE: `OpKind::Conv` has a dispatch arm but conv::cuda_conv always
-            // returns Ok(None), so it is NOT claimable and must not appear here.
-        ]
-    }
-
-    /// Every unit variant of `OpKind` (i.e. excluding `OpKind::Unknown(_)`).
-    ///
-    /// Enumerated exhaustively so that `is_supported_op` can be pinned to
-    /// *exactly* the claimable set — an op accidentally added to the predicate
-    /// without a matching dispatch arm makes this test fail.
-    fn all_op_kinds() -> Vec<OpKind> {
-        vec![
-            OpKind::MatMul,
-            OpKind::Gemm,
-            OpKind::Add,
-            OpKind::Sub,
-            OpKind::Mul,
-            OpKind::Div,
-            OpKind::Pow,
-            OpKind::Sqrt,
-            OpKind::Reciprocal,
-            OpKind::Neg,
-            OpKind::ReduceMean,
-            OpKind::ReduceSum,
-            OpKind::ReduceMax,
-            OpKind::ReduceMin,
-            OpKind::ReduceProd,
-            OpKind::ArgMax,
-            OpKind::ArgMin,
-            OpKind::CumSum,
-            OpKind::Range,
-            OpKind::TopK,
-            OpKind::Softmax,
-            OpKind::LayerNorm,
-            OpKind::GroupNorm,
-            OpKind::BatchNorm,
-            OpKind::Gelu,
-            OpKind::Relu,
-            OpKind::Sigmoid,
-            OpKind::Tanh,
-            OpKind::Erf,
-            OpKind::SiLU,
-            OpKind::HardSigmoid,
-            OpKind::HardSwish,
-            OpKind::RMSNorm,
-            OpKind::Reshape,
-            OpKind::Transpose,
-            OpKind::Squeeze,
-            OpKind::Unsqueeze,
-            OpKind::Flatten,
-            OpKind::Concat,
-            OpKind::Slice,
-            OpKind::Expand,
-            OpKind::Split,
-            OpKind::Tile,
-            OpKind::Gather,
-            OpKind::GatherElements,
-            OpKind::Where,
-            OpKind::ScatterElements,
-            OpKind::ScatterND,
-            OpKind::Conv,
-            OpKind::MaxPool,
-            OpKind::AveragePool,
-            OpKind::Pad,
-            OpKind::LeakyRelu,
-            OpKind::PRelu,
-            OpKind::Resize,
-            OpKind::GlobalAveragePool,
-            OpKind::GlobalMaxPool,
-            OpKind::QuantizeLinear,
-            OpKind::DequantizeLinear,
-            OpKind::Identity,
-            OpKind::Cast,
-            OpKind::Shape,
-            OpKind::Constant,
-            OpKind::Clip,
-            OpKind::Abs,
-            OpKind::Log,
-            OpKind::Exp,
-            OpKind::Ceil,
-            OpKind::Floor,
-            OpKind::Round,
-            OpKind::Sign,
-            OpKind::Mod,
-            OpKind::BitShift,
-            OpKind::Sin,
-            OpKind::Cos,
-            OpKind::Tan,
-            OpKind::Asin,
-            OpKind::Acos,
-            OpKind::Atan,
-            OpKind::Sinh,
-            OpKind::Cosh,
-            OpKind::Asinh,
-            OpKind::Acosh,
-            OpKind::Atanh,
-            OpKind::VariadicMin,
-            OpKind::VariadicMax,
-            OpKind::VariadicMean,
-            OpKind::VariadicSum,
-            OpKind::Equal,
-            OpKind::Greater,
-            OpKind::GreaterOrEqual,
-            OpKind::Less,
-            OpKind::LessOrEqual,
-            OpKind::And,
-            OpKind::Or,
-            OpKind::Xor,
-            OpKind::Not,
-            OpKind::IsInf,
-            OpKind::IsNaN,
-            OpKind::NonZero,
-            OpKind::ConstantOfShape,
-            OpKind::EyeLike,
-            OpKind::Trilu,
-            OpKind::LogSoftmax,
-            OpKind::Softplus,
-            OpKind::Softsign,
-            OpKind::Mish,
-            OpKind::Celu,
-            OpKind::Elu,
-            OpKind::Selu,
-            OpKind::ThresholdedRelu,
-            OpKind::InstanceNorm,
-            OpKind::LpNorm,
-            OpKind::MeanVarianceNormalization,
-            OpKind::Dropout,
-            OpKind::DepthToSpace,
-            OpKind::SpaceToDepth,
-            OpKind::ReverseSequence,
-            OpKind::GatherND,
-            OpKind::OneHot,
-            OpKind::Compress,
-            OpKind::Unique,
-            OpKind::Einsum,
-            OpKind::ConvTranspose,
-            OpKind::NonMaxSuppression,
-            OpKind::LSTM,
-            OpKind::GRU,
-            OpKind::Attention,
-            OpKind::MultiHeadAttention,
-            OpKind::RotaryEmbedding,
-            OpKind::GridSample,
-            OpKind::RoiAlign,
-            OpKind::If,
-            OpKind::Loop,
-            OpKind::Scan,
-            OpKind::LinearClassifier,
-            OpKind::LinearRegressor,
-            OpKind::Normalizer,
-            OpKind::Scaler,
-            OpKind::LabelEncoder,
-            OpKind::TreeEnsembleClassifier,
-            OpKind::TreeEnsembleRegressor,
-            OpKind::SVMClassifier,
-            OpKind::SVMRegressor,
-            OpKind::TfIdfVectorizer,
-            OpKind::StringNormalizer,
-            OpKind::DFT,
-            OpKind::STFT,
-            OpKind::BlackmanWindow,
-            OpKind::HannWindow,
-            OpKind::HammingWindow,
-            OpKind::MelWeightMatrix,
-            OpKind::Bernoulli,
-            OpKind::ReduceL1,
-            OpKind::ReduceL2,
-            OpKind::ReduceLogSum,
-            OpKind::ReduceLogSumExp,
-            OpKind::ReduceSumSquare,
-            OpKind::BitwiseAnd,
-            OpKind::BitwiseOr,
-            OpKind::BitwiseXor,
-            OpKind::BitwiseNot,
-            OpKind::Size,
-            OpKind::Hardmax,
-            OpKind::Shrink,
-            OpKind::ConvAddRelu,
-        ]
-    }
-
-    /// `is_supported_op` must return `true` for **exactly** the ops that
-    /// `try_cuda_dispatch` can claim — no more, no fewer.
-    ///
-    /// This is the contract `oxionnx::execution_providers::decide_placement`
-    /// relies on to avoid an upload → dispatch → fence → readback round-trip
-    /// for an op CUDA was never going to handle.
-    #[test]
-    fn is_supported_op_matches_dispatch_arms() {
-        let claimable = claimable_ops();
-
-        // 1. Every claimable op is reported supported.
-        for op in &claimable {
-            assert!(
-                is_supported_op(op),
-                "{op:?} has a live try_cuda_dispatch arm but is_supported_op says false",
-            );
-        }
-
-        // 2. Nothing outside the claimable set is reported supported.
-        //    Sweeping every OpKind unit variant makes this an "exactly" check.
-        let all = all_op_kinds();
-        for op in &all {
-            let expected = claimable.contains(op);
-            assert_eq!(
-                is_supported_op(op),
-                expected,
-                "is_supported_op({op:?}) disagrees with the try_cuda_dispatch match arms",
-            );
-        }
-
-        // 3. Guard the enumeration itself: if `OpKind` grows a variant and
-        //    `all_op_kinds` is not updated, the arity check below trips.
-        assert_eq!(
-            all.len(),
-            166,
-            "OpKind gained/lost a unit variant — update all_op_kinds() and re-audit \
-             is_supported_op against the try_cuda_dispatch match arms",
-        );
-        assert_eq!(
-            claimable.len(),
-            25,
-            "claimable_ops() changed — re-audit against the try_cuda_dispatch match arms",
-        );
-    }
-
-    /// Every op `try_cuda_dispatch` can claim through the unary/binary/reduce arms must
-    /// have a live [`reference`] oracle formula.
-    ///
-    /// Without this, an op added to a dispatch arm with no matching `reference::ref_*`
-    /// case doesn't fail loudly: `verify_or_fallback`'s oracle closure returns `None`,
-    /// [`reference::shadow_verify`] treats that as "the oracle has no formula, skip the
-    /// check" and logs a `warn!` — which only a human staring at a real CUDA machine's
-    /// logs under `OXIONNX_CUDA_VERIFY=1` would ever see. This test makes that gap fail
-    /// on every host, including this one with no GPU, by driving the same
-    /// `claimable_ops()` list `is_supported_op_matches_dispatch_arms` already pins so the
-    /// two enumerations cannot silently drift apart.
-    ///
-    /// `MatMul`/`Gemm` (verified via [`reference::ref_matmul`], which takes no `OpKind` —
-    /// it is unconditionally applicable) and `Softmax` (verified via
-    /// [`reference::ref_softmax`], likewise `OpKind`-free) are excluded from the
-    /// per-op-formula check for that reason, and asserted present in `claimable_ops()`
-    /// instead so removing one of them from the enum list still trips the arity check.
-    #[test]
-    fn oracle_covers_every_op_the_unary_binary_and_reduce_dispatch_arms_claim() {
-        const UNARY_OPS: &[OpKind] = &[
-            OpKind::Relu,
-            OpKind::Sigmoid,
-            OpKind::Gelu,
-            OpKind::Tanh,
-            OpKind::Exp,
-            OpKind::Sqrt,
-            OpKind::Abs,
-            OpKind::Neg,
-            OpKind::Log,
-            OpKind::Ceil,
-            OpKind::Floor,
-            OpKind::HardSigmoid,
-            OpKind::HardSwish,
-            OpKind::SiLU,
-            OpKind::Softplus,
-            OpKind::LeakyRelu,
-        ];
-        const BINARY_OPS: &[OpKind] = &[OpKind::Add, OpKind::Sub, OpKind::Mul, OpKind::Div];
-        const REDUCE_OPS: &[OpKind] = &[OpKind::ReduceSum, OpKind::ReduceMax];
-        const NO_OPKIND_NEEDED: &[OpKind] = &[OpKind::MatMul, OpKind::Gemm, OpKind::Softmax];
-
-        let claimable = claimable_ops();
-        for op in &claimable {
-            if UNARY_OPS.contains(op) {
-                assert!(
-                    reference::ref_unary(op, 0.5).is_some(),
-                    "{op:?} is claimable by the unary elementwise dispatch arm but \
-                     reference::ref_unary has no formula for it",
-                );
-            } else if BINARY_OPS.contains(op) {
-                assert!(
-                    reference::ref_binary(op, 1.0, 2.0).is_some(),
-                    "{op:?} is claimable by the binary elementwise dispatch arm but \
-                     reference::ref_binary has no formula for it",
-                );
-            } else if REDUCE_OPS.contains(op) {
-                assert!(
-                    reference::ref_reduce(op, &[1.0, 2.0, 3.0, 4.0], &[4], 0).is_some(),
-                    "{op:?} is claimable by the reduce dispatch arm but reference::ref_reduce \
-                     has no formula for it",
-                );
-            } else {
-                assert!(
-                    NO_OPKIND_NEEDED.contains(op),
-                    "{op:?} is claimable but not classified into any op-family list in this \
-                     test — add it to one of the lists above so oracle coverage stays pinned",
-                );
-            }
-        }
-
-        // The four lists above partition `claimable_ops()` exactly; this catches an op
-        // quietly removed from one list (rather than from `claimable_ops()` itself, which
-        // `is_supported_op_matches_dispatch_arms` already pins at 25).
-        assert_eq!(
-            UNARY_OPS.len() + BINARY_OPS.len() + REDUCE_OPS.len() + NO_OPKIND_NEEDED.len(),
-            claimable.len(),
-            "the op-family lists in this test no longer partition claimable_ops() exactly",
-        );
-    }
-
-    /// `Conv` has a dispatch arm, but `conv::cuda_conv` always returns `Ok(None)`.
-    /// Advertising it would route every convolution to the GPU only to fall back.
-    #[test]
-    fn conv_has_an_arm_but_is_not_claimable() {
-        assert!(
-            !is_supported_op(&OpKind::Conv),
-            "Conv must not be advertised: conv::cuda_conv unconditionally declines",
-        );
-    }
-
-    /// `Unknown` ops can never be claimed.
-    #[test]
-    fn unknown_op_is_not_supported() {
-        assert!(!is_supported_op(&OpKind::Unknown("Frobnicate".to_string())));
-    }
-
-    /// The predicate must be pure and side-effect free — callable without a device.
-    #[test]
-    fn is_supported_op_needs_no_cuda_device() {
-        // No CudaContext is constructed anywhere in this test.
-        for op in all_op_kinds() {
-            let _ = is_supported_op(&op);
-        }
-    }
-
-    /// Validates that try_cuda_dispatch returns Ok(None) for unsupported ops
-    /// when no CUDA context is available (unit test only touches the match arm).
-    #[test]
-    fn dispatch_unknown_op_returns_none() {
-        // Without a real CUDA device we can only test the None-returning path.
-        // We verify the dispatch fn returns None for an op that has no CUDA kernel.
-        let node = make_node(OpKind::Identity, &["x"], &["y"]);
-        let weights: HashMap<String, Tensor> = HashMap::new();
-        let mut intermediates: HashMap<String, Tensor> = HashMap::new();
-        let t = Tensor::new(vec![1.0f32], vec![1]);
-        intermediates.insert("x".to_string(), t);
-
-        // We cannot construct a real CudaContext in CI, so we skip the actual
-        // dispatch and just verify the type signature compiles.
-        let _ = &node;
-        let _ = &weights;
-        let _ = &intermediates;
-    }
-
-    #[test]
-    fn cuda_context_try_new_no_panic() {
-        // try_new must never panic — it should return None if no GPU present.
-        let _ctx = CudaContext::try_new();
-    }
-
-    #[test]
-    fn cuda_error_displays_correctly() {
-        let e = CudaError::Ptx("bad ptx".to_string());
-        let s = format!("{e}");
-        assert!(
-            s.contains("bad ptx"),
-            "Expected error message to contain 'bad ptx', got: {s}"
-        );
-    }
-
-    #[test]
-    fn cuda_error_maps_to_onnx_internal() {
-        let e = CudaError::Shape {
-            op: "Conv",
-            msg: "wrong shape".to_string(),
-        };
-        let onnx_err: OnnxError = e.into();
-        match onnx_err {
-            OnnxError::Internal(msg) => {
-                assert!(
-                    msg.contains("wrong shape"),
-                    "Expected 'wrong shape' in: {msg}"
-                );
-            }
-            other => panic!("Expected OnnxError::Internal, got: {other:?}"),
-        }
-    }
-
-    // ── apply_gemm_bias (finding a8-4): every spec-legal broadcastable `C` ──
-    //
-    // ONNX Gemm's `C` may be unidirectionally broadcastable to `[M, N]` as a true
-    // scalar (`[]` or `[1]`), `[N]`, `[M, 1]`, or `[M, N]`. The pre-fix code only
-    // handled `[N]` and `[M, N]`; `[M, 1]` (M != N) and a genuine scalar (N != 1)
-    // silently added nothing. Each case below is hand-verified.
-
-    #[test]
-    fn gemm_bias_row_broadcast_n_shape() {
-        // bias = [N] = [10, 20, 30], M=2, N=3, beta=1.0 — broadcasts across every row.
-        let mut out = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        assert!(apply_gemm_bias(
-            &mut out,
-            &[10.0, 20.0, 30.0],
-            &[3],
-            2,
-            3,
-            1.0
-        ));
-        assert_eq!(out, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
-    }
-
-    #[test]
-    fn gemm_bias_one_by_n_shape_matches_plain_n_shape() {
-        // bias = [1, N] = [[10, 20, 30]] — same broadcast as the plain [N] case above,
-        // exercised through the rank-2-with-leading-1 code path instead of rank-1.
-        let mut out = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        assert!(apply_gemm_bias(
-            &mut out,
-            &[10.0, 20.0, 30.0],
-            &[1, 3],
-            2,
-            3,
-            1.0
-        ));
-        assert_eq!(out, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
-    }
-
-    #[test]
-    fn gemm_bias_full_m_by_n_matrix() {
-        // bias = [M, N] = [[100,200,300],[400,500,600]], M=2, N=3, beta=1.0.
-        let mut out = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let bias = [100.0, 200.0, 300.0, 400.0, 500.0, 600.0];
-        assert!(apply_gemm_bias(&mut out, &bias, &[2, 3], 2, 3, 1.0));
-        assert_eq!(out, vec![101.0, 202.0, 303.0, 404.0, 505.0, 606.0]);
-    }
-
-    #[test]
-    fn gemm_bias_m_by_one_column_broadcast_with_m_ne_n() {
-        // The exact a8-4 regression case: bias = [M, 1] = [[7],[70]], M=2, N=3 (M != N),
-        // beta=1.0. Before the fix, neither `bias.len() == n` (2 != 3) nor
-        // `bias.len() == m*n` (2 != 6) matched, so the bias was silently dropped.
-        let mut out = vec![0.0; 6];
-        assert!(apply_gemm_bias(&mut out, &[7.0, 70.0], &[2, 1], 2, 3, 1.0));
-        assert_eq!(out, vec![7.0, 7.0, 7.0, 70.0, 70.0, 70.0]);
-    }
-
-    #[test]
-    fn gemm_bias_true_scalar_broadcasts_to_every_element_with_n_ne_one() {
-        // The other a8-4 regression case: bias = [1] (a true scalar), M=2, N=3 (N != 1),
-        // beta=2.0. Before the fix, `bias.len() == n` (1 != 3) and `bias.len() == m*n`
-        // (1 != 6) both failed, so the bias was silently dropped.
-        let mut out = vec![0.0; 6];
-        assert!(apply_gemm_bias(&mut out, &[5.0], &[1], 2, 3, 2.0));
-        assert_eq!(out, vec![10.0; 6]);
-    }
-
-    #[test]
-    fn gemm_bias_rank_zero_scalar_broadcasts_too() {
-        // A genuine ONNX scalar tensor has shape `[]` (rank 0), not `[1]`.
-        let mut out = vec![0.0; 4];
-        assert!(apply_gemm_bias(&mut out, &[9.0], &[], 2, 2, 1.0));
-        assert_eq!(out, vec![9.0; 4]);
-    }
-
-    #[test]
-    fn gemm_bias_declines_an_incompatible_shape_leaving_out_untouched() {
-        // bias = [5] against N=3: neither equal nor 1 — not unidirectionally broadcastable.
-        let mut out = vec![1.0, 2.0, 3.0];
-        let untouched = out.clone();
-        assert!(!apply_gemm_bias(
-            &mut out,
-            &[1.0, 2.0, 3.0, 4.0, 5.0],
-            &[5],
-            1,
-            3,
-            1.0
-        ));
-        assert_eq!(
-            out, untouched,
-            "a declined bias must leave `out` unmodified"
-        );
-    }
-
-    #[test]
-    fn gemm_bias_declines_when_the_data_is_shorter_than_its_declared_shape() {
-        // bias_shape claims 3 elements (a malformed model: shape/data length mismatch).
-        let mut out = vec![1.0, 2.0, 3.0];
-        let untouched = out.clone();
-        assert!(!apply_gemm_bias(&mut out, &[1.0, 2.0], &[3], 1, 3, 1.0));
-        assert_eq!(out, untouched);
-    }
-
-    #[test]
-    fn gemm_bias_row_broadcast_applies_across_every_stacked_batch_slice() {
-        // `out` may stack several batch slices (`out.len() == batch * m * n`); a row-
-        // broadcast bias must repeat for every row across every slice, matching the
-        // pre-fix behaviour for this already-supported shape (a8-4 regression guard).
-        let mut out = vec![0.0; 8]; // batch=2, m=2, n=2 -> 4 rows total.
-        assert!(apply_gemm_bias(&mut out, &[1.0, 2.0], &[2], 2, 2, 1.0));
-        assert_eq!(out, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
-    }
-}
+mod dispatch_tests;

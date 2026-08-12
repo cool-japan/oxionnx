@@ -16,3 +16,9 @@ pub use functions::{
     simd_reduce_min, simd_reduce_sum, simd_relu, simd_sigmoid, simd_silu, simd_softmax_inplace,
     simd_softmax_strided, simd_sqrt, simd_sub, simd_tanh,
 };
+
+// AVX2 intrinsics only exist on x86_64 (see `avx2::avx2_impl`'s own
+// `#[cfg(target_arch = "x86_64")]`), so the regression test that exercises
+// them directly is gated the same way.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests;

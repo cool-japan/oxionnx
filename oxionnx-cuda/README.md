@@ -32,7 +32,7 @@ to the wgpu or CPU backend — no crash.
 | Category         | Operators                                                         |
 |------------------|-------------------------------------------------------------------|
 | Linear algebra   | MatMul, Gemm — batched with numpy-style batch broadcasting (e.g. 3-D activations × a 2-D weight), `transA`/`transB`, and a bias epilogue for `[]`/`[N]`/`[M,N]`-shaped `C` — via `oxicuda_blas::gemm` |
-| Convolution      | Conv — not accelerated. `cuda_conv` unconditionally declines to the CPU: `oxicuda-dnn`'s convolution engines have stubbed GEMM phases that would silently produce wrong numbers, so no CUDA kernel is wired up rather than shipping one that's fast and wrong. |
+| Convolution      | Conv — NCHW forward, dispatched *directly* to one of three `oxicuda-dnn` engines: `Conv1x1` (1x1 filter, unit stride and dilation, no padding), `DepthwiseConv` (`groups == in_channels == out_channels`), otherwise `ImplicitGemmConv` (arbitrary stride, dilation and grouping). Deliberately does **not** go through `oxicuda_dnn::conv::api::conv_forward`, whose auto-selector can route into the Winograd path. Asymmetric `pads` declines to the CPU rather than silently computing with one side's padding value — ONNX allows `[top, left, bottom, right]` to differ per side, `ConvProblem` carries one value per spatial dimension — as do non-4-D shapes and group/channel mismatches. |
 | Unary activation | Relu, Sigmoid, Gelu, Tanh, Exp, Sqrt, Abs, Neg, Log, Ceil, Floor, HardSigmoid, HardSwish, SiLU, Softplus, LeakyRelu (16 ops via PTX) |
 | Binary           | Add, Sub, Mul, Div (same-shape only)                              |
 | Reduction        | ReduceSum, ReduceMax (single axis, any axis length)                |
@@ -50,12 +50,72 @@ anything else declines to the attribute-aware CPU kernel instead of silently
 computing the wrong constant.
 
 `oxionnx_cuda::is_supported_op(op: &OpKind) -> bool` is a cheap, pure,
-allocation-free predicate reporting exactly which of the 25 ops above
-`try_cuda_dispatch` is capable of claiming (`Conv` and everything else are
-`false`). Placement logic in the `oxionnx` workspace crate consults it before
+allocation-free predicate reporting exactly which of the 26 ops above
+`try_cuda_dispatch` is capable of claiming (everything else is `false`).
+Placement logic in the `oxionnx` workspace crate consults it before
 paying for an upload/dispatch/readback; returning `true` is necessary but
 not sufficient — an individual node's shape or attributes can still put it
 outside what the kernel handles, in which case dispatch itself declines.
+`Conv` is the sharpest example: it is advertised, and a convolution with
+asymmetric padding is still declined at dispatch time.
+
+## Session-lifetime caches
+
+A `CudaContext` is built once per `oxionnx::Session` and shared by every
+dispatch that session makes, so it is also where anything that should outlive a
+single node lives:
+
+* **A device-buffer pool.** Operand and output buffers are borrowed from a
+  size-classed free list and returned when the dispatch ends, instead of a
+  `cuMemAlloc`/`cuMemFree` pair per operand per node per frame.
+* **Weight residency.** A `MatMul`/`Gemm` operand or a `Conv` filter/bias that
+  resolves out of the session's *initializer* map — not out of this run's
+  intermediates — is uploaded once and reused thereafter. Bytes that never
+  change stop crossing the bus every frame.
+* **Compiled PTX modules.** The elementwise and softmax kernels this crate
+  generates itself are JIT-compiled once per context rather than once per
+  dispatch.
+
+Every copy also rides the same stream as the kernel that consumes it, so a
+dispatch performs exactly one host/device fence instead of one per operand.
+
+Measured on an RTX A4000 (sm_86, driver 550.144.03, CUDA 12.4) with
+`cargo run -p oxionnx-cuda --features gpu-tests --release --example
+dispatch_bench`, steady state, median of three runs:
+
+| dispatch                                    | before   | after   |       |
+|---------------------------------------------|---------:|--------:|------:|
+| batched MatMul, `[4,64,128] x [4,128,64]`    | 1.66 ms  | 0.10 ms | 17x   |
+| batched MatMul, `[16,64,128] x [16,128,64]`  | 5.89 ms  | 0.34 ms | 17x   |
+| batched MatMul, `[4,256,256] x [4,256,256]`  | 8.32 ms  | 0.68 ms | 12x   |
+| ArcFace head, `[1,25088] x [25088,512]`      | 43.65 ms | 5.56 ms | 7.9x  |
+| broadcast batch, `[8,64,128] x [128,64]`     | 2.93 ms  | 0.58 ms | 5.0x  |
+| InSwapper AdaIN, `[1,512] x [512,2048]`      | 1.04 ms  | 0.31 ms | 3.4x  |
+| Conv 3x3, 64ch at 64x64, with bias           | 1.08 ms  | 0.65 ms | 1.7x  |
+| Softmax `[1024,512]`                         | 1.27 ms  | 0.70 ms | 1.8x  |
+| ReduceSum `[1024,512]` axis 1                | 0.54 ms  | 0.22 ms | 2.5x  |
+
+The three batched-MatMul rows are the batched-dispatch change (one
+upload/launch/readback for the whole batch, replacing one *complete* round trip
+per batch slice); the rest is the pooling, residency and stream ordering above.
+
+Two consequences worth knowing:
+
+* **A session holds device memory between runs.** Resident weights plus idle
+  pooled buffers; `CudaContext::cached_device_bytes()` reports how much, and
+  `CudaContext::release_device_caches()` frees all of it (the next dispatch
+  simply re-allocates and re-uploads). The pool is bounded — buffers beyond its
+  budget are freed on check-in rather than retained.
+* **Initializers must actually be invariant.** `try_cuda_dispatch` treats a
+  name found in `weights` as denoting the same bytes for as long as the context
+  lives, which is what `oxionnx::Session` guarantees by construction. A direct
+  caller that swaps weight maps under one context should call
+  `release_device_caches()` in between; see `try_cuda_dispatch`'s own docs for
+  the check that usually catches it anyway.
+
+`CudaContext::cache_counters()` reports what the caches did. The number that
+matters is `weight_bytes_uploaded`: as a delta across a steady-state frame it
+must be **zero**, and `tests/batched_matmul_gpu.rs` asserts exactly that.
 
 ## Activation, shadow verification, and strict mode
 
@@ -92,8 +152,13 @@ Fixed in 0.1.5: batch-broadcast `MatMul`/`Gemm` operands, `ReduceSum`/
 ignoring the node's `alpha`/`beta`, and `Gemm`'s bias epilogue dropping bias
 for shapes other than `[N]`/`[M,N]`. The dead, permanently-unreachable
 `Conv` GPU path (already disabled behind a bare `if true`, since
-`oxicuda-dnn`'s conv engines produced wrong numbers) was deleted outright
-rather than left in the tree as misleading dead code.
+`oxicuda-dnn`'s conv engines produced wrong numbers *at the time*) was
+deleted outright rather than left in the tree as misleading dead code.
+That verdict on `oxicuda-dnn` no longer holds and this paragraph is history,
+not current status: `Conv` has since been re-implemented as the direct
+`Conv1x1`/`DepthwiseConv`/`ImplicitGemmConv` dispatch described above, each
+engine validated on real hardware against an independent CPU oracle, and is
+advertised by `is_supported_op`. See the "Accelerated operators" table.
 
 ## Feature flags
 

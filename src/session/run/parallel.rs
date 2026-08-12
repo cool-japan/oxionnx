@@ -1117,8 +1117,8 @@ mod tests {
     /// moment a CUDA or DirectML context existed.**
     ///
     /// The old gate was literally `if self.cuda.is_some() { return true; }` — no op
-    /// check at all — while `OpKind` has ~166 variants and CUDA implements 25 of
-    /// them (DirectML, 5).  So merely *owning* a CUDA context dragged every node in
+    /// check at all — while `OpKind` has ~166 variants and CUDA implements 26 of
+    /// them (DirectML, 15).  So merely *owning* a CUDA context dragged every node in
     /// the graph out of `par_iter` and into the serial phase, to be probed one at a
     /// time on the main thread only to be declined and handed back to the CPU.
     ///
@@ -1296,27 +1296,46 @@ mod tests {
         assert!(chain.is_empty(), "no accelerator is compiled in");
     }
 
-    /// CUDA has no `Conv` kernel (`conv::cuda_conv` always declines), so a `Conv`
-    /// must never be planned onto it — planning it would serialise the node out of
-    /// `par_iter` for a probe guaranteed to return `Ok(None)`.  DirectML and wgpu both
-    /// *do* have a Conv kernel; under `Auto` the plan is the priority chain
-    /// (`DirectMl` before `Gpu`) filtered by support, with CUDA dropped.
+    /// CUDA has a real `Conv` kernel (`conv::cuda_conv` dispatches directly to
+    /// `oxicuda-dnn`'s `Conv1x1` / `DepthwiseConv` / `ImplicitGemmConv`), so a
+    /// `Conv` must be planned onto it, at the head of the chain.  All three
+    /// accelerators implement `Conv`, so under `Auto` the plan is the full
+    /// priority chain, unfiltered: CUDA, then DirectML, then wgpu.
+    ///
+    /// Planning several providers is the point of the chain — a node CUDA
+    /// *declines* at dispatch time (asymmetric `pads`, say) falls through to the
+    /// next entry rather than straight to the CPU.
+    ///
+    /// This test asserted the exact opposite until CUDA gained a working
+    /// convolution; it is inverted rather than deleted because it is the parallel
+    /// path's copy of the placement decision that matters most for the
+    /// convolution-dominated models this engine runs.
     #[cfg(feature = "cuda")]
     #[test]
-    fn conv_is_never_planned_onto_cuda() {
+    fn conv_is_planned_onto_cuda_first() {
         let plan = plan_from_placement(&OpKind::Conv, 1 << 20, &auto_everything(), all_live());
-        assert!(
-            !plan.contains(&ProviderKind::Cuda),
-            "CUDA declines every Conv; planning it there is a guaranteed wasted round trip",
+        assert_eq!(
+            plan.first().copied(),
+            Some(ProviderKind::Cuda),
+            "CUDA implements Conv and heads the priority chain; it must be tried first, got \
+             {plan:?}",
         );
-        // DirectML outranks wgpu and both support Conv → DirectML-first, wgpu fallback.
+        // Every accelerator supports Conv → nothing is filtered out of the chain.
         #[cfg(all(feature = "gpu", feature = "directml"))]
-        assert_eq!(plan, vec![ProviderKind::DirectMl, ProviderKind::Gpu]);
-        // Only one of the two Conv-capable accelerators is present.
+        assert_eq!(
+            plan,
+            vec![
+                ProviderKind::Cuda,
+                ProviderKind::DirectMl,
+                ProviderKind::Gpu
+            ]
+        );
         #[cfg(all(feature = "gpu", not(feature = "directml")))]
-        assert_eq!(plan, vec![ProviderKind::Gpu]);
+        assert_eq!(plan, vec![ProviderKind::Cuda, ProviderKind::Gpu]);
         #[cfg(all(feature = "directml", not(feature = "gpu")))]
-        assert_eq!(plan, vec![ProviderKind::DirectMl]);
+        assert_eq!(plan, vec![ProviderKind::Cuda, ProviderKind::DirectMl]);
+        #[cfg(all(not(feature = "gpu"), not(feature = "directml")))]
+        assert_eq!(plan, vec![ProviderKind::Cuda]);
     }
 
     // ── Bug 3: `self.providers` was ignored on the parallel path ────────────

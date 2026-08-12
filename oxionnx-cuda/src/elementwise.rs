@@ -4,15 +4,39 @@
 //! `Abs`, `Neg`, `Log`, `Ceil`, `Floor`, `HardSigmoid`, `HardSwish`, `SiLU`,
 //! `Softplus`, `LeakyRelu`) and binary ops (`Add`, `Sub`, `Mul`, `Div`).
 //!
-//! Each op generates a PTX kernel via [`ElementwiseTemplate`], compiles it
-//! into a module, and launches it with the input/output device pointers as
-//! arguments.
+//! Each op has a PTX kernel generated from [`ElementwiseTemplate`], compiled
+//! **once per context** (see `CudaContext`'s module cache) and launched with
+//! the input/output device pointers as arguments.
+//!
+//! # Per-call cost, and what is left of it
+//!
+//! These are the cheapest kernels in the crate and used to be among its most
+//! expensive dispatches, because everything around the kernel dominated it.
+//! Two of those things are now gone:
+//!
+//! * **The JIT.** `template.generate()` + `Module::from_ptx` ran on *every*
+//!   dispatch — a PTX string rebuilt and handed to the driver's compiler per
+//!   node per frame, for the 57 elementwise nodes an InSwapper frame runs.
+//!   The context's module cache makes that a once-per-context cost.
+//! * **The allocations and the fences.** Two or three `cuMemAlloc`/`cuMemFree`
+//!   pairs plus a context-wide synchronise per operand, replaced by pooled
+//!   buffers and stream-ordered copies (see [`mod@crate::residency`]).
+//!
+//! What is left is the unavoidable part: the operand crosses the bus, the
+//! kernel runs, the result crosses back. That round trip is why `oxionnx`'s
+//! placement layer gates memory-bound ops on size in the first place — see
+//! `oxionnx::session::gpu_residency`'s measured table, where seven of ten op
+//! types lose to their CPU kernels *while transferring*. Removing the transfer
+//! itself needs session-level activation residency, which is a layer above
+//! this crate.
+//!
+//! Operands here are deliberately **not** weight-cached. An elementwise
+//! operand is essentially always an activation, and the rare initializer one
+//! (a per-channel constant in an `Add`) is a few hundred bytes — the residency
+//! bookkeeping would cost more than the upload it saves. `MatMul`/`Gemm` and
+//! `Conv`, whose initializers are megabytes each, do cache theirs.
 
-use std::sync::Arc;
-
-use oxicuda_driver::Module;
 use oxicuda_launch::{grid_size_for, Dim3, Kernel, LaunchParams};
-use oxicuda_memory::DeviceBuffer;
 use oxicuda_ptx::{
     ir::PtxType,
     templates::elementwise::{ElementwiseOp, ElementwiseTemplate},
@@ -63,54 +87,89 @@ fn binary_op_for(op_name: &str) -> Result<ElementwiseOp, CudaDispatchError> {
     }
 }
 
+/// Fetch — compiling on first use — the kernel for one elementwise op.
+///
+/// The template is cheap to construct and its `kernel_name` is the cache key,
+/// so a hit costs a hash lookup and an `Arc` clone; only a miss pays for PTX
+/// generation and the driver's JIT.
+fn kernel_for(ctx: &CudaContext, op: ElementwiseOp) -> Result<Kernel, CudaDispatchError> {
+    let template = ElementwiseTemplate::new(op, PtxType::F32, ctx.dnn.sm_version());
+    let kernel_name = template.kernel_name();
+    let module = ctx.module(&kernel_name, || {
+        template
+            .generate()
+            .map_err(|e| CudaDispatchError::Ptx(e.to_string()))
+    })?;
+    Kernel::from_module(module, &kernel_name).map_err(CudaDispatchError::Driver)
+}
+
 /// Launch a unary elementwise kernel on the CUDA device.
 ///
-/// `op_name` is the ONNX op type string.  The PTX template is generated at
-/// call time (in practice the driver caches compiled modules).
+/// `op_name` is the ONNX op type string.
 ///
 /// Returns the output data vector on success.
+///
+/// # Errors
+///
+/// [`CudaDispatchError::Unsupported`] for an op with no kernel,
+/// [`CudaDispatchError::Shape`] for a tensor too large for a `u32` launch, or
+/// a driver error from PTX compilation, allocation, upload, launch or
+/// readback.
 pub fn cuda_elementwise(
     ctx: &CudaContext,
     data: &[f32],
     op_name: &str,
 ) -> Result<Vec<f32>, CudaDispatchError> {
-    let ew_op = unary_op_for(op_name)?;
-
-    let sm = ctx.dnn.sm_version();
-    let template = ElementwiseTemplate::new(ew_op, PtxType::F32, sm);
-    let kernel_name = template.kernel_name();
-
-    let ptx = template
-        .generate()
-        .map_err(|e| CudaDispatchError::Ptx(e.to_string()))?;
-
-    let module = Arc::new(Module::from_ptx(&ptx).map_err(CudaDispatchError::Driver)?);
-    let kernel = Kernel::from_module(module, &kernel_name).map_err(CudaDispatchError::Driver)?;
+    let kernel = kernel_for(ctx, unary_op_for(op_name)?)?;
 
     let n = data.len();
-    let mut d_input: DeviceBuffer<f32> = DeviceBuffer::alloc(n)?;
-    d_input.copy_from_host(data)?;
-    let d_output: DeviceBuffer<f32> = DeviceBuffer::alloc(n)?;
+    let Ok(n_u32) = u32::try_from(n) else {
+        return Err(CudaDispatchError::Shape {
+            op: "elementwise",
+            msg: format!("{n} elements exceed a u32 kernel launch"),
+        });
+    };
 
-    let grid = grid_size_for(n as u32, BLOCK_SIZE);
-    let params = LaunchParams::new(Dim3::from(grid), Dim3::from(BLOCK_SIZE));
-
+    // Upload, launch and readback all ride `ctx.dnn.stream()` — the stream the
+    // kernel is launched on. Stream order alone sequences them, so the only
+    // host/device rendezvous is the single synchronise at the end.
     let stream = ctx.dnn.stream();
-    let args = (d_input.as_device_ptr(), d_output.as_device_ptr(), n as u32);
+    let mut d_input = ctx.scratch(n)?;
+    d_input.upload(data, stream)?;
+    let mut d_output = ctx.scratch(n)?;
+
+    // No zero-fill: the grid covers `[0, n)` and the kernel writes every
+    // element of that range, so nothing a previous borrower left is ever read.
+    // (The pooled allocation's tail beyond `n` stays stale and is never
+    // touched — `download` copies exactly `n`.)
+    let grid = grid_size_for(n_u32, BLOCK_SIZE);
+    let params = LaunchParams::new(Dim3::from(grid), Dim3::from(BLOCK_SIZE));
+    let args = (d_input.device_ptr(), d_output.device_ptr(), n_u32);
     kernel
         .launch(&params, stream, &args)
         .map_err(CudaDispatchError::Driver)?;
 
-    stream.synchronize().map_err(CudaDispatchError::Driver)?;
-
     let mut out = vec![0.0_f32; n];
-    d_output.copy_to_host(&mut out)?;
+    d_output.download(&mut out, stream)?;
+    stream.synchronize().map_err(CudaDispatchError::Driver)?;
+    // ...and only now may these allocations go back to the pool. See
+    // `PooledBuffer`'s "a borrow is only recycled once its stream work is
+    // known to be done".
+    d_input.retire();
+    d_output.retire();
     Ok(out)
 }
 
 /// Launch a binary elementwise kernel (Add, Sub, Mul, Div) on the CUDA device.
 ///
 /// Both `a` and `b` must have the same length.  Returns the output data vector.
+///
+/// # Errors
+///
+/// [`CudaDispatchError::Shape`] if the operands differ in length or are too
+/// large for a `u32` launch, [`CudaDispatchError::Unsupported`] for an op with
+/// no kernel, or a driver error from PTX compilation, allocation, upload,
+/// launch or readback.
 pub fn cuda_binary_elementwise(
     ctx: &CudaContext,
     a: &[f32],
@@ -128,43 +187,40 @@ pub fn cuda_binary_elementwise(
         });
     }
 
-    let ew_op = binary_op_for(op_name)?;
-
-    let sm = ctx.dnn.sm_version();
-    let template = ElementwiseTemplate::new(ew_op, PtxType::F32, sm);
-    let kernel_name = template.kernel_name();
-
-    let ptx = template
-        .generate()
-        .map_err(|e| CudaDispatchError::Ptx(e.to_string()))?;
-
-    let module = Arc::new(Module::from_ptx(&ptx).map_err(CudaDispatchError::Driver)?);
-    let kernel = Kernel::from_module(module, &kernel_name).map_err(CudaDispatchError::Driver)?;
+    let kernel = kernel_for(ctx, binary_op_for(op_name)?)?;
 
     let n = a.len();
-    let mut d_a: DeviceBuffer<f32> = DeviceBuffer::alloc(n)?;
-    d_a.copy_from_host(a)?;
-    let mut d_b: DeviceBuffer<f32> = DeviceBuffer::alloc(n)?;
-    d_b.copy_from_host(b)?;
-    let d_output: DeviceBuffer<f32> = DeviceBuffer::alloc(n)?;
-
-    let grid = grid_size_for(n as u32, BLOCK_SIZE);
-    let params = LaunchParams::new(Dim3::from(grid), Dim3::from(BLOCK_SIZE));
+    let Ok(n_u32) = u32::try_from(n) else {
+        return Err(CudaDispatchError::Shape {
+            op: "binary_elementwise",
+            msg: format!("{n} elements exceed a u32 kernel launch"),
+        });
+    };
 
     let stream = ctx.dnn.stream();
+    let mut d_a = ctx.scratch(n)?;
+    d_a.upload(a, stream)?;
+    let mut d_b = ctx.scratch(n)?;
+    d_b.upload(b, stream)?;
+    let mut d_output = ctx.scratch(n)?;
+
+    let grid = grid_size_for(n_u32, BLOCK_SIZE);
+    let params = LaunchParams::new(Dim3::from(grid), Dim3::from(BLOCK_SIZE));
     let args = (
-        d_a.as_device_ptr(),
-        d_b.as_device_ptr(),
-        d_output.as_device_ptr(),
-        n as u32,
+        d_a.device_ptr(),
+        d_b.device_ptr(),
+        d_output.device_ptr(),
+        n_u32,
     );
     kernel
         .launch(&params, stream, &args)
         .map_err(CudaDispatchError::Driver)?;
 
-    stream.synchronize().map_err(CudaDispatchError::Driver)?;
-
     let mut out = vec![0.0_f32; n];
-    d_output.copy_to_host(&mut out)?;
+    d_output.download(&mut out, stream)?;
+    stream.synchronize().map_err(CudaDispatchError::Driver)?;
+    d_a.retire();
+    d_b.retire();
+    d_output.retire();
     Ok(out)
 }

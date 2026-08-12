@@ -335,10 +335,14 @@ pub fn select_accelerator(op: &OpKind) -> Option<ProviderKind> {
 /// still shipped a `[1, 4]` bias-add across PCIe.
 ///
 /// `Auto` also consults each backend's **own** op-support predicate rather than
-/// the wgpu-flavoured [`is_gpu_capable`].  That matters: `is_gpu_capable` claims
-/// `Conv`, but `oxionnx_cuda::is_supported_op` correctly reports `false` for it
-/// (there is no CUDA convolution kernel), so `Auto` no longer routes convolutions
-/// to CUDA only to have them bounce straight back to the CPU.
+/// the wgpu-flavoured [`is_gpu_capable`].  That matters because the op sets
+/// genuinely differ: `is_gpu_capable` claims `ReduceMean`, but
+/// `oxionnx_cuda::is_supported_op` reports `false` for it (the CUDA reduce arm
+/// covers `ReduceSum`/`ReduceMax` only), so `Auto` does not route a `ReduceMean`
+/// to CUDA only to have it bounce straight back to the CPU.  (`Conv` used to be
+/// the example here; CUDA now has a real convolution kernel — `oxionnx_cuda`
+/// dispatches it directly to `oxicuda-dnn`'s `Conv1x1` / `DepthwiseConv` /
+/// `ImplicitGemmConv` engines — so `Auto` routes convolutions to CUDA.)
 ///
 /// # Availability
 ///
@@ -613,34 +617,78 @@ mod tests {
         }
     }
 
-    /// `Auto` must consult the **backend's own** predicate, not `is_gpu_capable`.
+    /// CUDA now has a real `Conv` kernel, so `Auto` must route convolutions to
+    /// it — CUDA being the highest-priority accelerator.
     ///
-    /// `oxionnx_cuda::is_supported_op(Conv) == false` — `conv::cuda_conv` always
-    /// returns `Ok(None)`.  So `Auto` must never route a `Conv` to CUDA, no matter
-    /// which other accelerators are compiled in.  DirectML and wgpu both *do* have a
-    /// Conv kernel, and DirectML outranks wgpu, so it is the one that claims Conv when
-    /// present.
+    /// This test asserted the exact opposite until `oxionnx_cuda::cuda_conv`
+    /// gained a working implementation (direct dispatch to `oxicuda-dnn`'s
+    /// `Conv1x1` / `DepthwiseConv` / `ImplicitGemmConv` engines) and
+    /// `oxionnx_cuda::is_supported_op` was flipped to advertise it. It is kept,
+    /// inverted rather than deleted, because the placement decision it pins is
+    /// the one that matters most for the convolution-dominated models this
+    /// engine actually runs (SCRFD, ArcFace, InSwapper): if this silently goes
+    /// back to `DirectMl`/`Gpu`/`Cpu` on a CUDA host, every convolution in
+    /// every graph has stopped being CUDA-accelerated.
     #[cfg(feature = "cuda")]
     #[test]
-    fn auto_never_routes_conv_to_cuda() {
+    fn auto_routes_conv_to_cuda() {
         let placement = OpPlacement::Auto {
             gpu_threshold_bytes: 0,
         };
-        let got = decide_placement(&OpKind::Conv, 1 << 20, &placement);
+        assert_eq!(
+            decide_placement(&OpKind::Conv, 1 << 20, &placement),
+            ProviderKind::Cuda,
+            "CUDA has a Conv kernel and is the highest-priority accelerator; a Conv must be \
+             placed there rather than on DirectML/wgpu/CPU",
+        );
+    }
+
+    /// `Auto` must consult the **backend's own** predicate, not `is_gpu_capable`.
+    ///
+    /// `ReduceMean` is the exemplar: `oxionnx_cuda::is_supported_op` excludes it
+    /// (the CUDA reduce arm covers `ReduceSum`/`ReduceMax` only) while
+    /// `is_gpu_capable` — the *wgpu* op set — includes it. Routing on
+    /// `is_gpu_capable` would therefore hand a `ReduceMean` to CUDA for it to
+    /// bounce straight back with `Ok(None)`, one wasted upload/dispatch/readback
+    /// per node. DirectML *does* implement it (`DML_REDUCE_FUNCTION_AVERAGE`)
+    /// and outranks wgpu, so it is the one that claims it when present.
+    ///
+    /// (`Conv` was this test's original exemplar, back when CUDA had no
+    /// convolution kernel. It no longer distinguishes the two predicates — CUDA
+    /// implements it now, see `auto_routes_conv_to_cuda` above — so the check
+    /// moved to an op where the two predicates still genuinely disagree, rather
+    /// than being dropped along with the stale example.)
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn auto_consults_the_backends_own_predicate_not_is_gpu_capable() {
+        assert!(
+            is_gpu_capable(&OpKind::ReduceMean),
+            "this test needs an op wgpu claims but CUDA does not; wgpu no longer claims \
+             ReduceMean, so pick a different exemplar",
+        );
+        assert!(
+            !oxionnx_cuda::is_supported_op(&OpKind::ReduceMean),
+            "this test needs an op wgpu claims but CUDA does not; CUDA now claims ReduceMean, \
+             so pick a different exemplar",
+        );
+
+        let placement = OpPlacement::Auto {
+            gpu_threshold_bytes: 0,
+        };
+        let got = decide_placement(&OpKind::ReduceMean, 1 << 20, &placement);
         assert_ne!(
             got,
             ProviderKind::Cuda,
-            "CUDA has no Conv kernel; routing Conv there guarantees a wasted round trip",
+            "CUDA has no ReduceMean kernel; routing it there guarantees a wasted round trip",
         );
 
-        // DirectML has a Conv kernel (`DML_CONVOLUTION`) and outranks wgpu, so it
-        // claims Conv whenever it is compiled in.
+        // DirectML has one and outranks wgpu, so it claims the node when compiled in.
         #[cfg(feature = "directml")]
         assert_eq!(got, ProviderKind::DirectMl);
-        // With DirectML off but wgpu on, wgpu's Conv kernel takes the node.
+        // With DirectML off but wgpu on, wgpu's kernel takes the node.
         #[cfg(all(feature = "gpu", not(feature = "directml")))]
         assert_eq!(got, ProviderKind::Gpu);
-        // With neither wgpu nor DirectML, Conv has nowhere to go but the CPU.
+        // With neither wgpu nor DirectML, it has nowhere to go but the CPU.
         #[cfg(all(not(feature = "gpu"), not(feature = "directml")))]
         assert_eq!(got, ProviderKind::Cpu);
     }
@@ -785,8 +833,17 @@ mod tests {
         assert!(provider_supports_op(ProviderKind::Cuda, &OpKind::MatMul));
         assert!(provider_supports_op(ProviderKind::Cuda, &OpKind::Add));
         assert!(provider_supports_op(ProviderKind::Cuda, &OpKind::Softmax));
-        // The whole point: CUDA has no Conv kernel, unlike wgpu.
-        assert!(!provider_supports_op(ProviderKind::Cuda, &OpKind::Conv));
+        // `oxionnx_cuda::conv::cuda_conv` dispatches straight to oxicuda-dnn's
+        // Conv1x1 / DepthwiseConv / ImplicitGemmConv engines, so CUDA claims
+        // Conv alongside wgpu and DirectML.
+        assert!(provider_supports_op(ProviderKind::Cuda, &OpKind::Conv));
+        // The whole point of delegating rather than reusing `is_gpu_capable`:
+        // this is the CUDA crate's *own* op set, and it really is narrower —
+        // `ReduceMean` and `Reshape` are both wgpu-capable, neither is CUDA-capable.
+        assert!(!provider_supports_op(
+            ProviderKind::Cuda,
+            &OpKind::ReduceMean
+        ));
         assert!(!provider_supports_op(ProviderKind::Cuda, &OpKind::Reshape));
     }
 

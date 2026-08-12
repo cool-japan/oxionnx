@@ -824,3 +824,141 @@ authoritative source — see there for full detail).
       measured) and cuts a warm three-model load from ~4.34s to ~0.14s (M3); output extraction
       (`array_read.rs`'s `CopyPlan`) fused into a single pass, 2.7x faster on SCRFD's padded
       outputs
+
+## 21. `oxionnx-cuda` GEMM/Reduce cross-stream readback race (2026-08-12) — COMPLETE
+
+Investigation into Linux+NVIDIA underperformance vs. `oxiface`'s CoreML path traced a real
+"CUDA MatMul returns wrong numbers" bug, reproduced on-device (RTX A4000, sm_86) before fixing:
+`matmul::cuda_matmul` (`M=1,K=25088,N=512`: 439/512 elements wrong; `64x64x64` all-ones:
+3456/4096 wrong — every one reading back `0.0` instead of the correct value).
+
+- **Root cause:** `oxicuda_dnn::DnnHandle` deliberately gives its internal `BlasHandle` its own
+  CUDA stream (so BLAS and DNN launches can overlap), but `matmul.rs` and `reduce.rs` dispatched
+  through `ctx.dnn.blas()` and then synchronized `ctx.dnn.stream()` — the *other*, empty stream —
+  before reading results back. Every `oxicuda-driver` stream is `CU_STREAM_NON_BLOCKING`, so
+  the host could read `C` back before the BLAS-stream kernel had finished. `reduce.rs` carried a
+  comment asserting `reduce_axis` "launches on the same stream `ctx.dnn` owns" — false; corrected.
+- **Fix:** new `oxicuda_dnn::handle::DnnHandle::synchronize_all()` (waits for both streams,
+  documented with the full rationale); `matmul.rs`/`reduce.rs` now call it instead of
+  `ctx.dnn.stream().synchronize()`.
+- **Companion fix (upstream, `oxicuda-blas`):** the same investigation found `GemmDispatcher`
+  severely under-provisions skinny/small-`M` GEMM launches (ArcFace/InSwapper's dominant
+  `1x512`-ish shapes capped at ~512 threads on a device that can schedule ~70k) — a real
+  ~17.6x-measured perf bug, though *not* the source of the wrong-numbers report above (that
+  kernel's grid-stride loop covers every element correctly regardless of grid size; verified
+  on-device before concluding this). Fixed via a genuine two-pass split-K launch. Full writeup:
+  `oxicuda`'s `TODO.md`, "GEMM skinny/small-M occupancy + cross-stream readback race".
+- **New coverage:** `oxionnx-cuda/tests/matmul_shape_sweep_gpu.rs` — the exact repro shapes above
+  plus an M-sweep, element-for-element against `reference::ref_matmul`, through `cuda_matmul` end
+  to end (fails against the pre-fix code with the exact wrong-element counts quoted above, passes
+  after); `oxicuda-dnn`'s `gpu_tests/handle_sync.rs`.
+- Dev-only against the local `oxicuda` checkout (`[patch.crates-io]` path patch in this
+  workspace's `Cargo.toml`) — not yet published.
+
+## 22. `oxionnx-cuda` on-device regression-test audit for §21 (2026-08-12) — COMPLETE
+
+Follow-up task: confirm §21's fixes (GEMM/reduce cross-stream race, cross-thread `CudaContext`
+affinity) actually have thorough, real, on-device regression coverage through this crate's own
+public dispatch, and that the coverage is consistently organised/gated — not just that a test
+file exists somewhere.
+
+- **Real gating bug found and fixed:** `tests/matmul_shape_sweep_gpu.rs` (added by §21) had no
+  `required-features` gate, unlike every other on-device suite in this crate
+  (`#[cfg(feature = "gpu-tests")]` in `src/lib.rs`/`src/conv.rs`). Confirmed on this machine: a
+  bare `cargo test -p oxionnx-cuda` — no feature flag, no `OXIONNX_CUDA` env var — silently ran
+  3 real on-device tests against the RTX A4000, contradicting this crate's own documented
+  contract ("default `cargo test`/CI never touches a GPU", `context` module docs). Fixed with
+  `required-features = ["gpu-tests"]` `[[test]]` entries in `Cargo.toml` for both on-device
+  integration-test files; `matmul_shape_sweep_gpu.rs`'s no-device behaviour also aligned from a
+  quiet runtime skip to the crate's dominant `.expect()`-and-fail convention (a `gpu-tests`-gated
+  run with no GPU is a misconfigured invocation, matching `lib.rs`/`conv.rs`'s existing rule).
+- **New coverage — cross-thread, third dispatch path:** `lib.rs`'s cross-thread suite
+  (`build_context_on_a_thread_that_then_exits`) covered MatMul (BLAS/GEMM handle) and Relu
+  (direct PTX-kernel launch); added `conv_dispatch_succeeds_from_a_different_thread_than_construction`
+  covering `conv::cuda_conv`'s `oxicuda_dnn` engine-dispatch path (a third, distinct kernel-launch
+  mechanism `activate_context` must also cover), a hand-verified 1x1-with-bias case through
+  `try_cuda_dispatch` end to end.
+- **New file — live shadow-verification wiring:** `tests/verify_path_gpu.rs`, gated the same way,
+  self-validating (fails loudly, not silently, if run without `OXIONNX_CUDA_VERIFY=1` actually
+  live — see `require_verify_enabled`). One test per `verify_or_fallback` call site in
+  `try_cuda_dispatch` (MatMul, binary-elementwise, reduce, unary-elementwise, Softmax, and —
+  once the sibling ref-conv task landed mid-session and wired `Conv` into the same gate — Conv
+  too), each checked independently against the matching `reference::ref_*` oracle from outside
+  `try_cuda_dispatch`, not just trusting its internal agreement. No dedicated file previously
+  ran with `OXIONNX_CUDA_VERIFY=1` live and checked per-arm; the only prior coverage was
+  incidental (the MatMul/Relu cross-thread tests happen to route through the same gate).
+- **Verified for real, repeatedly, on this machine's RTX A4000:** `OXIONNX_CUDA=1
+  OXIONNX_CUDA_VERIFY=1 cargo test -p oxionnx-cuda --features gpu-tests` — 110 lib tests + 3
+  (`matmul_shape_sweep_gpu`) + 6 (`verify_path_gpu`, after the sibling Conv case landed) + 1
+  doc-test, all green, across 7+ consecutive full runs (including once under
+  `OXIONNX_CUDA_STRICT=1`, and a `cargo fmt --check`/`cargo clippy -D warnings` pass). One
+  transient failure was observed mid-session (`ref_conv_adds_bias_once_per_output_channel` and,
+  cascading from it via the newly-landed `verify_or_fallback("Conv", ...)` wiring, the new Conv
+  cross-thread test) while the sibling ref-conv task's bias handling was mid-edit in the shared
+  working tree; both settled to consistently green immediately after and stayed green over many
+  subsequent reruns — not a bug in §21's fixes or in this task's own additions.
+- Same dev-only `[patch.crates-io]` wiring as §21 — not yet published.
+
+## 23. `oxionnx-cuda`: `Conv` advertised as CUDA-supported (2026-08-12) — COMPLETE
+
+The final wiring step of the Linux/NVIDIA investigation's CUDA-convolution track: with
+`conv::cuda_conv` implemented (direct dispatch to `oxicuda-dnn`'s three validated forward
+engines) and `reference::ref_conv` wired into the `Conv` arm's `verify_or_fallback` by the two
+sibling tasks, `is_supported_op` was flipped to claim `OpKind::Conv`. Until this landed the
+predicate was a hard `false`, so `oxionnx::execution_providers::decide_placement` never routed a
+convolution to CUDA and the working implementation was unreachable from production inference —
+only from direct `try_cuda_dispatch`/`cuda_conv` calls, i.e. from tests.
+
+- **The flip:** `OpKind::Conv` added to `is_supported_op`'s `matches!`; its doc-comment table row
+  changed from **no** to **yes** with the direct-dispatch note (`Conv1x1` / `DepthwiseConv` /
+  `ImplicitGemmConv`, never `conv_forward`'s Winograd-capable auto-selector); the doctest example
+  inverted; asymmetric `pads` named in "Necessary, not sufficient" as the per-node decline that
+  survives the op-kind claim.
+- **Self-consistency tests re-pinned:** `claimable_ops()` gained `Conv` (arity 25 → 26);
+  `oracle_covers_every_op_the_unary_binary_and_reduce_dispatch_arms_claim` renamed to
+  `oracle_covers_every_op_try_cuda_dispatch_can_claim` and given a `CONV_OPS` family with its own
+  `ref_conv`-based check. `ref_conv` takes no `OpKind` and returns a plain `Vec<f32>`, so the
+  `.is_some()` probe the unary/binary/reduce families use does not apply; instead the branch runs
+  the oracle on a hand-computed problem (`1*1 + 2*10 + 3*100 + 4*1000 + bias 5 = 4326`, decade-
+  separated so a dropped bias, a transposed filter, or a zeroed stub each land on a visibly
+  different number).
+- **Contradicted tests replaced, not deleted:** `conv::tests::conv_is_not_advertised_as_supported`
+  → `conv_is_advertised_as_supported`; `lib.rs`'s `conv_has_an_arm_but_is_not_claimable` →
+  `conv_is_advertised_as_supported`. Four *downstream* tests in the `oxionnx` crate itself also
+  asserted the old behaviour and went red on the flip — `execution_providers::auto_never_routes_
+  conv_to_cuda`, `provider_supports_op_cuda_delegates_to_the_cuda_crate`,
+  `session::run::sequential::auto_never_gates_conv_to_cuda`,
+  `session::run::parallel::conv_is_never_planned_onto_cuda` — each inverted to assert that CUDA
+  now claims/heads the chain for `Conv`. Their original point (placement consults each backend's
+  *own* predicate, not the wgpu-flavoured `is_gpu_capable`) was preserved by moving the exemplar
+  from `Conv` to `ReduceMean`, where the two predicates still genuinely disagree.
+- **New on-device coverage:** `conv_claimed_by_the_pre_filter_is_actually_dispatched` walks the
+  full production sequence (`is_supported_op` → `try_cuda_dispatch` → `reference::ref_conv`
+  comparison) on the oxiface workhorse shape (3x3, stride 1, pad 1, bias, multi-channel →
+  `ImplicitGemmConv`); `advertised_conv_still_declines_the_configurations_it_cannot_compute`
+  pins the other half of the contract — asymmetric `pads` must come back `Ok(None)`, never a
+  tensor computed for padding the model did not ask for.
+- **Falsifiability checked, not assumed** (this codebase's catalogued failure mode is tests that
+  pass without testing anything): reverting only the `matches!` line makes 7 tests fail
+  (2 × `conv_is_advertised_as_supported`, `is_supported_op_matches_dispatch_arms`, both new
+  on-device tests, `conv_verify_path_agrees_live_on_real_hardware`, the doctest); making the
+  decline-test's `pads` symmetric makes it fail (so the decline is attributable to the asymmetry,
+  not to something incidental about the node); gutting `ref_conv`'s bias makes the new oracle
+  branch fail with `left: [4321.0], right: [4326.0]`.
+- **Stale docs corrected:** `conv.rs`'s "Why `Conv` is still not advertised" section replaced with
+  "Advertised as CUDA-supported"; its stale `tests/conv_verify_gpu.rs` path (a file that never
+  existed) corrected to `tests/verify_path_gpu.rs`; `verify_path_gpu.rs`'s module docs no longer
+  claim the `Conv` arm is unreachable from placement, and its Conv test now *asserts* the
+  predicate rather than describing it. `oxionnx-cuda/README.md`'s "Conv — not accelerated …
+  `oxicuda-dnn`'s convolution engines have stubbed GEMM phases" row rewritten (that verdict on
+  `oxicuda-dnn` no longer holds), 25 → 26 ops, and the 0.1.5 history paragraph marked as history.
+  Root `README.md`'s "Conv still stubbed and not advertised" corrected — per-crate *test counts*
+  there deliberately left alone, since they are release figures the footnote sums to a total and
+  publishing is out of scope for this session.
+- **Verified on this machine's RTX A4000** (sm_86, driver 550.144.03): `OXIONNX_CUDA=1
+  OXIONNX_CUDA_VERIFY=1 cargo test -p oxionnx-cuda --features gpu-tests` — 112 lib + 3
+  (`matmul_shape_sweep_gpu`) + 6 (`verify_path_gpu`) + 1 doc-test, all green; plain
+  `cargo test -p oxionnx-cuda` 101 + 1 green; `cargo test -p oxionnx --features cuda` all green
+  (493 lib + every integration binary); `cargo fmt --check` and `cargo clippy --all-targets`
+  clean on both crates; `cargo check --workspace` green in the downstream `oxiface` tree.
+- Same dev-only `[patch.crates-io]` wiring as §21/§22 — not yet published.
