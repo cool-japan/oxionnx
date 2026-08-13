@@ -4,7 +4,7 @@ use crate::context::GpuContext;
 
 use super::common::{
     block_on_gpu, checked_storage_bytes, plan_dispatch, read_back_and_recycle_async, ErrorScope,
-    TransposeParams, TRANSPOSE_GPU_THRESHOLD, WG_SIZE,
+    TransposeParams, WG_SIZE,
 };
 
 // ========================================================================
@@ -52,7 +52,7 @@ pub async fn gpu_transpose_async(
     if total == 0 || input.len() < total {
         return None;
     }
-    if total < TRANSPOSE_GPU_THRESHOLD {
+    if total < ctx.tuning().transpose_min_elements {
         return None;
     }
     // Strides and the flat index are `u32` in the kernel.

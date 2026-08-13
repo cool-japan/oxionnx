@@ -4,7 +4,7 @@ use crate::context::GpuContext;
 
 use super::common::{
     block_on_gpu, checked_storage_bytes, plan_dispatch, read_back_and_recycle_async, DispatchGrid,
-    ErrorScope, ReduceParams, REDUCE_GPU_THRESHOLD, WG_SIZE,
+    ErrorScope, ReduceParams, WG_SIZE,
 };
 
 // ========================================================================
@@ -47,7 +47,7 @@ fn reduce_plan(
     }
     let (outer, axis_len, inner) = reduction_dims(shape, axis)?;
     let out_count = outer.checked_mul(inner)?;
-    if out_count < REDUCE_GPU_THRESHOLD {
+    if out_count < ctx.tuning().reduce_min_output_elements {
         return None;
     }
     let total_in = out_count.checked_mul(axis_len)?;

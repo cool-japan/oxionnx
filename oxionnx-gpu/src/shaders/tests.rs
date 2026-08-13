@@ -7,6 +7,28 @@ use crate::shaders::{
     gpu_reduce_mean, gpu_relu, gpu_sigmoid, gpu_softmax, gpu_transpose, ConvActivation,
 };
 
+/// A context whose *placement* floors are lifted, for the kernel tests below.
+///
+/// Every guard that protects correctness — device limits, the memory budget,
+/// dispatch planning, the degraded flag — stays exactly as it is; only the
+/// "is this dispatch worth making" floors are zeroed
+/// (`crate::context::tuning::GpuTuning::PARITY`).
+///
+/// Without this, these tests would pass by *skipping*. Their shapes are chosen
+/// small enough to check by hand, and the real floors are measured: on a native
+/// discrete GPU the memory-bound kernels decline at every transferring size
+/// (they lose to their CPU counterparts by 1.8x-45x), and the reduction and
+/// transpose floors are in the millions of elements. Each test's
+/// `None => return` would then fire on every run, on every machine, and report
+/// green — the exact false-green shape `w3_gpu_kernel_parity.rs` was written to
+/// eliminate. The floors themselves are covered there and in
+/// `tests/p1_dispatch_gating.rs`.
+fn kernel_ctx() -> Option<GpuContext> {
+    let mut ctx = GpuContext::try_new()?;
+    ctx.set_tuning(crate::context::tuning::GpuTuning::PARITY);
+    Some(ctx)
+}
+
 /// After a dispatch, the only device memory this crate still holds is what the
 /// pool deliberately retains — every operand, params and staging buffer has
 /// been destroyed and its bytes released.
@@ -19,10 +41,7 @@ use crate::shaders::{
 /// budget declines on, and it is the same code on both targets.
 #[test]
 fn a_dispatch_leaves_only_pooled_bytes_live() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
     assert_eq!(ctx.live_gpu_bytes(), 0, "a fresh context owns nothing");
 
     // Comfortably over `EW_GPU_THRESHOLD` so the kernel does not decline.
@@ -59,10 +78,7 @@ fn a_dispatch_leaves_only_pooled_bytes_live() {
 /// CPU and the context stays perfectly usable afterwards.
 #[test]
 fn an_exhausted_budget_declines_instead_of_allocating() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
     let data = vec![0.5f32; 200_000];
     if gpu_relu(&ctx, &data).is_none() {
         return; // No dispatch on this device at all; nothing to compare against.
@@ -117,10 +133,7 @@ fn test_gpu_buffer_pool_basic() {
 
 #[test]
 fn test_gpu_buffer_pool_reuse() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     let mut pool = GpuBufferPool::new(16);
     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
@@ -346,10 +359,7 @@ async fn tiny_limited_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 
 #[test]
 fn test_gpu_softmax() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // Shape: [2, 2000] — last dim > 1000 so GPU should accept.
     let rows = 2usize;
@@ -382,10 +392,7 @@ fn test_gpu_softmax() {
 
 #[test]
 fn test_gpu_relu() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     let len = 200_000;
     let data: Vec<f32> = (0..len)
@@ -410,10 +417,7 @@ fn test_gpu_relu() {
 
 #[test]
 fn test_gpu_sigmoid() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     let len = 200_000;
     let data: Vec<f32> = (0..len).map(|i| (i as f32 - 100_000.0) * 0.0001).collect();
@@ -436,10 +440,7 @@ fn test_gpu_sigmoid() {
 
 #[test]
 fn test_gpu_gelu() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     let len = 200_000;
     let data: Vec<f32> = (0..len).map(|i| (i as f32 - 100_000.0) * 0.00005).collect();
@@ -470,10 +471,7 @@ fn test_gpu_gelu() {
 
 #[test]
 fn test_gpu_layer_norm() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // [batch=250, n_elements=256] — 64000 > threshold
     let batch = 250usize;
@@ -512,10 +510,7 @@ fn test_gpu_layer_norm() {
 
 #[test]
 fn test_gpu_batch_norm() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // [N=10, C=2, H=50, W=50] → 50000 elements
     let (nn, c, h, w) = (10, 2, 50, 50);
@@ -553,10 +548,7 @@ fn test_gpu_batch_norm() {
 
 #[test]
 fn test_gpu_transpose() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // [200, 256] → [256, 200] — 51200 > threshold
     let (rows, cols) = (200usize, 256usize);
@@ -587,10 +579,7 @@ fn test_gpu_transpose() {
 
 #[test]
 fn test_gpu_reduce_mean() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // [100000, 3] axis=1 → output [100000] (output >= 50000)
     let (d0, d1) = (100_000usize, 3usize);
@@ -637,10 +626,7 @@ fn test_gpu_reduce_mean() {
 /// `shaders::purge_thread_local_caches_for`.
 #[test]
 fn dropping_a_context_purges_this_threads_pipeline_caches() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
     let device = ctx.device.clone();
 
     // Populate as many of the five caches as this adapter allows.

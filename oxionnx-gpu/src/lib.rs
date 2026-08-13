@@ -55,7 +55,8 @@ pub use compute::{
     gpu_matmul_tiled_async,
 };
 pub use context::{
-    skips_size_threshold, DeviceTensor, GpuBufferPool, GpuContext, GpuMemoryBudget, GpuOutput,
+    skips_size_threshold, DeviceTensor, GemmWeightTraffic, GpuBufferPool, GpuContext,
+    GpuInitDiagnostic, GpuInitError, GpuMemoryBudget, GpuOutput, GpuPerfClass, GpuTuning,
     OutputPlacement, ResidentCounters, TensorSource, TrackedBuffer, WeightBytes, WeightFormat,
     WeightKeys, DEFAULT_LIVE_BYTE_BUDGET, DEFAULT_POOL_BYTE_BUDGET,
 };

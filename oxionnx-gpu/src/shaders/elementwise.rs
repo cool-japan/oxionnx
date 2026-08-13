@@ -9,7 +9,7 @@ use crate::context::GpuContext;
 
 use super::common::{
     block_on_gpu, checked_storage_bytes, finish_output_async, plan_dispatch, ErrorScope, EwParams,
-    BINARY_EW_GPU_THRESHOLD, EW_GPU_THRESHOLD, WG_SIZE,
+    WG_SIZE,
 };
 
 /// LeakyRelu slope used when the caller does not supply one (ONNX default).
@@ -38,7 +38,9 @@ pub(super) async fn gpu_elementwise_placed(
     // The size gate answers "is a round trip cheaper than the CPU kernel?",
     // which is not the question being asked once an operand is on the device.
     // See `context::activation::skips_size_threshold`.
-    if (len < EW_GPU_THRESHOLD && !skips_size_threshold(&[input])) || ctx.is_degraded() {
+    if (len < ctx.tuning().elementwise_min_elements && !skips_size_threshold(&[input]))
+        || ctx.is_degraded()
+    {
         return None;
     }
 
@@ -333,7 +335,7 @@ pub(super) async fn gpu_binary_elementwise_placed(
     if len != b.len() || ctx.is_degraded() {
         return None;
     }
-    if len < BINARY_EW_GPU_THRESHOLD && !skips_size_threshold(&[a, b]) {
+    if len < ctx.tuning().binary_elementwise_min_elements && !skips_size_threshold(&[a, b]) {
         return None;
     }
 

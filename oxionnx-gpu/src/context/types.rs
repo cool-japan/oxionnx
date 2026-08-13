@@ -10,8 +10,10 @@ use super::functions::{
     ELEMENTWISE_SHADER, LAYER_NORM_SHADER, MATMUL_SHADER, REDUCE_SHADER, SOFTMAX_SHADER,
     TILED_MATMUL_SHADER, TRANSPOSE_SHADER,
 };
+use super::init_error::{GpuInitDiagnostic, GpuInitError};
 use super::resident::{Lookup, OperandBuffer, ResidentBuffers, ResidentCounters};
 use super::tracker_pool::{GpuBufferPool, DEFAULT_POOL_BYTE_BUDGET};
+use super::tuning::{GpuPerfClass, GpuTuning};
 use super::weight_format::{F16Compute, WeightBytes, WeightFormat};
 use crate::device_guard::GpuLimits;
 
@@ -88,6 +90,10 @@ pub struct GpuContext {
     /// half-precision path, and whether this device can at all. Off by default
     /// — see [`Self::set_f16_compute`].
     f16_compute: F16Compute,
+    /// The size and shape floors every kernel in this crate declines below,
+    /// derived once from this adapter's own [`wgpu::AdapterInfo`]. See
+    /// [`super::tuning`] for why these are not compile-time constants.
+    tuning: GpuTuning,
 }
 
 impl GpuContext {
@@ -158,8 +164,39 @@ impl GpuContext {
         }
     }
 
+    /// Async GPU context creation that **explains** its failure.
+    ///
+    /// [`Self::try_new_async`] is this with the explanation discarded. Prefer
+    /// this one anywhere the answer reaches a human: the most common reason a
+    /// Linux server with a perfectly good GPU produces `None` is a missing
+    /// Vulkan loader package, and that is not something an operator can guess
+    /// from a bare `None`. See [`crate::context::init_error`].
+    pub async fn try_new_diagnosed_async() -> Result<Self, GpuInitError> {
+        Self::acquire_device_diagnosed().await
+    }
+
+    /// Blocking form of [`Self::try_new_diagnosed_async`].
+    ///
+    /// Returns [`GpuInitError::BlockingUnavailable`] on wasm32, for the same
+    /// reason [`Self::try_new`] returns `None` there.
+    pub fn try_new_diagnosed() -> Result<Self, GpuInitError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on(Self::try_new_diagnosed_async())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(GpuInitError::BlockingUnavailable)
+        }
+    }
+
     /// Request an adapter and device, then build the context.
     async fn acquire_device() -> Option<Self> {
+        Self::acquire_device_diagnosed().await.ok()
+    }
+
+    /// The real constructor — see [`Self::try_new_diagnosed_async`].
+    async fn acquire_device_diagnosed() -> Result<Self, GpuInitError> {
         let backends = Self::requested_backends();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
@@ -169,14 +206,28 @@ impl GpuContext {
             display: None,
         });
 
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
             .await
-            .ok()?;
+        {
+            Ok(adapter) => adapter,
+            Err(_) => {
+                // Nothing on the requested backends. Before answering "no GPU",
+                // ask every *other* backend whether it can see one: a GPU that
+                // OpenGL reports and Vulkan does not is a missing Vulkan
+                // loader, not missing hardware, and that distinction is the
+                // difference between "install one package" and "get a
+                // different machine". Only reached on the failure path.
+                return Err(GpuInitError::NoAdapter {
+                    backends: format!("{backends:?}"),
+                    diagnostic: GpuInitDiagnostic::probe(backends).await,
+                });
+            }
+        };
 
         // [w2-f16] Ask for half-precision shader support *only where the adapter
         // already reports it*. Intersecting rather than naming the feature
@@ -228,9 +279,20 @@ impl GpuContext {
                 break;
             }
         }
-        let (device, queue) = device_queue?;
+        let info = adapter.get_info();
+        let Some((device, queue)) = device_queue else {
+            return Err(GpuInitError::NoDevice {
+                adapter: format!("{} ({:?})", info.name, info.backend),
+            });
+        };
 
-        Self::build_from_device_queue(device, queue)
+        let mut ctx =
+            Self::build_from_device_queue(device, queue).ok_or(GpuInitError::PipelineBuild)?;
+        // The adapter's own classification, which `build_from_device_queue`
+        // cannot know: it is `pub` and takes an already-acquired device, with no
+        // `AdapterInfo` attached. See `super::tuning` for what it selects.
+        ctx.set_tuning(GpuTuning::from_adapter_info(&info));
+        Ok(ctx)
     }
 
     /// True once the device has reported an unrecoverable error.
@@ -790,7 +852,49 @@ impl GpuContext {
             // The device's own feature set is the only answer correct for every
             // entry path.
             f16_compute: F16Compute::new(device_features.contains(wgpu::Features::SHADER_F16)),
+            // No `AdapterInfo` reaches this constructor — it is `pub` and takes
+            // an already-acquired device/queue pair — so the caller's device
+            // gets the `Unknown` class. `acquire_device` overwrites this with
+            // the real classification immediately afterwards, and any other
+            // caller can do the same through `set_tuning`.
+            tuning: GpuTuning::default(),
         })
+    }
+
+    /// The size and shape floors this context's kernels decline below.
+    ///
+    /// Every `gpu_*` entry point reads its threshold from here rather than from
+    /// a compile-time constant; see [`super::tuning`] for what each field means
+    /// and how the numbers were arrived at.
+    #[inline]
+    #[must_use]
+    pub fn tuning(&self) -> &GpuTuning {
+        &self.tuning
+    }
+
+    /// Which performance class this context's adapter was classified as.
+    #[inline]
+    #[must_use]
+    pub fn perf_class(&self) -> GpuPerfClass {
+        self.tuning.class
+    }
+
+    /// Replace this context's dispatch thresholds wholesale.
+    ///
+    /// Two callers are expected, and no others:
+    ///
+    /// * an embedder that has measured its own target and wants to say so, and
+    /// * a *kernel* test, which wants the numerics of one shader exercised at a
+    ///   size a real workload would decline. Installing [`GpuTuning::PARITY`]
+    ///   separates "does this kernel compute the right values" from "is this
+    ///   dispatch worth making", which is the whole reason the second question
+    ///   moved out of the shader modules and into [`GpuTuning`].
+    ///
+    /// `&mut self` deliberately: the thresholds are read on every dispatch, so
+    /// they must stay a plain field rather than becoming a lock or an atomic.
+    /// Configure the context before sharing it.
+    pub fn set_tuning(&mut self, tuning: GpuTuning) {
+        self.tuning = tuning;
     }
 }
 
