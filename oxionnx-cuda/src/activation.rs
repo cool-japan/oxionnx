@@ -188,19 +188,22 @@ impl CudaDeviceTensor {
     /// session memoizes the result into its run state, so a value read for one
     /// CPU consumer is not read again for the next.
     ///
+    /// Routed through [`DeviceCaches::staged_download`](crate::residency::DeviceCaches::staged_download)
+    /// rather than a bare `copy_to_host_async` + fence: this call was already
+    /// unconditionally blocking (the whole point of a "read-back"), so
+    /// staging the copy through pinned host memory above the module's size
+    /// floor is a pure bandwidth win with no new fence introduced — this *is*
+    /// one of the "CPU islands" the pinned-staging wave targets, not an
+    /// interior node on the fast async path.
+    ///
     /// # Errors
     ///
     /// Propagates the driver's error from the copy or the fence.
     pub fn read_back(&self, ctx: &CudaContext) -> Result<Tensor, CudaDispatchError> {
         let stream = ctx.dnn.stream();
-        let mut host = vec![0.0_f32; self.len];
-        // SAFETY: a non-owning view of exactly `self.len` elements over an
-        // allocation `from_owned` proved holds at least that many. Built by
-        // `from_raw`, so its drop does not free the allocation.
-        let view = unsafe { DeviceBuffer::<f32>::from_raw(self.device_ptr(), self.len) };
-        view.copy_to_host_async(&mut host, stream)?;
-        ctx.sync_stream(stream)?;
-        ctx.caches.note_download(self.len);
+        let host = ctx
+            .caches
+            .staged_download(self.device_ptr(), self.len, stream)?;
         Ok(Tensor::new(host, self.shape.clone()))
     }
 }
@@ -411,9 +414,16 @@ pub(crate) fn finish_output(
         }
     }
 
-    let mut out = vec![0.0_f32; out_len];
-    d_output.download(&mut out, stream)?;
-    ctx.sync_stream(stream)?;
+    // Staged rather than a bare `download` + fence: a `Host`-placement
+    // dispatch was already going to block here regardless (the caller asked
+    // for numbers, not a device handle), so routing the copy through pinned
+    // host memory above the module's size floor is a bandwidth win with no
+    // new host/device rendezvous — see `residency`'s "pinned staging"
+    // section for why this is one of the two call sites that gets it and
+    // `PooledBuffer::upload`/`download` deliberately do not.
+    let out = ctx
+        .caches
+        .staged_download(d_output.device_ptr(), out_len, stream)?;
     d_output.retire();
     Ok(KernelOutput::Host(out))
 }

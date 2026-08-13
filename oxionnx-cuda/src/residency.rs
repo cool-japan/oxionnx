@@ -76,7 +76,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use oxicuda_driver::{ffi::CUdeviceptr, Stream};
-use oxicuda_memory::DeviceBuffer;
+use oxicuda_memory::{DeviceBuffer, StagingBuffer};
 
 use crate::error::CudaDispatchError;
 
@@ -180,6 +180,18 @@ pub struct CacheCounters {
     /// Activation buffers returned to the scratch pool by the session's
     /// activation map.
     pub activation_recycles: u64,
+    /// Bytes of a host→device transfer that went through the pinned staging
+    /// buffer (see the "pinned staging" section below) rather than the
+    /// ordinary pageable path.
+    ///
+    /// A subset of [`Self::host_to_device_bytes`], not an addition to it:
+    /// every staged upload still bumps that counter too, so "how many bytes
+    /// crossed the bus" never depends on which path carried them.
+    pub staged_upload_bytes: u64,
+    /// Bytes of a device→host transfer that went through the pinned staging
+    /// buffer. A subset of [`Self::device_to_host_bytes`], for the same
+    /// reason as [`Self::staged_upload_bytes`].
+    pub staged_download_bytes: u64,
 }
 
 impl CacheCounters {
@@ -212,6 +224,12 @@ impl CacheCounters {
             activation_recycles: self
                 .activation_recycles
                 .saturating_sub(earlier.activation_recycles),
+            staged_upload_bytes: self
+                .staged_upload_bytes
+                .saturating_sub(earlier.staged_upload_bytes),
+            staged_download_bytes: self
+                .staged_download_bytes
+                .saturating_sub(earlier.staged_download_bytes),
         }
     }
 
@@ -238,6 +256,8 @@ struct Counters {
     resident_activation_binds: AtomicU64,
     device_handoffs: AtomicU64,
     activation_recycles: AtomicU64,
+    staged_upload_bytes: AtomicU64,
+    staged_download_bytes: AtomicU64,
 }
 
 impl Counters {
@@ -255,6 +275,8 @@ impl Counters {
             resident_activation_binds: self.resident_activation_binds.load(Ordering::Relaxed),
             device_handoffs: self.device_handoffs.load(Ordering::Relaxed),
             activation_recycles: self.activation_recycles.load(Ordering::Relaxed),
+            staged_upload_bytes: self.staged_upload_bytes.load(Ordering::Relaxed),
+            staged_download_bytes: self.staged_download_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -392,8 +414,10 @@ impl DevicePool {
 ///   necessary — a descriptor built from the buffer's capacity would describe
 ///   a matrix the caller never wrote.
 /// * **The tail is stale.** It holds a previous dispatch's numbers. Reading
-///   it back would be silent, plausible-looking garbage, which is why
-///   [`Self::download`] refuses to copy more than the logical length.
+///   it back would be silent, plausible-looking garbage, which is why every
+///   read-back path in this crate (see [`crate::residency`]'s "pinned
+///   staging" section) is built from the logical length, never the
+///   allocation's capacity.
 ///
 /// # A borrow is only recycled once its stream work is known to be done
 ///
@@ -501,43 +525,6 @@ impl PooledBuffer<'_> {
             .counters
             .host_to_device_bytes
             .fetch_add(byte_len(data), Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Read the logical range back into `out` from `stream`.
-    ///
-    /// Enqueues the copy on `stream` (so it is ordered after the kernel that
-    /// produced the data) and does **not** wait: the caller synchronises once,
-    /// after issuing every readback it needs, rather than once per buffer.
-    ///
-    /// # Errors
-    ///
-    /// [`CudaDispatchError::Shape`] if `out` is longer than the logical
-    /// length, or the driver's error from the copy.
-    pub(crate) fn download(
-        &mut self,
-        out: &mut [f32],
-        stream: &Stream,
-    ) -> Result<(), CudaDispatchError> {
-        if out.len() > self.len {
-            return Err(CudaDispatchError::Shape {
-                op: "device_pool",
-                msg: format!(
-                    "readback of {} elements from a borrow of {}",
-                    out.len(),
-                    self.len
-                ),
-            });
-        }
-        // SAFETY: as in `upload` — a non-owning view of exactly `out.len()`
-        // elements, which is within this borrow's logical length.
-        let view = unsafe { DeviceBuffer::<f32>::from_raw(self.device_ptr(), out.len()) };
-        self.in_flight = true;
-        view.copy_to_host_async(out, stream)?;
-        self.pool
-            .counters
-            .device_to_host_bytes
-            .fetch_add(byte_len(out), Ordering::Relaxed);
         Ok(())
     }
 
@@ -815,9 +802,11 @@ impl ResidentWeights {
     /// # Errors
     ///
     /// Propagates allocation and upload failures.
+    #[allow(clippy::too_many_arguments)]
     fn acquire<'p>(
         &self,
         pool: &'p DevicePool,
+        staging: &Mutex<StagingBuffer>,
         id: Option<WeightId<'_>>,
         label: &'static str,
         data: &[f32],
@@ -871,7 +860,17 @@ impl ResidentWeights {
             return Ok(Operand::Pooled(self.transient(pool, data, stream)?));
         }
         let mut buffer = DeviceBuffer::<f32>::alloc(data.len())?;
-        buffer.copy_from_host_async(data, stream)?;
+        // A resident weight is uploaded **at most once per session** — this
+        // branch is a cache *miss*, and every subsequent frame hits the fast
+        // path above and never reaches here again. That makes it the one
+        // upload in this crate where paying `StagingBuffer`'s blocking
+        // `stream.synchronize()` (see [`stage_or_async_upload`]) costs
+        // nothing in steady state: there is no "next frame" for this call to
+        // slow down. What it buys in return is real for the operands that
+        // matter here — ArcFace's 49 MiB embedding head, InSwapper's 4 MiB
+        // AdaIN projections — where pinned bandwidth (measured ~25.8 GB/s on
+        // this box) roughly doubles the pageable path's ~9.7 GB/s.
+        stage_or_async_upload(staging, &self.counters, &mut buffer, data, stream)?;
         let shared = Arc::new(buffer);
 
         self.counters.weight_misses.fetch_add(1, Ordering::Relaxed);
@@ -881,7 +880,9 @@ impl ResidentWeights {
         // This copy does not go through `PooledBuffer::upload` (a resident
         // allocation is exact-sized and never pooled), so the bus counter has
         // to be bumped here or a session's first frame would under-report its
-        // uploads by the whole weight set.
+        // uploads by the whole weight set. `stage_or_async_upload` already
+        // counted it as staged (or not); this is the *total* crossed-the-bus
+        // counter, which every upload -- staged or pageable -- must add to.
         self.counters
             .host_to_device_bytes
             .fetch_add(byte_len(data), Ordering::Relaxed);
@@ -995,7 +996,133 @@ impl ResidentWeights {
 
 /// `data`'s size in bytes, as a `u64` for the counters.
 fn byte_len(data: &[f32]) -> u64 {
-    (data.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64)
+    byte_len_usize(data.len())
+}
+
+/// `len` `f32` elements' size in bytes, as a `u64` for the counters.
+fn byte_len_usize(len: usize) -> u64 {
+    (len as u64).saturating_mul(std::mem::size_of::<f32>() as u64)
+}
+
+// ─── pinned staging ─────────────────────────────────────────────────────────
+//
+// `oxicuda_dnn::DnnHandle` already owns a `StagingBuffer` (`handle.rs:358-531`
+// at the time this was written), but every entry point that reaches it takes
+// `&mut self` — unusable from here, since every dispatch in this crate holds
+// only `&CudaContext`. `DeviceCaches` gets its own, guarded by a `Mutex` so it
+// is reachable through the same `&self` every other cache method already
+// uses (see the module docs' "Thread safety" section: a lock here is
+// released before any driver call that could block *except* the staged
+// transfer itself, which cannot be split that way — see the note on
+// contention in [`stage_or_async_upload`]).
+//
+// # Why `upload_with`/`download_into`, never `upload`/`download`
+//
+// `oxicuda_memory::StagingBuffer` offers two shapes of staged transfer (see
+// its own module docs for the measured table): the convenience wrappers
+// `upload`/`download`, which `memcpy` between the caller's ordinary slice and
+// the pinned buffer and therefore *auto-select* — silently falling back to
+// the driver's plain pageable path above
+// [`DEFAULT_AUTO_STAGE_MAX_BYTES`](oxicuda_memory::DEFAULT_AUTO_STAGE_MAX_BYTES)
+// (512 KiB), because that extra host copy loses to the driver's own pipelined
+// staging past roughly that size — and `upload_with`/`download_into`, which
+// write into (or read out of) the pinned buffer directly with **no**
+// intermediate copy and are measured to win at every size the crate's own
+// table covers (150 KiB-4.7 MiB, 1.55x-2.67x). This module always uses the
+// latter pair and enforces its own floor below, which runs in the *opposite*
+// sense from that 512 KiB auto-select: the direct pair has no upper bound
+// where it stops paying off, so [`STAGING_MIN_BYTES`] exists only to skip the
+// `Mutex` lock and the reused-allocation bookkeeping for a transfer too small
+// for either to matter (a handful of floats — a bias vector, a scalar) has no
+// business contending for the one pinned allocation this context holds.
+//
+// # Where this is (and is not) wired in
+//
+// Two call sites, both already-blocking boundaries where staging is a pure
+// win with no new fence introduced:
+//
+// * [`ResidentWeights::acquire`]'s "first sighting" branch (see its own
+//   comment) — a weight uploads *once* per session, so paying
+//   `StagingBuffer`'s internal `stream.synchronize()` there costs nothing in
+//   steady state.
+// * [`DeviceCaches::staged_download`], used by [`crate::activation::finish_output`]'s
+//   `Host`-placement branch and by [`crate::activation::CudaDeviceTensor::read_back`]
+//   — the two places a device-resident value crosses back to the host, both
+//   of which already ended in a blocking `stream.synchronize()` before this
+//   existed.
+//
+// Deliberately **not** wired into [`PooledBuffer::upload`] (there is no
+// `PooledBuffer::download` any more: [`DeviceCaches::staged_download`]
+// replaced its one call site in [`crate::activation::finish_output`]
+// outright rather than sitting beside it) or [`ResidentWeights::transient`]:
+// those are the steady-state, per-frame,
+// *asynchronous* path residency exists to keep fence-free (see
+// `PooledBuffer::upload`'s own "Stream ordering is the whole point"). Every
+// call to `StagingBuffer::upload_with`/`download_into` is synchronous by
+// construction — inserting one into that path would trade a bandwidth win for
+// a fence that was not there before, undoing exactly the property residency
+// was built to get.
+
+/// Bytes at or above which a host↔device copy is routed through the pinned
+/// staging buffer. See the section above for why the sense is the opposite of
+/// [`oxicuda_memory::DEFAULT_AUTO_STAGE_MAX_BYTES`], which this reuses only as
+/// a familiar, already-calibrated constant, not because the two thresholds
+/// answer the same question.
+const STAGING_MIN_BYTES: usize = oxicuda_memory::DEFAULT_AUTO_STAGE_MAX_BYTES;
+
+/// Upload `data` into `dst`, staging through pinned memory above
+/// [`STAGING_MIN_BYTES`] and falling back to the ordinary asynchronous
+/// pageable path below it (or if the staging lock is poisoned — a
+/// correctness-preserving degradation, exactly as every other lock in this
+/// module degrades).
+///
+/// # Contention is accepted, not overlooked
+///
+/// Locking the *whole* transfer (not just the free-list bookkeeping the
+/// scratch pool's lock covers) is unlike every other lock in this module, and
+/// is forced by `StagingBuffer` owning a single reused pinned allocation: two
+/// threads writing into it concurrently would corrupt each other's bytes, so
+/// the lock has to cover fill-and-copy, not just a pointer swap. Callers of
+/// this function are, by construction, on a *first-sighting* upload path that
+/// runs once per weight per session — see [`ResidentWeights::acquire`] — so
+/// contention here would mean two sessions' first frames racing to cache
+/// their *own* distinct weights at the same instant, not a steady-state cost.
+///
+/// # Errors
+/// Propagates the driver's allocation/copy error.
+fn stage_or_async_upload(
+    staging: &Mutex<StagingBuffer>,
+    counters: &Counters,
+    dst: &mut DeviceBuffer<f32>,
+    data: &[f32],
+    stream: &Stream,
+) -> Result<(), CudaDispatchError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let bytes = byte_len(data);
+    if (bytes as usize) < STAGING_MIN_BYTES {
+        dst.copy_from_host_async(data, stream)?;
+        return Ok(());
+    }
+    let Ok(mut guard) = staging.lock() else {
+        dst.copy_from_host_async(data, stream)?;
+        return Ok(());
+    };
+    guard
+        .upload_with(dst, data.len(), stream, |pinned| {
+            pinned.copy_from_slice(data)
+        })
+        .map_err(CudaDispatchError::Driver)?;
+    counters
+        .staged_upload_bytes
+        .fetch_add(bytes, Ordering::Relaxed);
+    // `upload_with` performs its own blocking `stream.synchronize()` (see the
+    // module docs above) -- counted here so `CacheCounters::stream_syncs`
+    // stays a true count of every host/device rendezvous this context pays,
+    // not just the ones taken through `CudaContext::sync_stream`.
+    counters.stream_syncs.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 // ─── the pair, as one object ───────────────────────────────────────────────
@@ -1005,17 +1132,24 @@ fn byte_len(data: &[f32]) -> u64 {
 pub(crate) struct DeviceCaches {
     pool: DevicePool,
     weights: ResidentWeights,
+    /// Pinned host staging for the irreducible host↔device boundaries. See
+    /// the "pinned staging" section above [`byte_len`] for what uses this and
+    /// what deliberately does not.
+    staging: Mutex<StagingBuffer>,
     counters: Arc<Counters>,
 }
 
 impl DeviceCaches {
     /// Empty caches. No device memory is touched until the first
-    /// [`Self::scratch`] or [`Self::operand`] call.
+    /// [`Self::scratch`] or [`Self::operand`] call, and no host memory is
+    /// pinned until the first transfer big enough to stage (see
+    /// [`STAGING_MIN_BYTES`]).
     pub(crate) fn new() -> Self {
         let counters = Arc::new(Counters::default());
         Self {
             pool: DevicePool::new(Arc::clone(&counters)),
             weights: ResidentWeights::new(Arc::clone(&counters)),
+            staging: Mutex::new(StagingBuffer::new()),
             counters,
         }
     }
@@ -1042,7 +1176,8 @@ impl DeviceCaches {
         data: &[f32],
         stream: &Stream,
     ) -> Result<Operand<'_>, CudaDispatchError> {
-        self.weights.acquire(&self.pool, id, label, data, stream)
+        self.weights
+            .acquire(&self.pool, &self.staging, id, label, data, stream)
     }
 
     /// A device copy the cache already holds for `id`, if any — resolved
@@ -1084,11 +1219,6 @@ impl DeviceCaches {
         self.pool.release(buffer);
     }
 
-    /// Count a blocking fence taken on a dispatch path.
-    pub(crate) fn note_sync(&self) {
-        self.counters.stream_syncs.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Count an operand bound straight from a device-resident activation.
     pub(crate) fn note_resident_bind(&self) {
         self.counters
@@ -1103,13 +1233,69 @@ impl DeviceCaches {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a device → host copy issued outside a [`PooledBuffer`] — the
-    /// read-back of a resident activation for a CPU consumer.
-    pub(crate) fn note_download(&self, elements: usize) {
-        self.counters.device_to_host_bytes.fetch_add(
-            (elements as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
-            Ordering::Relaxed,
-        );
+    /// Read `len` elements back from `ptr` into a fresh host `Vec`, staging
+    /// through pinned memory above [`STAGING_MIN_BYTES`] and blocking either
+    /// way — a self-contained enqueue-copy-and-fence, not an addition to one
+    /// that was going to happen anyway.
+    ///
+    /// `ptr`/`len` describe an allocation the caller guarantees holds at
+    /// least `len` elements (a [`PooledBuffer`]'s backing allocation, or a
+    /// [`crate::CudaDeviceTensor`]'s) — mirrored from the same non-owning
+    /// `DeviceBuffer::from_raw` pattern [`crate::CudaDeviceTensor::read_back`]
+    /// uses to build its own view, since this function's whole job is to be
+    /// the shared implementation [`crate::activation::finish_output`] and
+    /// `read_back` both route through.
+    ///
+    /// # Errors
+    /// Propagates the driver's copy/synchronise error.
+    pub(crate) fn staged_download(
+        &self,
+        ptr: CUdeviceptr,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<Vec<f32>, CudaDispatchError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: `ptr`/`len` describe an allocation the caller (both call
+        // sites are inside this crate) guarantees is valid for at least `len`
+        // `f32` elements; this view never outlives the function and is never
+        // used to free the allocation (`from_raw` views are non-owning).
+        let view = unsafe { DeviceBuffer::<f32>::from_raw(ptr, len) };
+        let bytes = byte_len_usize(len);
+
+        // Plain pageable path: below the staging floor, or the staging lock
+        // is poisoned (degrade to correctness, not a panic -- same policy as
+        // every other lock in this module).
+        let pageable_path = |view: &DeviceBuffer<f32>| -> Result<Vec<f32>, CudaDispatchError> {
+            let mut out = vec![0.0_f32; len];
+            view.copy_to_host_async(&mut out, stream)?;
+            stream.synchronize().map_err(CudaDispatchError::Driver)?;
+            self.counters.stream_syncs.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .device_to_host_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            Ok(out)
+        };
+
+        if (bytes as usize) < STAGING_MIN_BYTES {
+            return pageable_path(&view);
+        }
+        let Ok(mut staging) = self.staging.lock() else {
+            return pageable_path(&view);
+        };
+        let pinned = staging
+            .download_into(&view, len, stream)
+            .map_err(CudaDispatchError::Driver)?;
+        let out = pinned.to_vec();
+        self.counters.stream_syncs.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .device_to_host_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.counters
+            .staged_download_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        Ok(out)
     }
 
     /// Whether `name` is resident in any form.
@@ -1291,4 +1477,61 @@ mod tests {
         assert!(!caches.is_resident("anything"));
         assert_eq!(caches.clear(), 0);
     }
+
+    // ── pinned staging ──────────────────────────────────────────────────────
+
+    #[test]
+    fn staging_construction_pins_no_host_memory_up_front() {
+        // `StagingBuffer::new()` must not allocate until the first transfer
+        // sizes it -- otherwise every `CudaContext`, including ones that
+        // never dispatch a large enough op to stage anything, would pay a
+        // `cuMemAllocHost_v2` at construction.
+        let staging = StagingBuffer::new();
+        assert_eq!(staging.capacity(), 0);
+    }
+
+    #[test]
+    fn staging_min_bytes_matches_the_reused_auto_stage_constant() {
+        // Documented as a deliberate reuse of an already-calibrated number,
+        // not a coincidence -- pin the equality so a future edit to either
+        // constant is forced to make the reuse a conscious decision.
+        assert_eq!(
+            STAGING_MIN_BYTES,
+            oxicuda_memory::DEFAULT_AUTO_STAGE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn byte_len_and_byte_len_usize_agree() {
+        let data = vec![0.0_f32; 37];
+        assert_eq!(byte_len(&data), byte_len_usize(37));
+        assert_eq!(byte_len_usize(37), 37 * 4);
+    }
+
+    #[test]
+    fn counter_deltas_carry_the_staged_transfer_fields() {
+        // The same discipline as `counter_deltas_are_saturating_rather_than_wrapping`
+        // above, extended to the two fields this wave added -- a `since()`
+        // that forgot to list them would silently always report zero staged
+        // traffic no matter how much staging actually happened.
+        let earlier = CacheCounters {
+            staged_upload_bytes: 1000,
+            staged_download_bytes: 2000,
+            ..CacheCounters::default()
+        };
+        let later = CacheCounters {
+            staged_upload_bytes: 1500,
+            staged_download_bytes: 2000,
+            ..CacheCounters::default()
+        };
+        let delta = later.since(earlier);
+        assert_eq!(delta.staged_upload_bytes, 500);
+        assert_eq!(delta.staged_download_bytes, 0);
+    }
+
+    // `staged_download`'s `len == 0` fast path (returns before touching the
+    // driver or the staging lock at all) has no safe way to exercise from a
+    // host-only unit test -- every real `Stream` talks to a live CUDA
+    // context. It is covered on real hardware instead, alongside every other
+    // on-device behaviour in this module, by the `gpu-tests` suite.
 }

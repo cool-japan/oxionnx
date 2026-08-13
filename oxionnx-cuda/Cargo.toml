@@ -104,6 +104,15 @@ name = "graph_cache_gpu"
 path = "tests/graph_cache_gpu.rs"
 required-features = ["gpu-tests"]
 
+# Data-movement CUDA op wave (MaxPool/AveragePool/Resize/Pad/Slice/Concat,
+# plus the Reshape-family residency alias): one `verify_or_fallback`-path test
+# per new dispatch arm, mirroring `verify_path_gpu`'s discipline. Same
+# `required-features` reasoning as every target above.
+[[test]]
+name = "data_ops_verify_path_gpu"
+path = "tests/data_ops_verify_path_gpu.rs"
+required-features = ["gpu-tests"]
+
 # Steady-state per-call dispatch cost on a real device. Carries
 # `required-features` for exactly the reason the test targets above do: it
 # allocates GPU memory and launches real kernels the moment it runs, so a host

@@ -385,21 +385,6 @@ impl CudaContext {
         self.dnn.streams_unified()
     }
 
-    /// Block until `stream`'s queued work has completed, counting the fence.
-    ///
-    /// Every blocking rendezvous on a dispatch path goes through here, so
-    /// [`CacheCounters::stream_syncs`] is a measurement rather than an
-    /// estimate — which is what makes "237 fences per frame became 3" a
-    /// checkable claim instead of a story.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the driver's error from the synchronise.
-    pub(crate) fn sync_stream(&self, stream: &Stream) -> Result<(), CudaDispatchError> {
-        self.caches.note_sync();
-        stream.synchronize().map_err(CudaDispatchError::Driver)
-    }
-
     /// Give a finished activation's allocation back to the scratch pool.
     ///
     /// Called by the session's activation map once a resident value's last

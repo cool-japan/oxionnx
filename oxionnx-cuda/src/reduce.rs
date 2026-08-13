@@ -12,8 +12,24 @@
 //! (`oxicuda_ptx::templates::reduction::ReductionTemplate`, a single-block
 //! kernel with exactly one element read per thread and no accumulation
 //! loop) was limited to.
+//!
+//! [`cuda_reduce_mean_bound`] extends the same machinery to `ReduceMean`:
+//! [`ReductionOp::Sum`] over a *range* of one or more contiguous axes (see
+//! [`resolve_contiguous_axes`] — the ONNX `axes=[2,3]` shape InSwapper's
+//! un-fused `InstanceNorm` decomposition emits, exactly as much generality as
+//! that real pattern needs and no more), followed by an in-place device-side
+//! divide by `axis_len` so the whole op — sum, then scale — never leaves the
+//! GPU. The scale step reuses `oxicuda_ptx::templates::elementwise`'s
+//! existing `Scale` kernel (`b[i] = alpha * a[i]`, `alpha` a genuine runtime
+//! parameter, not baked in like `LeakyRelu`'s) rather than adding a new one.
 
 use oxicuda_blas::reduction::{reduce_axis, ReductionOp};
+use oxicuda_driver::ffi::CUdeviceptr;
+use oxicuda_launch::{grid_size_for, Dim3, Kernel, LaunchParams};
+use oxicuda_ptx::{
+    ir::PtxType,
+    templates::elementwise::{ElementwiseOp, ElementwiseTemplate},
+};
 
 use crate::activation::{
     finish_output, retire_queued, CudaOutputPlacement, InputBinding, KernelOutput,
@@ -25,30 +41,91 @@ use crate::error::CudaDispatchError;
 /// always an activation, so this only ever tags a transient pooled upload.
 const INPUT_LABEL: &str = "reduce_in";
 
-/// Decompose `shape` around `axis` into `(outer, axis_len, inner)`, and
-/// decide whether this is a configuration [`cuda_reduce`] will attempt (as
+/// Threads per block for the post-sum scale kernel `cuda_reduce_mean_bound`
+/// launches.
+const SCALE_BLOCK_SIZE: u32 = 256;
+
+/// Decompose `shape` around a single `axis` into `(outer, axis_len, inner)`.
+/// A thin wrapper over [`reduce_plan_range`] with `start == end == axis`; see
+/// its docs for the decline rules.
+fn reduce_plan(shape: &[usize], axis: usize) -> Option<(usize, usize, usize)> {
+    reduce_plan_range(shape, axis, axis)
+}
+
+/// Decompose `shape` around the contiguous axis range `[start, end]`
+/// (inclusive both ends) into `(outer, axis_len, inner)`, and decide whether
+/// this is a configuration the CUDA reduction machinery will attempt (as
 /// opposed to declining to the CPU).
+///
+/// `axis_len` is the *product* of every dimension in `start..=end` — the
+/// generalisation [`cuda_reduce_mean_bound`] needs to reduce ONNX's
+/// `axes=[2,3]` (InstanceNorm's un-fused spatial mean) in one launch, exactly
+/// as if the two trailing dimensions had been flattened into one before the
+/// call. Row-major contiguity is what makes that legal: `outer` covers every
+/// dimension strictly before `start`, `inner` every dimension strictly after
+/// `end`, and nothing in between is skipped.
 ///
 /// Pure and allocation-free, so the axis/shape bookkeeping is unit-testable
 /// without a CUDA device — unlike the GPU launch itself, which cannot be
 /// exercised on a host with no CUDA device.
 ///
 /// Declines (`None`) when:
-/// - `axis` is out of range for `shape` (a malformed model).
+/// - `end` is out of range for `shape`, or `start > end` (a malformed model
+///   or a caller bug in the range resolved by [`resolve_contiguous_axes`]).
 /// - The reduction would touch zero elements (`outer`, `axis_len`, or
 ///   `inner` is `0`): a degenerate edge case left to the CPU kernel's
 ///   identity-element handling rather than special-cased here.
-fn reduce_plan(shape: &[usize], axis: usize) -> Option<(usize, usize, usize)> {
-    if axis >= shape.len() {
+fn reduce_plan_range(shape: &[usize], start: usize, end: usize) -> Option<(usize, usize, usize)> {
+    if end >= shape.len() || start > end {
         return None;
     }
-    let outer: usize = shape[..axis].iter().product();
-    let axis_len = shape[axis];
-    let inner: usize = shape[axis + 1..].iter().product();
+    let outer: usize = shape[..start].iter().product();
+    let axis_len: usize = shape[start..=end].iter().product();
+    let inner: usize = shape[end + 1..].iter().product();
     if outer == 0 || axis_len == 0 || inner == 0 {
         return None;
     }
     Some((outer, axis_len, inner))
+}
+
+/// Resolve an ONNX `axes` attribute list (as `ReduceMean`'s node carries it —
+/// see `lib.rs`'s `OpKind::ReduceMean` arm) against `rank`, and check that it
+/// names a single *contiguous* run of axes once negative indices are
+/// resolved and duplicates removed.
+///
+/// Returns `(start, end)` inclusive, suitable for [`reduce_plan_range`].
+/// `None` — decline to the CPU kernel, which has no such restriction —
+/// covers every case this narrow CUDA path does not model: an empty `axes`
+/// list (ONNX's "reduce every axis", or `noop_with_empty_axes`, neither of
+/// which this function can express as one contiguous range in general), an
+/// out-of-range or duplicate-free-but-non-contiguous axis set (e.g. `[0,
+/// 2]` on a rank-4 tensor, skipping axis `1`), or an axis outside `[-rank,
+/// rank)`.
+///
+/// Pure and allocation-free, so unit-testable without a CUDA device.
+#[must_use]
+pub(crate) fn resolve_contiguous_axes(rank: usize, raw_axes: &[i64]) -> Option<(usize, usize)> {
+    if raw_axes.is_empty() {
+        return None;
+    }
+    let mut resolved: Vec<usize> = Vec::with_capacity(raw_axes.len());
+    for &raw in raw_axes {
+        let r = if raw < 0 { raw + rank as i64 } else { raw };
+        if r < 0 || r as usize >= rank {
+            return None;
+        }
+        resolved.push(r as usize);
+    }
+    resolved.sort_unstable();
+    resolved.dedup();
+    for pair in resolved.windows(2) {
+        if pair[1] != pair[0] + 1 {
+            return None;
+        }
+    }
+    let start = *resolved.first()?;
+    let end = *resolved.last()?;
+    Some((start, end))
 }
 
 /// GPU reduction for a single axis.
@@ -174,6 +251,136 @@ pub(crate) fn cuda_reduce_bound(
     Ok(Some(out))
 }
 
+/// Fetch — compiling on first use — the `Scale` kernel (`b[i] = alpha *
+/// a[i]`) [`cuda_reduce_mean_bound`] uses for its post-sum divide.
+///
+/// `alpha` is a genuine runtime `.param` in this kernel (unlike
+/// `LeakyRelu`'s baked-in constant slope), so one compiled module serves
+/// every `axis_len` a `ReduceMean` node could ever present — no per-shape
+/// PTX regeneration, and no cache-key subtlety like
+/// `crate::norm`'s `epsilon` (which *is* baked in).
+fn scale_kernel(ctx: &CudaContext) -> Result<Kernel, CudaDispatchError> {
+    let template =
+        ElementwiseTemplate::new(ElementwiseOp::Scale, PtxType::F32, ctx.dnn.sm_version());
+    let kernel_name = template.kernel_name();
+    let module = ctx.module(&kernel_name, || {
+        template
+            .generate()
+            .map_err(|e| CudaDispatchError::Ptx(e.to_string()))
+    })?;
+    Kernel::from_module(module, &kernel_name).map_err(CudaDispatchError::Driver)
+}
+
+/// Multiply every element at `device_ptr` by `alpha`, in place, queued on
+/// `ctx.dnn.blas().stream()` (the same stream [`cuda_reduce_mean_bound`]'s
+/// `reduce_axis` call ran on) so stream order alone sequences the scale
+/// behind the sum — no fence between them.
+///
+/// In-place aliasing (`a_ptr == b_ptr`) is safe: `Scale`'s kernel gives
+/// thread `i` exactly one read of `a[i]` and one write of `b[i]`, the same
+/// discipline `elementwise::launch_unary_in_place`'s doc comment establishes
+/// for the ops it covers.
+fn launch_scale_in_place(
+    ctx: &CudaContext,
+    device_ptr: CUdeviceptr,
+    alpha: f32,
+    n: usize,
+) -> Result<(), CudaDispatchError> {
+    if n == 0 {
+        return Ok(());
+    }
+    let Ok(n_u32) = u32::try_from(n) else {
+        return Err(CudaDispatchError::Shape {
+            op: "reduce_mean_scale",
+            msg: format!("{n} elements exceed a u32 kernel launch"),
+        });
+    };
+    let kernel = scale_kernel(ctx)?;
+    let grid = grid_size_for(n_u32, SCALE_BLOCK_SIZE);
+    let params = LaunchParams::new(Dim3::from(grid), Dim3::from(SCALE_BLOCK_SIZE));
+    let args = (device_ptr, device_ptr, alpha, n_u32);
+    kernel
+        .launch(&params, ctx.dnn.blas().stream(), &args)
+        .map_err(CudaDispatchError::Driver)
+}
+
+/// GPU `ReduceMean` over one or more contiguous axes: [`ReductionOp::Sum`]
+/// via the same [`reduce_axis`] machinery [`cuda_reduce_bound`] uses,
+/// immediately followed by an in-place device-side divide by `axis_len` (see
+/// [`launch_scale_in_place`]) — so a `ReduceMean` whose result stays on the
+/// device never round-trips through the host to apply the `1/axis_len`
+/// scale.
+///
+/// `shape` is decomposed as `[outer, axis_len, inner]` around the *inclusive*
+/// axis range `[start_axis, end_axis]` (see [`reduce_plan_range`] and
+/// [`resolve_contiguous_axes`], which `lib.rs`'s `OpKind::ReduceMean` arm
+/// uses to turn an ONNX `axes` list into this range). Returns `Ok(None)` —
+/// deferring to the CPU — when the plan declines, or when a dimension
+/// doesn't fit the kernel's `u32` launch parameters.
+///
+/// # Errors
+///
+/// As [`cuda_reduce_bound`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cuda_reduce_mean_bound(
+    ctx: &CudaContext,
+    input: InputBinding<'_>,
+    shape: &[usize],
+    start_axis: usize,
+    end_axis: usize,
+    out_shape: &[usize],
+    placement: CudaOutputPlacement,
+) -> Result<Option<KernelOutput>, CudaDispatchError> {
+    let Some((outer, axis_len, inner)) = reduce_plan_range(shape, start_axis, end_axis) else {
+        return Ok(None);
+    };
+
+    let (Ok(outer_u32), Ok(axis_len_u32), Ok(inner_u32)) = (
+        u32::try_from(outer),
+        u32::try_from(axis_len),
+        u32::try_from(inner),
+    ) else {
+        return Ok(None);
+    };
+    let Some(output_len) = outer.checked_mul(inner) else {
+        return Ok(None);
+    };
+    // `axis_len` came from real (checked) shape dims and is >= 1 by
+    // `reduce_plan_range`'s own zero-guard, so this division is exact and
+    // never by zero.
+    #[allow(clippy::cast_precision_loss)]
+    let alpha = 1.0_f32 / axis_len as f32;
+
+    let stream = ctx.dnn.blas().stream();
+
+    let Some(mut d_input) = input.bind(ctx, INPUT_LABEL, input.len(), stream)? else {
+        return Ok(None);
+    };
+    let mut d_output = ctx.scratch(output_len)?;
+    d_output.zero_fill(stream)?;
+
+    reduce_axis(
+        ctx.dnn.blas(),
+        ReductionOp::Sum,
+        outer_u32,
+        axis_len_u32,
+        inner_u32,
+        d_input.buffer(),
+        d_output.buffer_mut(),
+    )
+    .map_err(|e| CudaDispatchError::Blas(e.to_string()))?;
+
+    // Same stream as the sum above: no fence between "sum" and "divide".
+    launch_scale_in_place(ctx, d_output.device_ptr(), alpha, output_len)?;
+
+    let out = finish_output(ctx, d_output, output_len, out_shape, placement, stream)?;
+    match &out {
+        KernelOutput::Host(_) => d_input.retire(),
+        KernelOutput::Device(_) => retire_queued(ctx, &mut d_input),
+    }
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +455,99 @@ mod tests {
         // live context, which is why the plan/decline logic above is
         // factored out into a pure function instead).
         let _ = CudaContext::try_new();
+    }
+
+    // ── reduce_plan_range: the multi-axis generalisation ReduceMean needs ──
+
+    #[test]
+    fn range_of_one_axis_matches_reduce_plan() {
+        assert_eq!(
+            reduce_plan_range(&[2, 3, 4], 1, 1),
+            reduce_plan(&[2, 3, 4], 1)
+        );
+    }
+
+    #[test]
+    fn range_merges_two_trailing_axes_into_one_axis_len() {
+        // The OxiInstanceNorm decomposition's `ReduceMean(axes=[2,3])` on a
+        // [N,C,H,W] tensor: outer=N*C, axis_len=H*W, inner=1.
+        assert_eq!(reduce_plan_range(&[2, 3, 4, 5], 2, 3), Some((6, 20, 1)));
+    }
+
+    #[test]
+    fn range_merges_a_leading_pair_of_axes() {
+        assert_eq!(reduce_plan_range(&[2, 3, 4, 5], 0, 1), Some((1, 6, 20)));
+    }
+
+    #[test]
+    fn range_declines_when_end_is_out_of_bounds() {
+        assert_eq!(reduce_plan_range(&[2, 3], 0, 5), None);
+    }
+
+    #[test]
+    fn range_declines_when_start_exceeds_end() {
+        assert_eq!(reduce_plan_range(&[2, 3, 4], 2, 1), None);
+    }
+
+    #[test]
+    fn range_declines_a_zero_dimension_inside_the_range() {
+        assert_eq!(reduce_plan_range(&[2, 0, 4, 5], 1, 2), None);
+    }
+
+    // ── resolve_contiguous_axes ──────────────────────────────────────────────
+
+    #[test]
+    fn resolves_a_single_positive_axis() {
+        assert_eq!(resolve_contiguous_axes(4, &[2]), Some((2, 2)));
+    }
+
+    #[test]
+    fn resolves_the_trailing_pair_instance_norm_uses() {
+        assert_eq!(resolve_contiguous_axes(4, &[2, 3]), Some((2, 3)));
+    }
+
+    #[test]
+    fn resolves_negative_axes_against_rank() {
+        // axes=[-2, -1] on a rank-4 tensor == [2, 3].
+        assert_eq!(resolve_contiguous_axes(4, &[-2, -1]), Some((2, 3)));
+    }
+
+    #[test]
+    fn resolves_out_of_order_axes_by_sorting() {
+        assert_eq!(resolve_contiguous_axes(4, &[3, 2]), Some((2, 3)));
+    }
+
+    #[test]
+    fn deduplicates_a_repeated_axis() {
+        assert_eq!(resolve_contiguous_axes(4, &[2, 2, 2]), Some((2, 2)));
+    }
+
+    #[test]
+    fn declines_an_empty_axes_list() {
+        assert_eq!(resolve_contiguous_axes(4, &[]), None);
+    }
+
+    #[test]
+    fn declines_a_non_contiguous_axis_set() {
+        // [0, 2] on a rank-4 tensor skips axis 1 -- not expressible as one
+        // [outer, axis_len, inner] range.
+        assert_eq!(resolve_contiguous_axes(4, &[0, 2]), None);
+    }
+
+    #[test]
+    fn declines_an_axis_out_of_range() {
+        assert_eq!(resolve_contiguous_axes(4, &[4]), None);
+        assert_eq!(resolve_contiguous_axes(4, &[-5]), None);
+    }
+
+    #[test]
+    fn resolves_every_axis_of_a_rank_one_tensor() {
+        assert_eq!(resolve_contiguous_axes(1, &[0]), Some((0, 0)));
+        assert_eq!(resolve_contiguous_axes(1, &[-1]), Some((0, 0)));
+    }
+
+    #[test]
+    fn resolves_all_axes_when_every_one_is_named_contiguously() {
+        assert_eq!(resolve_contiguous_axes(3, &[0, 1, 2]), Some((0, 2)));
     }
 }

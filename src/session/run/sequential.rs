@@ -1661,16 +1661,17 @@ mod tests {
     /// that is the whole point of having the kernel.
     ///
     /// The op sets still differ, which is why the gate consults each backend's
-    /// own predicate rather than the wgpu-flavoured `is_gpu_capable`:
-    /// `ReduceMean` is the surviving exemplar (wgpu and DirectML implement it,
-    /// CUDA does not), and it must *not* be gated to CUDA.  This test asserted
+    /// own predicate rather than the wgpu-flavoured `is_gpu_capable`: whichever
+    /// op `op_wgpu_claims_but_cuda_lacks` turns up must *not* be gated to CUDA.
+    /// (That exemplar is derived rather than named — `ReduceMean` was hard-coded
+    /// here until CUDA grew a kernel for it.)  This test asserted
     /// the opposite for `Conv` until CUDA gained the kernel; it is inverted
     /// rather than deleted because a silent regression here means every
     /// convolution in every graph quietly stops being CUDA-accelerated.
     #[cfg(feature = "cuda")]
     #[test]
     fn auto_gates_conv_to_cuda_but_not_an_op_cuda_lacks() {
-        use crate::execution_providers::OpPlacement;
+        use crate::execution_providers::{op_wgpu_claims_but_cuda_lacks, OpPlacement};
 
         let placement = OpPlacement::Auto {
             gpu_threshold_bytes: 0,
@@ -1679,13 +1680,19 @@ mod tests {
             accelerator_gate(ProviderKind::Cuda, &OpKind::Conv, 1 << 20, &placement),
             "CUDA has a Conv kernel; the gate must let convolutions through to it",
         );
+
+        // The op that still separates the two predicates, derived rather than
+        // named: `ReduceMean` was hard-coded here until CUDA grew
+        // `reduce::cuda_reduce_mean_bound`. See `op_wgpu_claims_but_cuda_lacks`.
+        let lacked = op_wgpu_claims_but_cuda_lacks();
         assert!(
-            !accelerator_gate(ProviderKind::Cuda, &OpKind::ReduceMean, 1 << 20, &placement),
-            "CUDA has no ReduceMean kernel; gating it there guarantees a wasted round trip",
+            !accelerator_gate(ProviderKind::Cuda, &lacked, 1 << 20, &placement),
+            "{lacked:?}: CUDA has no kernel for it; gating it there guarantees a wasted \
+             round trip",
         );
 
-        // wgpu has both, so with `gpu` also compiled in it stays in the chain
-        // for either op.
+        // wgpu claims Conv, and claims `lacked` by construction, so with `gpu`
+        // also compiled in it stays in the chain for either op.
         #[cfg(feature = "gpu")]
         {
             assert!(accelerator_gate(
@@ -1694,12 +1701,10 @@ mod tests {
                 1 << 20,
                 &placement
             ));
-            assert!(accelerator_gate(
-                ProviderKind::Gpu,
-                &OpKind::ReduceMean,
-                1 << 20,
-                &placement
-            ));
+            assert!(
+                accelerator_gate(ProviderKind::Gpu, &lacked, 1 << 20, &placement),
+                "{lacked:?}: comes from wgpu's own op set, so wgpu's gate must let it through",
+            );
         }
     }
 
@@ -1707,15 +1712,18 @@ mod tests {
     #[cfg(any(feature = "gpu", feature = "cuda", feature = "directml"))]
     #[test]
     fn auto_leaves_non_accelerable_ops_on_the_cpu() {
-        use crate::execution_providers::OpPlacement;
+        use crate::execution_providers::{ops_no_backend_implements, OpPlacement};
 
         let placement = OpPlacement::Auto {
             gpu_threshold_bytes: 0,
         };
+        // Exemplars derived, not named: `Reshape` was hard-coded here until
+        // oxionnx-cuda grew a shape-op arm. See `ops_no_backend_implements`.
+        let non_accelerable = ops_no_backend_implements();
         for accel in all_accelerators() {
-            for op in [OpKind::Reshape, OpKind::Shape, OpKind::Gather] {
+            for op in &non_accelerable {
                 assert!(
-                    !accelerator_gate(accel, &op, 1 << 24, &placement),
+                    !accelerator_gate(accel, op, 1 << 24, &placement),
                     "{accel:?}: {op:?} has no kernel there",
                 );
             }

@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::{Duration, Instant};
 
 fn node(op: OpKind, name: &str, inputs: &[&str], outputs: &[&str]) -> Node {
     Node {
@@ -152,27 +153,50 @@ fn the_future_can_be_driven_by_a_foreign_executor() {
     let waker = Waker::from(Arc::clone(&waker_state));
     let mut cx = Context::from_waker(&waker);
 
-    // Poll until ready. Whether the first poll is Pending or Ready is a race
-    // with a very fast inference, so both are accepted — what must hold is that
-    // the future terminates and that a Pending poll is always followed by a wake.
-    let mut polls = 0usize;
-    let outputs = loop {
-        polls += 1;
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(outputs) => break outputs.expect("run completes"),
-            Poll::Pending => {
-                assert!(polls < 100_000, "the future must eventually complete");
+    // Whether the first poll is Pending or Ready is a race with a very fast
+    // inference, so both are accepted.
+    let outputs = match future.as_mut().poll(&mut cx) {
+        Poll::Ready(outputs) => outputs.expect("run completes"),
+        Poll::Pending => {
+            // The property a foreign executor actually relies on: after a
+            // `Pending` poll the future wakes its task *by itself*, with nobody
+            // polling it in between. So this waits for the wake instead of
+            // re-polling, and that is what makes the check race-free rather
+            // than merely lucky.
+            //
+            // Re-polling in a loop — what this used to do — failed ~50% of runs
+            // on this machine, and the implementation was right while the test
+            // was wrong. `Shared::complete` publishes the result *under* the
+            // state lock but calls `wake()` *after* releasing it, deliberately
+            // (see its doc comment: waking under the lock deadlocks against an
+            // executor that polls synchronously from inside `wake()`). A second
+            // poll landing in that window legally observes `Ready` while the
+            // wake count is still zero, so `polls > 1 => wakes >= 1` was never
+            // a sound assertion.
+            //
+            // Waiting is sound in the other direction: reaching this branch
+            // means `poll` registered our waker under the lock *before*
+            // `complete` took it, so `complete` is guaranteed to find it and
+            // call it. A wake that never arrives is a real bug, and the
+            // deadline turns that into a failure rather than a hung suite.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while waker_state.wakes.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "a future that returned Pending must wake its task",
+                );
                 std::thread::yield_now();
+            }
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(outputs) => outputs.expect("run completes"),
+                // `complete` stores the result before it takes the waker, so a
+                // woken task polling `Pending` would mean the two had been
+                // reordered.
+                Poll::Pending => panic!("the future must be Ready once it has woken its task"),
             }
         }
     };
     assert_eq!(outputs["y"].data, vec![0.0, 0.0, 2.5]);
-    if polls > 1 {
-        assert!(
-            waker_state.wakes.load(Ordering::SeqCst) >= 1,
-            "a future that returned Pending must wake its task"
-        );
-    }
 }
 
 #[test]

@@ -35,8 +35,8 @@
 //!   self-checking about whether the env var was actually set.
 //!
 //! This file is purpose-built for the gap: one test per dispatch-arm family,
-//! every one of which fails loudly (not silently no-ops) if invoked without
-//! `OXIONNX_CUDA_VERIFY=1` actually live -- see [`require_verify_enabled`].
+//! every one of which skips loudly (not silently no-ops) if invoked without
+//! `OXIONNX_CUDA_VERIFY=1` actually live -- see [`verify_enabled_or_skip`].
 //! Every arm covered here is one `oxionnx`'s placement logic actually routes
 //! production nodes to, `Conv` included ([`oxionnx_cuda::is_supported_op`]
 //! reports `true` for it -- see the `conv` module docs' "Advertised as
@@ -87,11 +87,14 @@
 //! `conv::tests::gpu_numeric`.
 //!
 //! Note the interaction between the two gates: the device check runs
-//! *first*, so a CPU-only host skips rather than tripping
-//! [`require_verify_enabled`]'s assert. The env-var assert is deliberately
-//! still loud on a host that *does* have a GPU -- there, a missing
-//! `OXIONNX_CUDA_VERIFY=1` means the run proves nothing, which is exactly
-//! the failure mode this file exists to rule out.
+//! *first*, so a CPU-only host skips rather than reaching
+//! [`verify_enabled_or_skip`]'s check at all. A GPU host without
+//! `OXIONNX_CUDA_VERIFY=1` then *skips loudly* (eprintln naming the exact
+//! rerun command) rather than failing: a plain
+//! `cargo test --workspace --all-features` must not be red by construction
+//! on a CUDA host, but a skipped suite must never be mistakable for a
+//! passed one -- which is why the skip message spells out that nothing was
+//! proven and how to actually run the proof.
 
 use std::collections::HashMap;
 
@@ -110,9 +113,9 @@ use oxionnx_cuda::{conv, reference, try_cuda_dispatch};
 /// device is present -- each test then skips, per the OxiCUDA convention.
 /// See the module docs' "Running" section.
 ///
-/// Every test acquires this *before* calling [`require_verify_enabled`]:
+/// Every test acquires this *before* calling [`verify_enabled_or_skip`]:
 /// on a host with no GPU there is nothing for shadow verification to have
-/// verified, so "no device" must skip rather than trip the env-var assert.
+/// verified, so "no device" must skip first, without mentioning the env var.
 fn gpu_ctx() -> Option<CudaContext> {
     CudaContext::try_new_with(Activation::Enabled)
 }
@@ -124,19 +127,30 @@ fn gpu_ctx() -> Option<CudaContext> {
 /// from a real pass, which is precisely the failure mode this file exists to
 /// rule out (see the module docs).
 ///
+/// Returns `false` (after a loud, self-explanatory eprintln) instead of
+/// asserting, so that a plain `cargo test --workspace --all-features` on a
+/// CUDA host is not red by construction; each caller must `return` on
+/// `false`, mirroring the no-device skip that precedes it. The skip message
+/// carries the exact rerun command so a skipped suite cannot quietly pass
+/// for a proven one.
+///
 /// Safe to call from every test despite `reference::verify_enabled`
 /// internally caching its answer in a `OnceLock`: the env var is fixed for
 /// the lifetime of this test binary's process (set by whoever invoked
 /// `cargo test`, before this process even started), so there is no
 /// first-caller-wins race to worry about the way there would be if a test
 /// tried to *mutate* it with `std::env::set_var` instead.
-fn require_verify_enabled() {
-    assert!(
-        reference::verify_enabled(),
-        "this test file only proves anything with shadow verification live -- rerun as \
-         `OXIONNX_CUDA_VERIFY=1 cargo test -p oxionnx-cuda --features gpu-tests --test \
-         verify_path_gpu` (see this file's module docs)",
+#[must_use]
+fn verify_enabled_or_skip() -> bool {
+    if reference::verify_enabled() {
+        return true;
+    }
+    eprintln!(
+        "OXIONNX_CUDA_VERIFY is not set -- skipping: this suite only proves anything with \
+         shadow verification live. Rerun as `OXIONNX_CUDA_VERIFY=1 cargo test -p oxionnx-cuda \
+         --features gpu-tests --test verify_path_gpu` (see this file's module docs)."
     );
+    false
 }
 
 fn make_node(op: OpKind, inputs: &[&str], outputs: &[&str]) -> Node {
@@ -189,7 +203,9 @@ fn matmul_verify_path_agrees_live_on_real_hardware() {
         );
         return;
     };
-    require_verify_enabled();
+    if !verify_enabled_or_skip() {
+        return;
+    }
 
     let (m, k, n) = (5usize, 7usize, 3usize);
     let mut rng = Lcg::new(0x7E71_FADE_7457_0001);
@@ -226,7 +242,9 @@ fn add_verify_path_agrees_live_on_real_hardware() {
         eprintln!("no CUDA device present, skipping add_verify_path_agrees_live_on_real_hardware");
         return;
     };
-    require_verify_enabled();
+    if !verify_enabled_or_skip() {
+        return;
+    }
 
     let shape = vec![3usize, 4, 2];
     let elems: usize = shape.iter().product();
@@ -267,7 +285,9 @@ fn reduce_sum_verify_path_agrees_live_on_real_hardware() {
         );
         return;
     };
-    require_verify_enabled();
+    if !verify_enabled_or_skip() {
+        return;
+    }
 
     let shape = vec![4usize, 3];
     let axis = 0usize;
@@ -310,7 +330,9 @@ fn relu_verify_path_agrees_live_on_real_hardware() {
         eprintln!("no CUDA device present, skipping relu_verify_path_agrees_live_on_real_hardware");
         return;
     };
-    require_verify_enabled();
+    if !verify_enabled_or_skip() {
+        return;
+    }
 
     let mut rng = Lcg::new(0x7E71_FADE_7457_0004);
     let mut data = make_vec(&mut rng, 32, -4.0, 4.0);
@@ -354,7 +376,9 @@ fn softmax_verify_path_agrees_live_on_real_hardware() {
         );
         return;
     };
-    require_verify_enabled();
+    if !verify_enabled_or_skip() {
+        return;
+    }
 
     let shape = vec![3usize, 5];
     let mut rng = Lcg::new(0x7E71_FADE_7457_0005);
@@ -404,7 +428,9 @@ fn conv_verify_path_agrees_live_on_real_hardware() {
         eprintln!("no CUDA device present, skipping conv_verify_path_agrees_live_on_real_hardware");
         return;
     };
-    require_verify_enabled();
+    if !verify_enabled_or_skip() {
+        return;
+    }
 
     let (n, in_channels, in_h, in_w) = (1usize, 3usize, 6usize, 7usize);
     let (out_channels, filter_h, filter_w) = (4usize, 3usize, 3usize);
@@ -487,5 +513,244 @@ fn conv_verify_path_agrees_live_on_real_hardware() {
     );
     if let Err(e) = reference::compare(&outputs[0].data, &expected) {
         panic!("Conv verify-path result disagrees with the CPU oracle: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The elementwise/normalization CUDA op wave: five more `verify_or_fallback`
+// call sites (broadcast Add/Sub/Mul/Div, PRelu, BatchNormalization,
+// OxiInstanceNorm, ReduceMean), same "one test per arm, fails loudly without
+// a live OXIONNX_CUDA_VERIFY=1" discipline as the six above.
+// ---------------------------------------------------------------------------
+
+/// Binary elementwise arm's **channel-broadcast** path (`[1,C,1,1]`-vs-
+/// `[1,C,H,W]`): oracle is `reference::ref_binary_broadcast`. `Add` stands
+/// in for the family, as the plain-`Add` test above does for the exact-shape
+/// path — this is the *other* branch of the same arm.
+#[test]
+fn broadcast_add_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!(
+            "no CUDA device present, skipping broadcast_add_verify_path_agrees_live_on_real_hardware"
+        );
+        return;
+    };
+    if !verify_enabled_or_skip() {
+        return;
+    }
+
+    let full_shape = vec![1usize, 3, 2, 2];
+    let small_shape = vec![1usize, 3, 1, 1];
+    let mut rng = Lcg::new(0x7E71_FADE_7457_0007);
+    let full = make_vec(&mut rng, 12, -5.0, 5.0);
+    let small = make_vec(&mut rng, 3, -5.0, 5.0);
+
+    let mut intermediates = HashMap::new();
+    intermediates.insert(
+        "full".to_string(),
+        Tensor::new(full.clone(), full_shape.clone()),
+    );
+    let mut weights = HashMap::new();
+    weights.insert("small".to_string(), Tensor::new(small.clone(), small_shape));
+    let node = make_node(OpKind::Add, &["full", "small"], &["y"]);
+
+    let outputs = try_cuda_dispatch(&node, &weights, &intermediates, &ctx)
+        .expect("dispatch must not hard-error")
+        .expect(
+            "Add's [1,C,1,1] broadcast must still be claimed (Ok(Some(_))) with \
+             OXIONNX_CUDA_VERIFY=1 live -- an Ok(None) here means the channel-broadcast \
+             path's verify wiring is broken",
+        );
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].shape, full_shape);
+    let expected = reference::ref_binary_broadcast(&OpKind::Add, &full, &small, 3, 4, false)
+        .expect("ref_binary_broadcast has a formula for Add");
+    if let Err(e) = reference::compare(&outputs[0].data, &expected) {
+        panic!("Add broadcast verify-path result disagrees with the CPU oracle: {e}");
+    }
+}
+
+/// `PRelu` arm: oracle is `reference::ref_prelu`. Per-channel slope (length
+/// `C`), exercising `prelu_plan`'s common case ahead of the oracle call.
+#[test]
+fn prelu_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!(
+            "no CUDA device present, skipping prelu_verify_path_agrees_live_on_real_hardware"
+        );
+        return;
+    };
+    if !verify_enabled_or_skip() {
+        return;
+    }
+
+    let x_shape = vec![1usize, 3, 2, 2];
+    let mut rng = Lcg::new(0x7E71_FADE_7457_0008);
+    let x = make_vec(&mut rng, 12, -4.0, 4.0);
+    let slope = make_vec(&mut rng, 3, 0.01, 0.5);
+
+    let mut intermediates = HashMap::new();
+    intermediates.insert("x".to_string(), Tensor::new(x.clone(), x_shape.clone()));
+    let mut weights = HashMap::new();
+    weights.insert("slope".to_string(), Tensor::new(slope.clone(), vec![3]));
+    let node = make_node(OpKind::PRelu, &["x", "slope"], &["y"]);
+
+    let outputs = try_cuda_dispatch(&node, &weights, &intermediates, &ctx)
+        .expect("dispatch must not hard-error")
+        .expect(
+            "PRelu must still be claimed (Ok(Some(_))) with OXIONNX_CUDA_VERIFY=1 live -- an \
+             Ok(None) here means the PRelu arm's verify wiring is broken",
+        );
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].shape, x_shape);
+    let expected =
+        reference::ref_prelu(&x, &slope, 3, 4).expect("ref_prelu has a formula for this shape");
+    if let Err(e) = reference::compare(&outputs[0].data, &expected) {
+        panic!("PRelu verify-path result disagrees with the CPU oracle: {e}");
+    }
+}
+
+/// `BatchNormalization` (inference) arm: oracle is `reference::ref_batch_norm`.
+/// `N=2` exercises the kernel's runtime `batch_count` loop, not just a
+/// single-sample launch.
+#[test]
+fn batch_norm_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!(
+            "no CUDA device present, skipping batch_norm_verify_path_agrees_live_on_real_hardware"
+        );
+        return;
+    };
+    if !verify_enabled_or_skip() {
+        return;
+    }
+
+    let x_shape = vec![2usize, 3, 2, 2];
+    let mut rng = Lcg::new(0x7E71_FADE_7457_0009);
+    let x = make_vec(&mut rng, 24, -3.0, 3.0);
+    let scale = make_vec(&mut rng, 3, 0.5, 2.0);
+    let bias = make_vec(&mut rng, 3, -1.0, 1.0);
+    let mean = make_vec(&mut rng, 3, -1.0, 1.0);
+    let var = make_vec(&mut rng, 3, 0.1, 2.0);
+
+    let mut intermediates = HashMap::new();
+    intermediates.insert("x".to_string(), Tensor::new(x.clone(), x_shape.clone()));
+    let mut weights = HashMap::new();
+    weights.insert("scale".to_string(), Tensor::new(scale.clone(), vec![3]));
+    weights.insert("bias".to_string(), Tensor::new(bias.clone(), vec![3]));
+    weights.insert("mean".to_string(), Tensor::new(mean.clone(), vec![3]));
+    weights.insert("var".to_string(), Tensor::new(var.clone(), vec![3]));
+    let node = make_node(
+        OpKind::BatchNorm,
+        &["x", "scale", "bias", "mean", "var"],
+        &["y"],
+    );
+
+    let outputs = try_cuda_dispatch(&node, &weights, &intermediates, &ctx)
+        .expect("dispatch must not hard-error")
+        .expect(
+            "BatchNormalization must still be claimed (Ok(Some(_))) with \
+             OXIONNX_CUDA_VERIFY=1 live -- an Ok(None) here means the batch_norm arm's \
+             verify wiring is broken",
+        );
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].shape, x_shape);
+    let expected = reference::ref_batch_norm(&x, &scale, &bias, &mean, &var, 3, 4, 1.0e-5)
+        .expect("ref_batch_norm has a formula for this shape");
+    if let Err(e) = reference::compare(&outputs[0].data, &expected) {
+        panic!("BatchNormalization verify-path result disagrees with the CPU oracle: {e}");
+    }
+}
+
+/// `OxiInstanceNorm` arm: oracle is `reference::ref_oxi_instance_norm`.
+/// `C=4` exercises `cuda_oxi_instance_norm_bound`'s one-block-per-channel
+/// grid at more than a single block.
+#[test]
+fn oxi_instance_norm_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!(
+            "no CUDA device present, skipping \
+             oxi_instance_norm_verify_path_agrees_live_on_real_hardware"
+        );
+        return;
+    };
+    if !verify_enabled_or_skip() {
+        return;
+    }
+
+    let x_shape = vec![1usize, 4, 3, 3];
+    let mut rng = Lcg::new(0x7E71_FADE_7457_000A);
+    let x = make_vec(&mut rng, 36, -4.0, 4.0);
+
+    let mut intermediates = HashMap::new();
+    intermediates.insert("x".to_string(), Tensor::new(x.clone(), x_shape.clone()));
+    let weights: HashMap<String, Tensor> = HashMap::new();
+    let node = make_node(OpKind::OxiInstanceNorm, &["x"], &["y"]);
+
+    let outputs = try_cuda_dispatch(&node, &weights, &intermediates, &ctx)
+        .expect("dispatch must not hard-error")
+        .expect(
+            "OxiInstanceNorm must still be claimed (Ok(Some(_))) with OXIONNX_CUDA_VERIFY=1 \
+             live -- an Ok(None) here means the oxi_instance_norm arm's verify wiring is broken",
+        );
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].shape, x_shape);
+    let expected = reference::ref_oxi_instance_norm(&x, &x_shape, 1.0e-5)
+        .expect("ref_oxi_instance_norm has a formula for this shape");
+    if let Err(e) = reference::compare(&outputs[0].data, &expected) {
+        panic!("OxiInstanceNorm verify-path result disagrees with the CPU oracle: {e}");
+    }
+}
+
+/// `ReduceMean` arm: oracle is `reference::ref_reduce`. `axes=[2,3]` is
+/// exactly the shape InSwapper's un-fused `InstanceNorm` decomposition
+/// emits (`ReduceMean(axes=[2,3])`), exercising
+/// `resolve_contiguous_axes`/`reduce_plan_range`'s multi-axis merge ahead of
+/// the sum-then-scale dispatch.
+#[test]
+fn reduce_mean_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!(
+            "no CUDA device present, skipping reduce_mean_verify_path_agrees_live_on_real_hardware"
+        );
+        return;
+    };
+    if !verify_enabled_or_skip() {
+        return;
+    }
+
+    let x_shape = vec![1usize, 4, 3, 3];
+    let mut rng = Lcg::new(0x7E71_FADE_7457_000B);
+    let x = make_vec(&mut rng, 36, -4.0, 4.0);
+
+    let mut intermediates = HashMap::new();
+    intermediates.insert("x".to_string(), Tensor::new(x.clone(), x_shape.clone()));
+    let weights: HashMap<String, Tensor> = HashMap::new();
+    let mut node = make_node(OpKind::ReduceMean, &["x"], &["y"]);
+    node.attrs.int_lists.insert("axes".to_string(), vec![2, 3]);
+    // keepdims defaults to 1.
+
+    let outputs = try_cuda_dispatch(&node, &weights, &intermediates, &ctx)
+        .expect("dispatch must not hard-error")
+        .expect(
+            "ReduceMean(axes=[2,3]) must still be claimed (Ok(Some(_))) with \
+             OXIONNX_CUDA_VERIFY=1 live -- an Ok(None) here means either the ReduceMean arm's \
+             verify wiring is broken, or resolve_contiguous_axes unexpectedly declined a \
+             contiguous trailing pair",
+        );
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].shape, vec![1, 4, 1, 1]);
+    // outer = N*C = 4, axis_len = H*W = 9, inner = 1 -- the synthetic merged-
+    // axis view `OpKind::ReduceMean`'s dispatch arm builds (see
+    // `reference::ref_reduce`'s doc comment).
+    let expected = reference::ref_reduce(&OpKind::ReduceMean, &x, &[4, 9, 1], 1)
+        .expect("ref_reduce has a formula for ReduceMean");
+    if let Err(e) = reference::compare(&outputs[0].data, &expected) {
+        panic!("ReduceMean verify-path result disagrees with the CPU oracle: {e}");
     }
 }

@@ -255,6 +255,80 @@ fn pick_engine_prioritises_conv1x1_over_depthwise_when_both_apply() {
     assert_eq!(pick_engine(&p), ConvEngine::Conv1x1);
 }
 
+/// Rule 0: a problem big enough for the CTA-tiled implicit-GEMM kernel goes
+/// to `ImplicitGemmConv` (which dispatches to that kernel internally) even
+/// when it is an unpadded unit-stride 1x1 -- the shape rule 1 would otherwise
+/// claim.
+///
+/// This is a throughput decision with a measured basis, not a preference: on
+/// an RTX A4000 `Conv1x1` runs this shape at 480 GFLOPS and the tiled kernel
+/// at 7345 GFLOPS. It also moves the bias and any fused activation onto the
+/// device, because `Conv1x1::execute` has no bias parameter at all.
+#[test]
+fn pick_engine_prefers_the_tiled_kernel_over_conv1x1_on_a_large_pointwise() {
+    let mut p = tiny_problem([1, 1], [1, 1], [1, 1], [0, 0], 1, 256, 512);
+    p.in_dims = vec![64, 64];
+    assert!(
+        TiledConvPlan::for_problem(&p).is_some(),
+        "fixture must be one the tiling claims, or this test proves nothing"
+    );
+    assert_eq!(pick_engine(&p), ConvEngine::ImplicitGemm);
+}
+
+/// ...and a 1x1 the tiling declines still takes the `Conv1x1` path, so rule 0
+/// narrows rule 1 rather than replacing it.
+#[test]
+fn pick_engine_still_selects_conv1x1_when_the_tiling_declines() {
+    let p = tiny_problem([1, 1], [1, 1], [1, 1], [0, 0], 1, 8, 8);
+    assert!(TiledConvPlan::for_problem(&p).is_none());
+    assert_eq!(pick_engine(&p), ConvEngine::Conv1x1);
+}
+
+/// Rule 0 must never steal a depthwise problem: the tiling models
+/// `groups == 1` only, and a depthwise convolution routed to the general
+/// engine would be correct but far slower than `DepthwiseConv`.
+#[test]
+fn pick_engine_keeps_large_depthwise_on_the_depthwise_engine() {
+    let mut p = tiny_problem([3, 3], [1, 1], [1, 1], [1, 1], 512, 512, 512);
+    p.in_dims = vec![128, 128];
+    assert!(
+        TiledConvPlan::for_problem(&p).is_none(),
+        "the tiling must decline every grouped convolution"
+    );
+    assert_eq!(pick_engine(&p), ConvEngine::Depthwise);
+}
+
+/// The face pipeline's own dominant convolutions must all land on the engine
+/// that dispatches to the tiled kernel -- this is the routing the whole
+/// change exists for, asserted on the real shapes rather than on a synthetic
+/// one.
+#[test]
+fn pick_engine_routes_every_dominant_face_pipeline_conv_to_the_tiled_kernel() {
+    // (label, C_in, H, W, C_out, pad)
+    let shapes = [
+        (
+            "InSwapper resblock 1024->1024 @34x34",
+            1024u32,
+            34u32,
+            1024u32,
+            0u32,
+        ),
+        ("InSwapper decoder 1024->512 @64x64", 1024, 64, 512, 1),
+        ("InSwapper decoder 512->256 @128x128", 512, 128, 256, 1),
+        ("SCRFD 28->56 @320x320", 28, 320, 56, 1),
+        ("ArcFace 64->64 @112x112", 64, 112, 64, 1),
+    ];
+    for (label, cin, hw, cout, pad) in shapes {
+        let mut p = tiny_problem([3, 3], [1, 1], [1, 1], [pad, pad], 1, cin, cout);
+        p.in_dims = vec![hw, hw];
+        assert_eq!(
+            pick_engine(&p),
+            ConvEngine::ImplicitGemm,
+            "{label} must route to the tiled implicit-GEMM kernel"
+        );
+    }
+}
+
 // ── add_bias_nchw: pure, GPU-free ────────────────────────────────────────
 
 #[test]

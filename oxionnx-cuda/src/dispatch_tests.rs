@@ -61,16 +61,44 @@ fn claimable_ops() -> Vec<OpKind> {
         OpKind::SiLU,
         OpKind::Softplus,
         OpKind::LeakyRelu,
-        // binary arm → elementwise::cuda_binary_elementwise
+        // binary arm → elementwise::cuda_binary_elementwise (exact shape) /
+        // broadcast::cuda_broadcast_bound ([1,C,1,1] and scalar broadcast)
         OpKind::Add,
         OpKind::Sub,
         OpKind::Mul,
         OpKind::Div,
+        // `OpKind::PRelu` arm → prelu::cuda_prelu_bound
+        OpKind::PRelu,
+        // `OpKind::BatchNorm` arm (inference only) → norm::cuda_batch_norm_bound
+        OpKind::BatchNorm,
+        // `OpKind::OxiInstanceNorm` arm → norm::cuda_oxi_instance_norm_bound
+        OpKind::OxiInstanceNorm,
         // reduction arm → reduce::cuda_reduce
         OpKind::ReduceSum,
         OpKind::ReduceMax,
+        // `OpKind::ReduceMean` arm (one or more contiguous axes) →
+        // reduce::cuda_reduce_mean_bound
+        OpKind::ReduceMean,
         // softmax arm → softmax::cuda_softmax
         OpKind::Softmax,
+        // `OpKind::MaxPool | OpKind::AveragePool` arm → pool::cuda_pool_bound
+        OpKind::MaxPool,
+        OpKind::AveragePool,
+        // `OpKind::Resize` arm → resize::cuda_resize_bound
+        OpKind::Resize,
+        // `OpKind::Pad` arm → pad::cuda_pad_bound
+        OpKind::Pad,
+        // `OpKind::Unsqueeze | OpKind::Squeeze | OpKind::Reshape |
+        // OpKind::Flatten` arm → `CudaDeviceTensor::alias` (zero-cost,
+        // resident input only -- see `reshape`'s module docs).
+        OpKind::Unsqueeze,
+        OpKind::Squeeze,
+        OpKind::Reshape,
+        OpKind::Flatten,
+        // `OpKind::Slice` arm → slice::cuda_slice_bound
+        OpKind::Slice,
+        // `OpKind::Concat` arm → concat::cuda_concat_bound
+        OpKind::Concat,
         // NOTE: `OpKind::Conv` has a dispatch arm, `conv::cuda_conv` now
         // computes real answers for some shapes, and that arm's output is
         // shadow-verified against `reference::ref_conv` -- but
@@ -254,6 +282,14 @@ fn all_op_kinds() -> Vec<OpKind> {
         OpKind::Hardmax,
         OpKind::Shrink,
         OpKind::ConvAddRelu,
+        // Pre-existing gap closed alongside this wave's `OxiInstanceNorm`
+        // dispatch arm: `OpKind` has carried this variant since the fusion
+        // pass that emits it landed, but this enumeration never listed it,
+        // so `is_supported_op_matches_dispatch_arms`'s sweep silently never
+        // exercised it. The other ~23 variants this enumeration is still
+        // missing (`QLinearConv`, `RNN`, `LRN`, ...) predate this wave and
+        // are out of its scope.
+        OpKind::OxiInstanceNorm,
     ]
 }
 
@@ -291,13 +327,13 @@ fn is_supported_op_matches_dispatch_arms() {
     //    `all_op_kinds` is not updated, the arity check below trips.
     assert_eq!(
         all.len(),
-        166,
+        167,
         "OpKind gained/lost a unit variant — update all_op_kinds() and re-audit \
          is_supported_op against the try_cuda_dispatch match arms",
     );
     assert_eq!(
         claimable.len(),
-        26,
+        40,
         "claimable_ops() changed — re-audit against the try_cuda_dispatch match arms",
     );
 }
@@ -335,6 +371,13 @@ fn is_supported_op_matches_dispatch_arms() {
 ///   hand-computed constants by their own dedicated `reference::tests` cases and
 ///   end-to-end by `tests/verify_path_gpu.rs`; they are listed here only so that
 ///   removing one from `claimable_ops()` still trips the partition check below.
+/// * `PRELU_OPS`/`BATCH_NORM_OPS`/`INSTANCE_NORM_OPS` — [`reference::ref_prelu`],
+///   [`reference::ref_batch_norm`] and [`reference::ref_oxi_instance_norm`] are,
+///   like the unary/binary/reduce oracles, `Option`-returning with `None` as the
+///   exact "no formula" signal `shadow_verify` treats specially, so `.is_some()`
+///   is the same right-sized check — their own *correctness* (not just presence)
+///   is pinned by hand-verified cases in `reference::tests` and by
+///   `crate::prelu`/`crate::norm`'s own plan-function unit tests.
 #[test]
 fn oracle_covers_every_op_try_cuda_dispatch_can_claim() {
     const UNARY_OPS: &[OpKind] = &[
@@ -356,8 +399,32 @@ fn oracle_covers_every_op_try_cuda_dispatch_can_claim() {
         OpKind::LeakyRelu,
     ];
     const BINARY_OPS: &[OpKind] = &[OpKind::Add, OpKind::Sub, OpKind::Mul, OpKind::Div];
-    const REDUCE_OPS: &[OpKind] = &[OpKind::ReduceSum, OpKind::ReduceMax];
+    const REDUCE_OPS: &[OpKind] = &[OpKind::ReduceSum, OpKind::ReduceMax, OpKind::ReduceMean];
     const CONV_OPS: &[OpKind] = &[OpKind::Conv];
+    const PRELU_OPS: &[OpKind] = &[OpKind::PRelu];
+    const BATCH_NORM_OPS: &[OpKind] = &[OpKind::BatchNorm];
+    const INSTANCE_NORM_OPS: &[OpKind] = &[OpKind::OxiInstanceNorm];
+    const POOL_OPS: &[OpKind] = &[OpKind::MaxPool, OpKind::AveragePool];
+    const RESIZE_OPS: &[OpKind] = &[OpKind::Resize];
+    const PAD_OPS: &[OpKind] = &[OpKind::Pad];
+    const SLICE_OPS: &[OpKind] = &[OpKind::Slice];
+    const CONCAT_OPS: &[OpKind] = &[OpKind::Concat];
+    // Deliberately **oracle-free**: `Reshape`/`Squeeze`/`Unsqueeze`/`Flatten`
+    // dispatch through `CudaDeviceTensor::alias` -- an `Arc::clone` under a
+    // new shape header, not a kernel launch. There is nothing for a CPU
+    // oracle to disagree with that `alias`'s own element-count check does
+    // not already catch structurally, so this arm never calls
+    // `verify_or_fallback` at all. See `reshape`'s module docs "why this
+    // module carries no oracle" for the full argument. Listed here (rather
+    // than silently matching the "no formula needed" `else` branch this test
+    // reserves for `NO_OPKIND_NEEDED`) so the exception is visible and
+    // intentional, not an oversight this test failed to catch.
+    const RESHAPE_ALIAS_OPS: &[OpKind] = &[
+        OpKind::Unsqueeze,
+        OpKind::Squeeze,
+        OpKind::Reshape,
+        OpKind::Flatten,
+    ];
     const NO_OPKIND_NEEDED: &[OpKind] = &[OpKind::MatMul, OpKind::Gemm, OpKind::Softmax];
 
     let claimable = claimable_ops();
@@ -374,11 +441,53 @@ fn oracle_covers_every_op_try_cuda_dispatch_can_claim() {
                 "{op:?} is claimable by the binary elementwise dispatch arm but \
                  reference::ref_binary has no formula for it",
             );
+            assert!(
+                reference::ref_binary_broadcast(
+                    op,
+                    &[1.0, 2.0, 3.0, 4.0],
+                    &[10.0, 20.0],
+                    2,
+                    2,
+                    false
+                )
+                .is_some(),
+                "{op:?} is claimable by the binary elementwise dispatch arm's channel-broadcast \
+                 path but reference::ref_binary_broadcast has no formula for it",
+            );
         } else if REDUCE_OPS.contains(op) {
             assert!(
                 reference::ref_reduce(op, &[1.0, 2.0, 3.0, 4.0], &[4], 0).is_some(),
                 "{op:?} is claimable by the reduce dispatch arm but reference::ref_reduce \
                  has no formula for it",
+            );
+        } else if PRELU_OPS.contains(op) {
+            assert!(
+                reference::ref_prelu(&[1.0, -2.0, 3.0, -4.0], &[0.1, 0.2], 2, 2).is_some(),
+                "{op:?} is claimable by the prelu dispatch arm but reference::ref_prelu has \
+                 no formula for this shape",
+            );
+        } else if BATCH_NORM_OPS.contains(op) {
+            assert!(
+                reference::ref_batch_norm(
+                    &[1.0, 2.0, 3.0, 4.0],
+                    &[1.0, 1.0],
+                    &[0.0, 0.0],
+                    &[0.0, 0.0],
+                    &[1.0, 1.0],
+                    2,
+                    2,
+                    1e-5,
+                )
+                .is_some(),
+                "{op:?} is claimable by the batch_norm dispatch arm but \
+                 reference::ref_batch_norm has no formula for this shape",
+            );
+        } else if INSTANCE_NORM_OPS.contains(op) {
+            assert!(
+                reference::ref_oxi_instance_norm(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], 1e-5)
+                    .is_some(),
+                "{op:?} is claimable by the oxi_instance_norm dispatch arm but \
+                 reference::ref_oxi_instance_norm has no formula for this shape",
             );
         } else if CONV_OPS.contains(op) {
             // A `[1, 1, 2, 2]` input under a `[1, 1, 2, 2]` filter, no padding,
@@ -413,6 +522,74 @@ fn oracle_covers_every_op_try_cuda_dispatch_can_claim() {
                  oracle is reference::ref_conv -- but ref_conv does not compute the \
                  hand-verified answer for a 2x2 single-channel convolution with bias",
             );
+        } else if POOL_OPS.contains(op) {
+            let params = pool::PoolParams {
+                kernel: [2, 2],
+                strides: [2, 2],
+                pads: [0, 0, 0, 0],
+                ceil_mode: false,
+                count_include_pad: false,
+            };
+            let kind = if *op == OpKind::MaxPool {
+                pool::PoolKind::Max
+            } else {
+                pool::PoolKind::Avg
+            };
+            assert!(
+                reference::ref_pool(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], kind, &params).is_some(),
+                "{op:?} is claimable by the pool dispatch arm but reference::ref_pool has \
+                 no formula for this shape",
+            );
+        } else if RESIZE_OPS.contains(op) {
+            let params = resize::ResizeParams {
+                mode: resize::ResizeMode::Nearest,
+                out_h: 4,
+                out_w: 4,
+            };
+            assert!(
+                reference::ref_resize(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], &params).is_some(),
+                "{op:?} is claimable by the resize dispatch arm but reference::ref_resize \
+                 has no formula for this shape",
+            );
+        } else if PAD_OPS.contains(op) {
+            let params = pad::PadParams {
+                pad_h: (1, 1),
+                pad_w: (1, 1),
+                mode: pad::PadMode::Constant,
+                constant_value: 0.0,
+            };
+            assert!(
+                reference::ref_pad(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], &params).is_some(),
+                "{op:?} is claimable by the pad dispatch arm but reference::ref_pad has no \
+                 formula for this shape",
+            );
+        } else if SLICE_OPS.contains(op) {
+            let params = slice::SliceParams {
+                start: [0, 0, 0, 0],
+                step: [1, 1, 1, 1],
+                out_shape: [1, 1, 2, 2],
+            };
+            assert!(
+                reference::ref_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], &params).is_some(),
+                "{op:?} is claimable by the slice dispatch arm but reference::ref_slice has \
+                 no formula for this shape",
+            );
+        } else if CONCAT_OPS.contains(op) {
+            let params = concat::ConcatParams {
+                axis: 0,
+                out_shape: vec![2],
+                segment_lens: vec![1, 1],
+            };
+            let a = [1.0_f32];
+            let b = [2.0_f32];
+            assert!(
+                reference::ref_concat(&[&a, &b], &params).is_some(),
+                "{op:?} is claimable by the concat dispatch arm but reference::ref_concat \
+                 has no formula for this shape",
+            );
+        } else if RESHAPE_ALIAS_OPS.contains(op) {
+            // Deliberately no oracle call -- see `RESHAPE_ALIAS_OPS`'s own
+            // comment above.
         } else {
             assert!(
                 NO_OPKIND_NEEDED.contains(op),
@@ -422,14 +599,23 @@ fn oracle_covers_every_op_try_cuda_dispatch_can_claim() {
         }
     }
 
-    // The five lists above partition `claimable_ops()` exactly; this catches an op
+    // The lists above partition `claimable_ops()` exactly; this catches an op
     // quietly removed from one list (rather than from `claimable_ops()` itself, which
-    // `is_supported_op_matches_dispatch_arms` already pins at 26).
+    // `is_supported_op_matches_dispatch_arms` already pins at 40).
     assert_eq!(
         UNARY_OPS.len()
             + BINARY_OPS.len()
             + REDUCE_OPS.len()
             + CONV_OPS.len()
+            + PRELU_OPS.len()
+            + BATCH_NORM_OPS.len()
+            + INSTANCE_NORM_OPS.len()
+            + POOL_OPS.len()
+            + RESIZE_OPS.len()
+            + PAD_OPS.len()
+            + SLICE_OPS.len()
+            + CONCAT_OPS.len()
+            + RESHAPE_ALIAS_OPS.len()
             + NO_OPKIND_NEEDED.len(),
         claimable.len(),
         "the op-family lists in this test no longer partition claimable_ops() exactly",

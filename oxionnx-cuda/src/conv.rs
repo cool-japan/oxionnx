@@ -38,6 +38,20 @@
 //! Given the [`ConvProblem`](oxicuda_dnn::conv::descriptor::ConvProblem)
 //! built from [`ConvParams`] and the ONNX input/filter shapes:
 //!
+//! 0. The shape is claimed by `oxicuda-dnn`'s CTA-tiled implicit-GEMM kernel
+//!    (`TiledConvPlan::for_problem`) →
+//!    [`ImplicitGemmConv`](oxicuda_dnn::conv::fprop::implicit_gemm::ImplicitGemmConv),
+//!    which dispatches to that kernel internally. This rule runs *first*,
+//!    ahead of the 1x1 rule, because the tiling wins by a wide margin
+//!    wherever it applies — measured on an RTX A4000
+//!    (`oxicuda-dnn/benches/conv_engine_gflops_regression`): a 256->512
+//!    pointwise convolution over 64x64 runs at **480 GFLOPS on `Conv1x1`
+//!    and 7345 GFLOPS tiled (15.3x)**, and the 3x3 layers of all three
+//!    face-pipeline models go from 875-1006 GFLOPS to 6.1-8.3 TFLOPS.
+//!    Routing through `ImplicitGemmConv` also moves the bias and the fused
+//!    activation onto the device (see below), where `Conv1x1` forces both
+//!    onto the host.
+//!    The tiling declines every grouped convolution, so rule 2 is unaffected.
 //! 1. `filter == 1x1 && stride == [1,1] && dilation == [1,1] && padding ==
 //!    [0,0]` → [`Conv1x1`](oxicuda_dnn::conv::fprop::direct::Conv1x1).
 //! 2. `groups == in_channels && groups == out_channels` (true depthwise,
@@ -161,6 +175,7 @@
 use oxicuda_dnn::conv::descriptor::ConvProblem;
 use oxicuda_dnn::conv::fprop::direct::{Conv1x1, DepthwiseConv};
 use oxicuda_dnn::conv::fprop::implicit_gemm::ImplicitGemmConv;
+use oxicuda_dnn::conv::fprop::tiled_implicit_gemm::TiledConvPlan;
 use oxicuda_dnn::{DnnError, TensorDesc, TensorDescMut, TensorLayout};
 use oxicuda_ptx::ir::PtxType;
 use oxicuda_ptx::templates::elementwise::ElementwiseOp;
@@ -492,14 +507,27 @@ enum ConvEngine {
 /// Chooses which of the three validated engines a [`ConvProblem`] must be
 /// dispatched to.
 ///
-/// Pure and allocation-free, so this — the actual decision this module
-/// exists to make — is unit-testable on any host, including one with no
-/// CUDA device. Order matters: rule 1 is checked before rule 2, so a
-/// problem that is simultaneously 1x1-unpadded-unit-stride *and*
-/// depthwise-shaped takes the [`ConvEngine::Conv1x1`] path, never
+/// Pure and allocation-light (`TiledConvPlan::for_problem` is arithmetic on
+/// the problem's own fields), so this — the actual decision this module
+/// exists to make — is unit-testable on any host, including one with no CUDA
+/// device.
+///
+/// Order matters twice over. Rule 0 precedes everything because the tiled
+/// kernel is 6-15x faster than whatever else would have claimed the shape
+/// (see the [module docs](self) for the measurements); and rule 1 still
+/// precedes rule 2, so a problem that is simultaneously
+/// 1x1-unpadded-unit-stride *and* depthwise-shaped — and too small for the
+/// tiling — takes the [`ConvEngine::Conv1x1`] path, never
 /// [`ConvEngine::Depthwise`].
 #[must_use]
 fn pick_engine(problem: &ConvProblem) -> ConvEngine {
+    // Rule 0: the tiled implicit-GEMM kernel, wherever it claims the shape.
+    // `ImplicitGemmConv` routes to it internally, so naming that engine here
+    // is what selects it. The tiling declines `groups != 1`, so this can
+    // never steal a depthwise problem from rule 2.
+    if TiledConvPlan::for_problem(problem).is_some() {
+        return ConvEngine::ImplicitGemm;
+    }
     let unpadded_unit_1x1 = problem.is_1x1() && problem.padding.iter().all(|&p| p == 0);
     if unpadded_unit_1x1 {
         ConvEngine::Conv1x1

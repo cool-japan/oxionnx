@@ -64,6 +64,25 @@ use crate::context::{parse_env_flag, FailurePolicy};
 use crate::conv::{ConvActivation, ConvParams};
 use crate::error::CudaDispatchError;
 
+/// The data-movement wave's oracles (`MaxPool`/`AveragePool`/`Resize`/`Pad`/
+/// `Slice`/`Concat`) live in a companion file rather than growing this one
+/// further -- see that file's own header for why -- but are re-exported here
+/// so every oracle in the crate is reachable uniformly as `reference::ref_*`.
+#[path = "reference_data_ops.rs"]
+mod reference_data_ops;
+pub use reference_data_ops::{ref_concat, ref_pad, ref_pool, ref_resize, ref_slice};
+
+/// The elementwise/normalization wave's oracles (the `[1,C,1,1]`/scalar
+/// broadcast path of `Add`/`Sub`/`Mul`/`Div`, `PRelu`, `BatchNormalization`,
+/// `OxiInstanceNorm`) live in a companion file for the identical reason
+/// [`reference_data_ops`] does — see that module's doc comment just above,
+/// and [`reference_norm_ops`]'s own header.
+#[path = "reference_norm_ops.rs"]
+mod reference_norm_ops;
+pub use reference_norm_ops::{
+    ref_batch_norm, ref_binary_broadcast, ref_oxi_instance_norm, ref_prelu,
+};
+
 // ─── the verify gate ────────────────────────────────────────────────────────
 
 /// Set this to shadow-verify every CUDA-dispatched op against this module's
@@ -749,6 +768,21 @@ fn reduce_max_at(data: &[f32], axis_len: usize, inner: usize, o: usize, i: usize
     acc
 }
 
+/// One `ReduceMean` output element: the same `f64` accumulation as
+/// [`reduce_sum_at`], divided by `axis_len` *before* the single cast to
+/// `f32` — not `reduce_sum_at(..) / axis_len as f32`, which would round
+/// twice. `axis_len` is always `>= 1` here (`ref_reduce` already declined a
+/// zero-length axis before this is ever called), so the division is exact
+/// arithmetic, never by zero.
+#[allow(clippy::cast_precision_loss)]
+fn reduce_mean_at(data: &[f32], axis_len: usize, inner: usize, o: usize, i: usize) -> f32 {
+    let mut acc = 0.0_f64;
+    for a in 0..axis_len {
+        acc += f64::from(data[(o * axis_len + a) * inner + i]);
+    }
+    (acc / axis_len as f64) as f32
+}
+
 /// Fill every output element of `out` serially -- no `rayon` involvement at
 /// all. See [`ref_reduce`].
 fn ref_reduce_fill_serial(
@@ -799,12 +833,17 @@ fn ref_reduce_fill_parallel(
         });
 }
 
-/// Naive per-axis `ReduceSum` / `ReduceMax`.
+/// Naive per-axis `ReduceSum` / `ReduceMax` / `ReduceMean`.
 ///
 /// `shape` is decomposed as `[outer, axis_len, inner]` around `axis`,
-/// matching [`crate::reduce::cuda_reduce`]'s own layout. Returns `None` for
-/// an out-of-range axis or an op this oracle has no formula for (the caller
-/// treats that as "skip the check", not "the GPU is wrong"). Above
+/// matching [`crate::reduce::cuda_reduce`]'s own layout. A multi-axis
+/// `ReduceMean` (`crate::reduce::cuda_reduce_mean_bound`, one or more
+/// *contiguous* axes) calls this with a synthetic 3-element `shape` and
+/// `axis = 1` — the merged-axis view [`crate::reduce::reduce_plan_range`]'s
+/// docs describe — rather than this function growing a second axis
+/// parameter. Returns `None` for an out-of-range axis or an op this oracle
+/// has no formula for (the caller treats that as "skip the check", not "the
+/// GPU is wrong"). Above
 /// `PAR_MIN_MACS` total multiply-adds, the `outer*inner` output elements
 /// are split across `rayon` in `rayon::current_num_threads() * 4`-ish flat
 /// chunks (`ref_reduce_fill_parallel` -- finer than "one chunk per `o`",
@@ -831,6 +870,7 @@ pub fn ref_reduce(op: &OpKind, data: &[f32], shape: &[usize], axis: usize) -> Op
     let compute: fn(&[f32], usize, usize, usize, usize) -> f32 = match op {
         OpKind::ReduceSum => reduce_sum_at,
         OpKind::ReduceMax => reduce_max_at,
+        OpKind::ReduceMean => reduce_mean_at,
         _ => return None,
     };
 
@@ -1319,6 +1359,40 @@ mod tests {
     fn ref_reduce_declines_out_of_range_axis_and_unknown_op() {
         assert_eq!(ref_reduce(&OpKind::ReduceSum, &[1.0, 2.0], &[2], 5), None);
         assert_eq!(ref_reduce(&OpKind::Relu, &[1.0, 2.0], &[2], 0), None);
+    }
+
+    #[test]
+    fn ref_reduce_mean_over_a_middle_axis() {
+        // Same shape/data as `ref_reduce_max_over_a_middle_axis`: [2,3,2],
+        // axis=1. mean over axis 1 of [[0,1],[2,3],[4,5]] is [2,3]; of
+        // [[6,7],[8,9],[10,11]] is [8,9].
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let out = ref_reduce(&OpKind::ReduceMean, &data, &[2, 3, 2], 1).unwrap();
+        assert_eq!(out, vec![2.0, 3.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn ref_reduce_mean_whole_1d_tensor_matches_sum_over_n() {
+        // Same data as `ref_reduce_sum_whole_1d_tensor_over_256_elements`:
+        // mean = 523776 / 1024 = 511.5.
+        let data: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+        let out = ref_reduce(&OpKind::ReduceMean, &data, &[1024], 0).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!((out[0] - 511.5).abs() < 1.0e-3, "got {}", out[0]);
+    }
+
+    /// The multi-axis path `crate::reduce::cuda_reduce_mean_bound` (and its
+    /// `lib.rs` call site) actually uses: a synthetic `[outer, axis_len,
+    /// inner]` shape standing in for a merged contiguous axis range, exactly
+    /// as `OpKind::ReduceMean`'s dispatch arm builds it.
+    #[test]
+    fn ref_reduce_mean_over_a_synthetic_merged_axis_matches_hand_computation() {
+        // [N=1,C=2,H=2,W=2] flattened to the OxiInstanceNorm decomposition's
+        // view: outer=N*C=2, axis_len=H*W=4, inner=1.
+        // Plane 0: [1,2,3,4] -> mean 2.5. Plane 1: [10,20,30,40] -> mean 25.
+        let data = [1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let out = ref_reduce(&OpKind::ReduceMean, &data, &[2, 4, 1], 1).unwrap();
+        assert_eq!(out, vec![2.5, 25.0]);
     }
 
     // ── ref_softmax ──────────────────────────────────────────────────────────
