@@ -4,6 +4,8 @@ All notable changes to OxiONNX will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.8] - Unreleased
+
 ## [0.1.7] - 2026-08-14
 
 **`oxionnx-cuda` matures from a working-but-partial 25-op backend into a 40-op one** — real `Conv` support, session-lifetime device-memory management (buffer pooling, weight residency, compiled-PTX-module caching, batched dispatch), run-scoped activation residency shared with the wgpu backend, and an honestly-scoped opt-in CUDA Graph capture path. Alongside it, `oxionnx-gpu` gained device- and shape-aware dispatch tuning replacing seven flat thresholds, a crash fix for running more than one GPU-backed session in a process, and activation-buffer recycling. Highlights below; the full per-task writeup lives in `TODO.md` §21-24.

@@ -128,7 +128,7 @@ Windows GPU backend.
 
 ```toml
 [dependencies]
-oxionnx = { version = "0.1.7", features = ["directml"] }
+oxionnx = { version = "0.1.8", features = ["directml"] }
 ```
 
 ## Usage

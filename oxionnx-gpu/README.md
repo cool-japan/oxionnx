@@ -64,7 +64,7 @@ The `_placed_async` family -- `gpu_add_placed_async`, `gpu_broadcast_placed_asyn
 
 ```toml
 [dependencies]
-oxionnx-gpu = "0.1.7"
+oxionnx-gpu = "0.1.8"
 ```
 
 ```rust

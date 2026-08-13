@@ -23,7 +23,7 @@ and has minimal dependencies; the `no_std` build is compile-verified via
 
 ```toml
 [dependencies]
-oxionnx-core = "0.1.7"
+oxionnx-core = "0.1.8"
 ```
 
 ```rust

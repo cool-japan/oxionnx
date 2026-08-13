@@ -1,4 +1,4 @@
-# OxiONNX 0.1.7 -- Pure Rust ONNX Inference Engine
+# OxiONNX 0.1.8 -- Pure Rust ONNX Inference Engine
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
