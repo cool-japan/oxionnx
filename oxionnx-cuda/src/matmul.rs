@@ -64,6 +64,7 @@ use oxicuda_blas::{level3::gemm_api::gemm, Layout, MatrixDesc, MatrixDescMut, Tr
 use oxicuda_driver::ffi::CUdeviceptr;
 use oxicuda_driver::Stream;
 
+use crate::activation::{finish_output, retire_queued, CudaOutputPlacement, KernelOutput};
 use crate::context::CudaContext;
 use crate::error::CudaDispatchError;
 use crate::residency::{Operand, WeightId};
@@ -253,6 +254,45 @@ pub(crate) fn cuda_gemm_batched(
     ctx: &CudaContext,
     request: BatchedGemm<'_, '_>,
 ) -> Result<Option<Vec<f32>>, CudaDispatchError> {
+    match cuda_gemm_batched_placed(ctx, request, &[], CudaOutputPlacement::Host)? {
+        Some(KernelOutput::Host(out)) => Ok(Some(out)),
+        Some(KernelOutput::Device(_)) => Err(CudaDispatchError::Shape {
+            op: "MatMul",
+            msg: "host placement produced a device-resident result".to_string(),
+        }),
+        None => Ok(None),
+    }
+}
+
+/// [`cuda_gemm_batched`], with the result left on the device when the caller
+/// asks for it.
+///
+/// `out_shape` is the ONNX output shape (the broadcast batch prefix plus
+/// `[m, n]`); it is only consulted on the device path, where it becomes the
+/// resident tensor's shape.
+///
+/// # The graph-replay path is host-only, deliberately
+///
+/// [`crate::graph_cache`] replays a recorded launch **and its read-back** into
+/// a host `Vec`, so it cannot serve a device-placement request. Rather than
+/// teach it two output modes, a device request skips it. Nothing is lost:
+/// graph replay is off by default, and its whole value — amortising launch
+/// overhead — is dwarfed on the resident path by the fence and the round trip
+/// that residency has already removed. Residency also *improves* the graph
+/// path where it does run: an operand bound from a resident activation is an
+/// externally-owned pointer in the key, exactly like a resident weight, so a
+/// steady-state frame that reuses the same pooled allocations hits the same
+/// recording rather than re-recording.
+///
+/// # Errors
+///
+/// As [`cuda_gemm_batched`].
+pub(crate) fn cuda_gemm_batched_placed(
+    ctx: &CudaContext,
+    request: BatchedGemm<'_, '_>,
+    out_shape: &[usize],
+    placement: CudaOutputPlacement,
+) -> Result<Option<KernelOutput>, CudaDispatchError> {
     let BatchedGemm {
         a,
         b,
@@ -307,7 +347,7 @@ pub(crate) fn cuda_gemm_batched(
     // graphs off, an operand not yet resident, a poisoned key — cost one
     // boolean and fall through to the ordinary path below with `a`/`b`
     // untouched.
-    if ctx.graphs.enabled() {
+    if ctx.graphs.enabled() && placement == CudaOutputPlacement::Host {
         let plan = plan_gemm(m, k, n, a_batches, b_batches);
         if let Some(out) = try_graph_gemm(
             ctx,
@@ -324,14 +364,14 @@ pub(crate) fn cuda_gemm_batched(
             plan,
             stream,
         )? {
-            return Ok(Some(out));
+            return Ok(Some(KernelOutput::Host(out)));
         }
     }
 
     let mut d_a = a.resolve(ctx, A_LABEL, a_needed, stream)?;
     let mut d_b = b.resolve(ctx, B_LABEL, b_needed, stream)?;
 
-    let mut d_c = ctx.scratch(out_total)?;
+    let d_c = ctx.scratch(out_total)?;
 
     issue_gemm(
         ctx,
@@ -356,18 +396,24 @@ pub(crate) fn cuda_gemm_batched(
         stream,
     )?;
 
-    let mut out = vec![0.0_f32; out_total];
-    d_c.download(&mut out, stream)?;
-    // The one fence in the whole dispatch. Everything above was enqueued on
-    // `stream` in order; this is where the host waits for all of it, and after
-    // it `out` holds the finished result.
-    stream.synchronize().map_err(CudaDispatchError::Driver)?;
+    // The one fence in the whole dispatch, on the host path: everything above
+    // was enqueued on `stream` in order, and this is where the host waits for
+    // all of it. On the device path there is no fence and no read-back at all.
+    let out = finish_output(ctx, d_c, out_total, out_shape, placement, stream)?;
     // ...and only now may these allocations go back to the pool. See
     // `PooledBuffer`'s "a borrow is only recycled once its stream work is
-    // known to be done".
-    d_a.retire();
-    d_b.retire();
-    d_c.retire();
+    // known to be done", and `mod@crate::activation` for why the device path
+    // may recycle without a fence.
+    match &out {
+        KernelOutput::Host(_) => {
+            d_a.retire();
+            d_b.retire();
+        }
+        KernelOutput::Device(_) => {
+            retire_queued(ctx, &mut d_a);
+            retire_queued(ctx, &mut d_b);
+        }
+    }
     Ok(Some(out))
 }
 

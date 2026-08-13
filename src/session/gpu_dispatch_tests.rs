@@ -68,7 +68,7 @@ mod gating_tests {
         intermediates.insert("x".to_string(), Tensor::new(vec![3.0], vec![1]));
         intermediates.insert("shadowed".to_string(), Tensor::new(vec![4.0], vec![1]));
 
-        let activations = RunActivations::default();
+        let activations = GpuActivations::default();
         assert_eq!(
             initializer_key("w", &weights, &intermediates, &activations),
             Some("w")
@@ -101,7 +101,7 @@ mod gating_tests {
         let mut weights = HashMap::new();
         weights.insert("shadowed".to_string(), Tensor::new(vec![2.0], vec![1]));
         let intermediates = HashMap::new();
-        let activations = RunActivations::default();
+        let activations = GpuActivations::default();
         // With nothing resident the name is a plain initializer.
         assert_eq!(
             initializer_key("shadowed", &weights, &intermediates, &activations),

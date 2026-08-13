@@ -19,8 +19,15 @@
 use oxicuda_launch::{Dim3, Kernel, LaunchParams};
 use oxicuda_ptx::{ir::PtxType, templates::softmax::SoftmaxTemplate};
 
+use crate::activation::{
+    finish_output, retire_queued, CudaOutputPlacement, InputBinding, KernelOutput,
+};
 use crate::context::CudaContext;
 use crate::error::CudaDispatchError;
+
+/// Residency-cache slot label for the softmax operand. Never weight-cached —
+/// a softmax input is always an activation — but the binding API takes one.
+const INPUT_LABEL: &str = "softmax_in";
 
 /// GPU softmax over the last axis.
 ///
@@ -39,6 +46,33 @@ pub fn cuda_softmax(
     data: &[f32],
     shape: &[usize],
 ) -> Result<Option<Vec<f32>>, CudaDispatchError> {
+    match cuda_softmax_bound(
+        ctx,
+        InputBinding::Host(data),
+        shape,
+        CudaOutputPlacement::Host,
+    )? {
+        Some(KernelOutput::Host(out)) => Ok(Some(out)),
+        Some(KernelOutput::Device(_)) => Err(CudaDispatchError::Shape {
+            op: "Softmax",
+            msg: "host placement produced a device-resident result".to_string(),
+        }),
+        None => Ok(None),
+    }
+}
+
+/// [`cuda_softmax`] over an operand that may already be on the device, leaving
+/// the result there when the caller asks for it.
+///
+/// # Errors
+///
+/// As [`cuda_softmax`].
+pub(crate) fn cuda_softmax_bound(
+    ctx: &CudaContext,
+    input: InputBinding<'_>,
+    shape: &[usize],
+    placement: CudaOutputPlacement,
+) -> Result<Option<KernelOutput>, CudaDispatchError> {
     if shape.is_empty() {
         return Ok(None);
     }
@@ -70,12 +104,13 @@ pub fn cuda_softmax(
     // stream order sequences them and the single synchronise at the end is the
     // only host/device rendezvous.
     let stream = ctx.dnn.stream();
-    let n = data.len();
-    let mut d_input = ctx.scratch(n)?;
-    d_input.upload(data, stream)?;
+    let n = input.len();
+    let Some(mut d_input) = input.bind(ctx, INPUT_LABEL, n, stream)? else {
+        return Ok(None);
+    };
     // No zero-fill: the kernel writes one full row per block for all
     // `batch_size` blocks, covering every element the readback reads.
-    let mut d_output = ctx.scratch(n)?;
+    let d_output = ctx.scratch(n)?;
 
     // The warp-shuffle kernel (row_size <= 32) maps one warp (32 threads) per
     // row, so we must launch 32 threads/block regardless of row_size.  The
@@ -92,13 +127,14 @@ pub fn cuda_softmax(
         .launch(&params, stream, &args)
         .map_err(CudaDispatchError::Driver)?;
 
-    let mut out = vec![0.0_f32; n];
-    d_output.download(&mut out, stream)?;
-    stream.synchronize().map_err(CudaDispatchError::Driver)?;
-    // ...and only now may these allocations go back to the pool. See
+    let out = finish_output(ctx, d_output, n, shape, placement, stream)?;
+    // ...and only now may the input borrow go back to the pool. See
     // `PooledBuffer`'s "a borrow is only recycled once its stream work is
-    // known to be done".
-    d_input.retire();
-    d_output.retire();
+    // known to be done", and `mod@crate::activation` for why the device path
+    // may recycle without a fence at all.
+    match &out {
+        KernelOutput::Host(_) => d_input.retire(),
+        KernelOutput::Device(_) => retire_queued(ctx, &mut d_input),
+    }
     Ok(Some(out))
 }

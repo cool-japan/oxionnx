@@ -369,6 +369,49 @@ impl CudaContext {
         self.caches.is_resident(name)
     }
 
+    // ── activation residency ───────────────────────────────────────────────
+
+    /// Whether every launch and copy this context issues rides **one** driver
+    /// queue.
+    ///
+    /// True for every context this crate builds — `DnnHandle::new` collapses
+    /// its BLAS sub-handle onto its own stream — and the precondition for two
+    /// things activation residency depends on: dropping the per-node fence
+    /// between a `Conv` and the `Gemm` that reads its output, and recycling a
+    /// device buffer between the two op families without one. On two queues
+    /// neither is safe, and both are declined rather than assumed.
+    #[must_use]
+    pub fn streams_unified(&self) -> bool {
+        self.dnn.streams_unified()
+    }
+
+    /// Block until `stream`'s queued work has completed, counting the fence.
+    ///
+    /// Every blocking rendezvous on a dispatch path goes through here, so
+    /// [`CacheCounters::stream_syncs`] is a measurement rather than an
+    /// estimate — which is what makes "237 fences per frame became 3" a
+    /// checkable claim instead of a story.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the driver's error from the synchronise.
+    pub(crate) fn sync_stream(&self, stream: &Stream) -> Result<(), CudaDispatchError> {
+        self.caches.note_sync();
+        stream.synchronize().map_err(CudaDispatchError::Driver)
+    }
+
+    /// Give a finished activation's allocation back to the scratch pool.
+    ///
+    /// Called by the session's activation map once a resident value's last
+    /// consumer has run. An allocation still shared with an
+    /// [`alias`](crate::CudaDeviceTensor::alias) is *not* recycled here — the
+    /// alias keeps it alive and recycles it in turn.
+    pub fn recycle_activation(&self, tensor: crate::activation::CudaDeviceTensor) {
+        if let Some(buffer) = tensor.into_unique_buffer() {
+            self.caches.recycle(buffer);
+        }
+    }
+
     /// Turn CUDA graph capture/replay on or off for this context, overriding
     /// [`GRAPH_ENV_VAR`](crate::graph_cache::GRAPH_ENV_VAR).
     ///

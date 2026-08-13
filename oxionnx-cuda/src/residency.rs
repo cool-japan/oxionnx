@@ -152,6 +152,34 @@ pub struct CacheCounters {
     pub weight_misses: u64,
     /// Bytes those misses handed to the driver.
     pub weight_bytes_uploaded: u64,
+    /// **Every** byte this context has pushed host → device, weights and
+    /// activations alike.
+    ///
+    /// [`Self::weight_bytes_uploaded`] is the invariant-bytes subset; the
+    /// difference between the two is what this frame's activations cost.
+    /// Counted at the copy itself rather than inferred from shapes, so it
+    /// cannot drift from what the driver was actually asked to move.
+    pub host_to_device_bytes: u64,
+    /// Every byte this context has pulled device → host.
+    ///
+    /// The number activation residency exists to drive to "graph outputs
+    /// only": a claimed node that keeps its result on the device adds nothing
+    /// here.
+    pub device_to_host_bytes: u64,
+    /// Blocking `stream.synchronize()` calls this context has performed on a
+    /// dispatch path.
+    ///
+    /// One per claimed node before residency (237/frame across the three
+    /// face-pipeline models); one per *host-visible* result after it.
+    pub stream_syncs: u64,
+    /// Operands bound straight from a device-resident activation — uploads
+    /// that did not happen.
+    pub resident_activation_binds: u64,
+    /// Node outputs handed back as device buffers rather than read back.
+    pub device_handoffs: u64,
+    /// Activation buffers returned to the scratch pool by the session's
+    /// activation map.
+    pub activation_recycles: u64,
 }
 
 impl CacheCounters {
@@ -170,6 +198,20 @@ impl CacheCounters {
             weight_bytes_uploaded: self
                 .weight_bytes_uploaded
                 .saturating_sub(earlier.weight_bytes_uploaded),
+            host_to_device_bytes: self
+                .host_to_device_bytes
+                .saturating_sub(earlier.host_to_device_bytes),
+            device_to_host_bytes: self
+                .device_to_host_bytes
+                .saturating_sub(earlier.device_to_host_bytes),
+            stream_syncs: self.stream_syncs.saturating_sub(earlier.stream_syncs),
+            resident_activation_binds: self
+                .resident_activation_binds
+                .saturating_sub(earlier.resident_activation_binds),
+            device_handoffs: self.device_handoffs.saturating_sub(earlier.device_handoffs),
+            activation_recycles: self
+                .activation_recycles
+                .saturating_sub(earlier.activation_recycles),
         }
     }
 
@@ -190,6 +232,12 @@ struct Counters {
     weight_hits: AtomicU64,
     weight_misses: AtomicU64,
     weight_bytes_uploaded: AtomicU64,
+    host_to_device_bytes: AtomicU64,
+    device_to_host_bytes: AtomicU64,
+    stream_syncs: AtomicU64,
+    resident_activation_binds: AtomicU64,
+    device_handoffs: AtomicU64,
+    activation_recycles: AtomicU64,
 }
 
 impl Counters {
@@ -201,6 +249,12 @@ impl Counters {
             weight_hits: self.weight_hits.load(Ordering::Relaxed),
             weight_misses: self.weight_misses.load(Ordering::Relaxed),
             weight_bytes_uploaded: self.weight_bytes_uploaded.load(Ordering::Relaxed),
+            host_to_device_bytes: self.host_to_device_bytes.load(Ordering::Relaxed),
+            device_to_host_bytes: self.device_to_host_bytes.load(Ordering::Relaxed),
+            stream_syncs: self.stream_syncs.load(Ordering::Relaxed),
+            resident_activation_binds: self.resident_activation_binds.load(Ordering::Relaxed),
+            device_handoffs: self.device_handoffs.load(Ordering::Relaxed),
+            activation_recycles: self.activation_recycles.load(Ordering::Relaxed),
         }
     }
 }
@@ -443,6 +497,10 @@ impl PooledBuffer<'_> {
         let mut view = unsafe { DeviceBuffer::<f32>::from_raw(self.device_ptr(), data.len()) };
         self.in_flight = true;
         view.copy_from_host_async(data, stream)?;
+        self.pool
+            .counters
+            .host_to_device_bytes
+            .fetch_add(byte_len(data), Ordering::Relaxed);
         Ok(())
     }
 
@@ -476,6 +534,10 @@ impl PooledBuffer<'_> {
         let view = unsafe { DeviceBuffer::<f32>::from_raw(self.device_ptr(), out.len()) };
         self.in_flight = true;
         view.copy_to_host_async(out, stream)?;
+        self.pool
+            .counters
+            .device_to_host_bytes
+            .fetch_add(byte_len(out), Ordering::Relaxed);
         Ok(())
     }
 
@@ -527,6 +589,26 @@ impl PooledBuffer<'_> {
     /// See the type docs for what happens to a buffer dropped without it.
     pub(crate) fn retire(&mut self) {
         self.in_flight = false;
+    }
+
+    /// Take the allocation out of the pool for good, disarming this guard.
+    ///
+    /// The handover an activation needs: a [`PooledBuffer`] dies at the end of
+    /// the dispatch that borrowed it, and an activation must outlive its
+    /// producing node. After this the pool has no claim on the allocation at
+    /// all — it comes back only through
+    /// [`CudaContext::recycle_activation`](crate::CudaContext::recycle_activation),
+    /// when the session's activation map releases the value.
+    ///
+    /// The `in_flight` flag is deliberately *not* consulted: the caller is
+    /// handing the allocation to a consumer that will read it on the same
+    /// queue, which is the ordering guarantee, so "has the stream been
+    /// synchronised" is the wrong question here. See
+    /// [`mod@crate::activation`]'s header.
+    pub(crate) fn into_owned(mut self) -> DeviceBuffer<f32> {
+        self.buffer
+            .take()
+            .expect("PooledBuffer used after its allocation was returned to the pool")
     }
 }
 
@@ -796,6 +878,13 @@ impl ResidentWeights {
         self.counters
             .weight_bytes_uploaded
             .fetch_add(byte_len(data), Ordering::Relaxed);
+        // This copy does not go through `PooledBuffer::upload` (a resident
+        // allocation is exact-sized and never pooled), so the bus counter has
+        // to be bumped here or a session's first frame would under-report its
+        // uploads by the whole weight set.
+        self.counters
+            .host_to_device_bytes
+            .fetch_add(byte_len(data), Ordering::Relaxed);
 
         if let Ok(mut entries) = self.entries.lock() {
             let entry = entries.entry(id.name.to_string()).or_default();
@@ -976,6 +1065,51 @@ impl DeviceCaches {
     /// A consistent snapshot of both caches' counters.
     pub(crate) fn counters(&self) -> CacheCounters {
         self.counters.snapshot()
+    }
+
+    /// Take an activation's allocation back into the scratch pool.
+    ///
+    /// The return leg of [`PooledBuffer::into_owned`]: the session's
+    /// activation map calls it when a resident value's last consumer has run.
+    /// Recycling rather than freeing is what keeps a steady-state frame at
+    /// zero `cuMemAlloc`s — the very next node that needs an output buffer of
+    /// that size class takes this one.
+    ///
+    /// No fence is taken, and none is needed on a unified queue: see
+    /// [`mod@crate::activation`]'s header for the argument.
+    pub(crate) fn recycle(&self, buffer: DeviceBuffer<f32>) {
+        self.counters
+            .activation_recycles
+            .fetch_add(1, Ordering::Relaxed);
+        self.pool.release(buffer);
+    }
+
+    /// Count a blocking fence taken on a dispatch path.
+    pub(crate) fn note_sync(&self) {
+        self.counters.stream_syncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an operand bound straight from a device-resident activation.
+    pub(crate) fn note_resident_bind(&self) {
+        self.counters
+            .resident_activation_binds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a node output handed back as a device buffer.
+    pub(crate) fn note_device_handoff(&self) {
+        self.counters
+            .device_handoffs
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a device → host copy issued outside a [`PooledBuffer`] — the
+    /// read-back of a resident activation for a CPU consumer.
+    pub(crate) fn note_download(&self, elements: usize) {
+        self.counters.device_to_host_bytes.fetch_add(
+            (elements as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
+            Ordering::Relaxed,
+        );
     }
 
     /// Whether `name` is resident in any form.

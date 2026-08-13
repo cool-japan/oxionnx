@@ -15,8 +15,15 @@
 
 use oxicuda_blas::reduction::{reduce_axis, ReductionOp};
 
+use crate::activation::{
+    finish_output, retire_queued, CudaOutputPlacement, InputBinding, KernelOutput,
+};
 use crate::context::CudaContext;
 use crate::error::CudaDispatchError;
+
+/// Residency-cache slot label for the reduction operand. A reduction input is
+/// always an activation, so this only ever tags a transient pooled upload.
+const INPUT_LABEL: &str = "reduce_in";
 
 /// Decompose `shape` around `axis` into `(outer, axis_len, inner)`, and
 /// decide whether this is a configuration [`cuda_reduce`] will attempt (as
@@ -57,6 +64,43 @@ pub fn cuda_reduce(
     axis: usize,
     op_name: &str,
 ) -> Result<Option<Vec<f32>>, CudaDispatchError> {
+    match cuda_reduce_bound(
+        ctx,
+        InputBinding::Host(data),
+        shape,
+        axis,
+        op_name,
+        &[],
+        CudaOutputPlacement::Host,
+    )? {
+        Some(KernelOutput::Host(out)) => Ok(Some(out)),
+        Some(KernelOutput::Device(_)) => Err(CudaDispatchError::Shape {
+            op: "reduce",
+            msg: "host placement produced a device-resident result".to_string(),
+        }),
+        None => Ok(None),
+    }
+}
+
+/// [`cuda_reduce`] over an operand that may already be on the device, leaving
+/// the result there when the caller asks for it.
+///
+/// `out_shape` is the ONNX output shape (which `keepdims` decides, and this
+/// module deliberately does not); it is only consulted on the device path,
+/// where it becomes the resident tensor's shape.
+///
+/// # Errors
+///
+/// As [`cuda_reduce`].
+pub(crate) fn cuda_reduce_bound(
+    ctx: &CudaContext,
+    input: InputBinding<'_>,
+    shape: &[usize],
+    axis: usize,
+    op_name: &str,
+    out_shape: &[usize],
+    placement: CudaOutputPlacement,
+) -> Result<Option<KernelOutput>, CudaDispatchError> {
     let Some((outer, axis_len, inner)) = reduce_plan(shape, axis) else {
         return Ok(None);
     };
@@ -85,16 +129,19 @@ pub fn cuda_reduce(
     };
 
     // `reduce_axis` launches on `handle.stream()` where `handle` is
-    // `ctx.dnn.blas()` — i.e. the BLAS sub-handle's *own* stream, separate
-    // from `ctx.dnn.stream()` (see `DnnHandle::build`'s doc comment). Issuing
-    // the upload, the zero-fill and the readback on that *same* stream is what
-    // orders them against the kernel with no fence at all; the predecessor of
-    // this code had to `synchronize_all()` mid-dispatch precisely because its
-    // copies rode a different stream from its kernel.
+    // `ctx.dnn.blas()`. Since `DnnHandle::build` collapsed the BLAS sub-handle
+    // onto the DNN handle's own stream, that *is* `ctx.dnn.stream()` — one
+    // queue for both op families, which is what lets a `Conv` output feed this
+    // reduction with neither an event nor a host fence between them. Issuing
+    // the upload, the zero-fill and the readback on the same stream as the
+    // kernel is what orders them against it; the predecessor of this code had
+    // to `synchronize_all()` mid-dispatch precisely because its copies rode a
+    // different stream from its kernel.
     let stream = ctx.dnn.blas().stream();
 
-    let mut d_input = ctx.scratch(data.len())?;
-    d_input.upload(data, stream)?;
+    let Some(mut d_input) = input.bind(ctx, INPUT_LABEL, input.len(), stream)? else {
+        return Ok(None);
+    };
     // Zero-filled, exactly as the `DeviceBuffer::zeroed` this replaces was —
     // the output is a recycled allocation now, so whatever the previous
     // borrower left in it must not be visible to the reduction kernel or to
@@ -114,17 +161,17 @@ pub fn cuda_reduce(
     )
     .map_err(|e| CudaDispatchError::Blas(e.to_string()))?;
 
-    let mut result = vec![0.0_f32; output_len];
-    d_output.download(&mut result, stream)?;
-    // The one fence in the dispatch: everything above was enqueued on
-    // `stream`, in order.
-    stream.synchronize().map_err(CudaDispatchError::Driver)?;
-    // ...and only now may these allocations go back to the pool. See
+    // The one fence in the dispatch on the host path — everything above was
+    // enqueued on `stream`, in order — and none at all on the device path.
+    let out = finish_output(ctx, d_output, output_len, out_shape, placement, stream)?;
+    // ...and only now may the input borrow go back to the pool. See
     // `PooledBuffer`'s "a borrow is only recycled once its stream work is
     // known to be done".
-    d_input.retire();
-    d_output.retire();
-    Ok(Some(result))
+    match &out {
+        KernelOutput::Host(_) => d_input.retire(),
+        KernelOutput::Device(_) => retire_queued(ctx, &mut d_input),
+    }
+    Ok(Some(out))
 }
 
 #[cfg(test)]

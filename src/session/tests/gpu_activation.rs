@@ -1113,7 +1113,7 @@ fn repeated_shadowed_runs_neither_grow_the_pool_nor_leak_the_displaced_buffer() 
 /// unchanged here; only recycling moves it, and only by that exact amount.
 #[test]
 fn displacing_a_promoted_operand_recycles_its_buffer_into_the_pool() {
-    use crate::session::gpu_activations::RunActivations;
+    use crate::session::gpu_activations::GpuActivations;
     use crate::session::gpu_dispatch::op_accepts_resident_slot;
 
     let Some((session, _inputs)) = shadowed_session() else {
@@ -1131,10 +1131,13 @@ fn displacing_a_promoted_operand_recycles_its_buffer_into_the_pool() {
     );
 
     let (graph, _weights) = shadowed_initializer_graph();
-    let mut activations =
-        RunActivations::new(true, &graph.nodes, &graph.output_names, |node, slot| {
-            op_accepts_resident_slot(&node.op, slot)
-        });
+    let mut activations = GpuActivations::new(
+        true,
+        &graph.nodes,
+        &graph.output_names,
+        crate::session::gpu_activations::KeepPolicy::EveryConsumer,
+        |node, slot| op_accepts_resident_slot(&node.op, slot),
+    );
     assert!(
         activations.may_keep(SHADOWED),
         "both consumers of `{SHADOWED}` bind it in a resident-capable slot and \

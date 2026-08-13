@@ -4,7 +4,7 @@ use crate::OnnxError;
 use std::collections::HashMap;
 
 #[cfg(feature = "gpu")]
-use super::gpu_activations::RunActivations;
+use super::gpu_activations::GpuActivations;
 #[cfg(feature = "gpu")]
 use oxionnx_gpu::{DeviceTensor, GpuOutput, OutputPlacement, TensorSource};
 
@@ -615,7 +615,7 @@ fn initializer_key<'a>(
     name: &'a str,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
-    activations: &RunActivations,
+    activations: &GpuActivations,
 ) -> Option<&'a str> {
     if name.is_empty() || intermediates.contains_key(name) || activations.holds_node_output(name) {
         return None;
@@ -744,7 +744,7 @@ impl From<GpuOutput> for DispatchOutcome {
 #[cfg(feature = "gpu")]
 fn node_output_placement(
     node: &Node,
-    activations: &RunActivations,
+    activations: &GpuActivations,
     gpu: &crate::gpu::GpuContext,
 ) -> OutputPlacement {
     let single_output = node.outputs.len() == 1;
@@ -790,7 +790,7 @@ pub(crate) async fn try_gpu_dispatch_async(
     node: &Node,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
-    activations: &RunActivations,
+    activations: &GpuActivations,
     gpu: &crate::gpu::GpuContext,
 ) -> Result<Option<DispatchOutcome>, OnnxError> {
     // [r3a] Residency-aware size gate. See
@@ -851,7 +851,7 @@ fn operand_census(
     node: &Node,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
-    activations: &RunActivations,
+    activations: &GpuActivations,
     gpu: &crate::gpu::GpuContext,
 ) -> OperandCensus {
     let mut census = OperandCensus {
@@ -899,7 +899,7 @@ async fn dispatch_node_async(
     node: &Node,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
-    activations: &RunActivations,
+    activations: &GpuActivations,
     gpu: &crate::gpu::GpuContext,
     placement: OutputPlacement,
 ) -> Result<Option<DispatchOutcome>, OnnxError> {
@@ -1653,7 +1653,7 @@ pub(crate) fn try_gpu_dispatch(
         // host tensors between nodes and always have. An empty plan makes every
         // placement decision come out `Host`, so this path is byte-for-byte the
         // dispatcher it was before residency existed.
-        let activations = RunActivations::default();
+        let activations = GpuActivations::default();
         let outcome = pollster::block_on(try_gpu_dispatch_async(
             node,
             weights,

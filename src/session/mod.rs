@@ -20,7 +20,10 @@ mod builder;
 pub mod cancellation;
 /// The run-scoped map from tensor name to device buffer: which activations stay
 /// on the device, and when each one is destroyed.
-#[cfg(feature = "gpu")]
+// The name -> device-buffer map is backend-generic (see the module header), so
+// it is compiled for either accelerator that has one: wgpu drives it from
+// `run_gpu_async`, CUDA from the synchronous `run` loop.
+#[cfg(any(feature = "gpu", feature = "cuda"))]
 pub(crate) mod gpu_activations;
 #[cfg(feature = "gpu")]
 mod gpu_dispatch;

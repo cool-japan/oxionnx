@@ -45,7 +45,7 @@ use crate::memory::SizeClassPool;
 use crate::tensor::Tensor;
 use crate::OnnxError;
 
-use super::super::gpu_activations::RunActivations;
+use super::super::gpu_activations::GpuActivations;
 use super::super::gpu_dispatch::{op_accepts_resident_slot, DispatchOutcome};
 use super::super::types::NodeProfile;
 use super::super::Session;
@@ -217,10 +217,14 @@ impl Session {
             .gpu
             .as_ref()
             .is_some_and(|ctx| ctx.activation_residency_enabled());
-        let mut activations = RunActivations::new(
+        let mut activations = GpuActivations::new(
             residency_enabled,
             &self.sorted_nodes,
             &self.output_names,
+            // The strict rule, unchanged and deliberately so: it is what was
+            // measured on this backend. See `KeepPolicy` for the trade the CUDA
+            // path takes instead, and why the two differ.
+            crate::session::gpu_activations::KeepPolicy::EveryConsumer,
             |node, slot| op_accepts_resident_slot(&node.op, slot),
         );
 
@@ -333,7 +337,7 @@ impl Session {
         &self,
         node: &Node,
         state: &SessionRunState,
-        activations: &RunActivations,
+        activations: &GpuActivations,
         resolved: &HashMap<String, Vec<usize>>,
     ) -> usize {
         let estimate = Self::estimate_output_bytes(node, state.as_map(), &self.weights, resolved);
@@ -382,7 +386,7 @@ impl Session {
         &self,
         node: &Node,
         state: &SessionRunState,
-        activations: &mut RunActivations,
+        activations: &mut GpuActivations,
     ) {
         use crate::session::gpu_residency::{
             gpu_min_transfer_elements, ResidencyTier, MEMORY_BOUND_TRANSFER_FLOOR,
@@ -471,7 +475,7 @@ impl Session {
         &self,
         node: &Node,
         state: &mut SessionRunState,
-        activations: &RunActivations,
+        activations: &GpuActivations,
     ) -> Result<(), OnnxError> {
         if !activations.is_enabled() {
             return Ok(());
@@ -530,7 +534,7 @@ impl Session {
         &self,
         node: &Node,
         state: &mut SessionRunState,
-        activations: &mut RunActivations,
+        activations: &mut GpuActivations,
         resolved_shapes: &HashMap<String, Vec<usize>>,
     ) -> Result<bool, OnnxError> {
         let Some(gpu_ctx) = &self.gpu else {

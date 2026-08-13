@@ -42,10 +42,25 @@ use oxicuda_ptx::{
     templates::elementwise::{ElementwiseOp, ElementwiseTemplate},
 };
 
+use crate::activation::{
+    finish_output, retire_queued, CudaOutputPlacement, InputBinding, KernelOutput,
+};
 use crate::context::CudaContext;
 use crate::error::CudaDispatchError;
 
 const BLOCK_SIZE: u32 = 256;
+
+/// Residency-cache slot label for a unary operand.
+///
+/// Elementwise operands are never weight-cached (see the module docs), so
+/// these labels only ever tag a transient pooled upload — but the binding API
+/// takes one uniformly, and a distinct label per slot keeps the two binary
+/// operands from ever being confused for one another should that change.
+const INPUT_LABEL: &str = "elementwise_in";
+/// Residency-cache slot label for a binary op's left operand.
+const LHS_LABEL: &str = "elementwise_lhs";
+/// Residency-cache slot label for a binary op's right operand.
+const RHS_LABEL: &str = "elementwise_rhs";
 
 /// Map an ONNX unary op name to the corresponding [`ElementwiseOp`].
 fn unary_op_for(op_name: &str) -> Result<ElementwiseOp, CudaDispatchError> {
@@ -123,9 +138,45 @@ pub fn cuda_elementwise(
     data: &[f32],
     op_name: &str,
 ) -> Result<Vec<f32>, CudaDispatchError> {
+    match cuda_elementwise_bound(
+        ctx,
+        InputBinding::Host(data),
+        &[data.len()],
+        op_name,
+        CudaOutputPlacement::Host,
+    )? {
+        KernelOutput::Host(out) => Ok(out),
+        // Unreachable: `CudaOutputPlacement::Host` was requested, and
+        // `finish_output` only returns `Device` for a `Device` request.
+        KernelOutput::Device(_) => Err(CudaDispatchError::Shape {
+            op: "elementwise",
+            msg: "host placement produced a device-resident result".to_string(),
+        }),
+    }
+}
+
+/// [`cuda_elementwise`] over an operand that may already be on the device,
+/// leaving the result there when the caller asks for it.
+///
+/// The residency-aware form: an operand bound from a device buffer costs no
+/// upload, and a result the caller wants kept costs no read-back and **no
+/// fence**. `shape` is the output shape, which for a unary elementwise op is
+/// the input's.
+///
+/// # Errors
+///
+/// As [`cuda_elementwise`], plus a [`CudaDispatchError::Shape`] when a
+/// resident operand is shorter than the shape it claims.
+pub(crate) fn cuda_elementwise_bound(
+    ctx: &CudaContext,
+    input: InputBinding<'_>,
+    shape: &[usize],
+    op_name: &str,
+    placement: CudaOutputPlacement,
+) -> Result<KernelOutput, CudaDispatchError> {
     let kernel = kernel_for(ctx, unary_op_for(op_name)?)?;
 
-    let n = data.len();
+    let n = input.len();
     let Ok(n_u32) = u32::try_from(n) else {
         return Err(CudaDispatchError::Shape {
             op: "elementwise",
@@ -135,11 +186,16 @@ pub fn cuda_elementwise(
 
     // Upload, launch and readback all ride `ctx.dnn.stream()` — the stream the
     // kernel is launched on. Stream order alone sequences them, so the only
-    // host/device rendezvous is the single synchronise at the end.
+    // host/device rendezvous is the single synchronise at the end — and on the
+    // resident path there is not even that one.
     let stream = ctx.dnn.stream();
-    let mut d_input = ctx.scratch(n)?;
-    d_input.upload(data, stream)?;
-    let mut d_output = ctx.scratch(n)?;
+    let Some(mut d_input) = input.bind(ctx, INPUT_LABEL, n, stream)? else {
+        return Err(CudaDispatchError::Shape {
+            op: "elementwise",
+            msg: format!("operand cannot supply the {n} elements its shape declares"),
+        });
+    };
+    let d_output = ctx.scratch(n)?;
 
     // No zero-fill: the grid covers `[0, n)` and the kernel writes every
     // element of that range, so nothing a previous borrower left is ever read.
@@ -152,14 +208,14 @@ pub fn cuda_elementwise(
         .launch(&params, stream, &args)
         .map_err(CudaDispatchError::Driver)?;
 
-    let mut out = vec![0.0_f32; n];
-    d_output.download(&mut out, stream)?;
-    stream.synchronize().map_err(CudaDispatchError::Driver)?;
-    // ...and only now may these allocations go back to the pool. See
-    // `PooledBuffer`'s "a borrow is only recycled once its stream work is
-    // known to be done".
-    d_input.retire();
-    d_output.retire();
+    let out = finish_output(ctx, d_output, n, shape, placement, stream)?;
+    // The input borrow can go back to the pool now: on the host path the fence
+    // inside `finish_output` has already passed, and on the device path stream
+    // order protects it (see `mod@crate::activation`).
+    match &out {
+        KernelOutput::Host(_) => d_input.retire(),
+        KernelOutput::Device(_) => retire_queued(ctx, &mut d_input),
+    }
     Ok(out)
 }
 
@@ -224,6 +280,36 @@ pub fn cuda_binary_elementwise(
     b: &[f32],
     op_name: &str,
 ) -> Result<Vec<f32>, CudaDispatchError> {
+    match cuda_binary_elementwise_bound(
+        ctx,
+        InputBinding::Host(a),
+        InputBinding::Host(b),
+        &[a.len()],
+        op_name,
+        CudaOutputPlacement::Host,
+    )? {
+        KernelOutput::Host(out) => Ok(out),
+        KernelOutput::Device(_) => Err(CudaDispatchError::Shape {
+            op: "binary_elementwise",
+            msg: "host placement produced a device-resident result".to_string(),
+        }),
+    }
+}
+
+/// [`cuda_binary_elementwise`] over operands that may already be on the
+/// device, leaving the result there when the caller asks for it.
+///
+/// # Errors
+///
+/// As [`cuda_binary_elementwise`].
+pub(crate) fn cuda_binary_elementwise_bound(
+    ctx: &CudaContext,
+    a: InputBinding<'_>,
+    b: InputBinding<'_>,
+    shape: &[usize],
+    op_name: &str,
+    placement: CudaOutputPlacement,
+) -> Result<KernelOutput, CudaDispatchError> {
     if a.len() != b.len() {
         return Err(CudaDispatchError::Shape {
             op: "binary_elementwise",
@@ -246,11 +332,16 @@ pub fn cuda_binary_elementwise(
     };
 
     let stream = ctx.dnn.stream();
-    let mut d_a = ctx.scratch(n)?;
-    d_a.upload(a, stream)?;
-    let mut d_b = ctx.scratch(n)?;
-    d_b.upload(b, stream)?;
-    let mut d_output = ctx.scratch(n)?;
+    let (Some(mut d_a), Some(mut d_b)) = (
+        a.bind(ctx, LHS_LABEL, n, stream)?,
+        b.bind(ctx, RHS_LABEL, n, stream)?,
+    ) else {
+        return Err(CudaDispatchError::Shape {
+            op: "binary_elementwise",
+            msg: format!("an operand cannot supply the {n} elements its shape declares"),
+        });
+    };
+    let d_output = ctx.scratch(n)?;
 
     let grid = grid_size_for(n_u32, BLOCK_SIZE);
     let params = LaunchParams::new(Dim3::from(grid), Dim3::from(BLOCK_SIZE));
@@ -264,11 +355,16 @@ pub fn cuda_binary_elementwise(
         .launch(&params, stream, &args)
         .map_err(CudaDispatchError::Driver)?;
 
-    let mut out = vec![0.0_f32; n];
-    d_output.download(&mut out, stream)?;
-    stream.synchronize().map_err(CudaDispatchError::Driver)?;
-    d_a.retire();
-    d_b.retire();
-    d_output.retire();
+    let out = finish_output(ctx, d_output, n, shape, placement, stream)?;
+    match &out {
+        KernelOutput::Host(_) => {
+            d_a.retire();
+            d_b.retire();
+        }
+        KernelOutput::Device(_) => {
+            retire_queued(ctx, &mut d_a);
+            retire_queued(ctx, &mut d_b);
+        }
+    }
     Ok(out)
 }

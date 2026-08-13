@@ -43,6 +43,7 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_safety_doc)]
 
+pub mod activation;
 pub mod context;
 pub mod conv;
 pub mod elementwise;
@@ -54,6 +55,9 @@ pub mod reference;
 pub mod residency;
 pub mod softmax;
 
+pub use activation::{
+    CudaDeviceTensor, CudaDispatchOutcome, CudaOutputPlacement, NoActivations, ResidentActivations,
+};
 pub use context::CudaContext;
 /// Re-exported at the crate root because the *session runner* — not a CUDA
 /// caller — is what has to ask this question, on the error it just got back
@@ -66,6 +70,7 @@ use std::collections::HashMap;
 use oxionnx_core::graph::{Node, OpKind};
 use oxionnx_core::{OnnxError, Tensor};
 
+use activation::InputBinding;
 use context::FailurePolicy;
 
 /// Report whether [`try_cuda_dispatch`] is *capable* of claiming `op`.
@@ -225,7 +230,14 @@ fn activate_context(ctx: &CudaContext) -> Result<(), OnnxError> {
         .map_err(|e| OnnxError::from(CudaError::from(e)))
 }
 
-/// Attempt to dispatch a single ONNX node to the CUDA backend.
+/// Attempt to dispatch a single ONNX node to the CUDA backend, returning host
+/// tensors.
+///
+/// The pre-residency entry point, and still the one every non-`oxionnx` caller
+/// wants: it passes [`NoActivations`] and asks for
+/// [`CudaOutputPlacement::Host`], so its behaviour is byte-for-byte what it was
+/// before activations could stay on the device — one upload per operand, one
+/// read-back, one fence.
 ///
 /// Returns `Ok(Some(results))` if the op was handled by CUDA,
 /// `Ok(None)` if the op is unsupported or the configuration is not
@@ -235,14 +247,140 @@ fn activate_context(ctx: &CudaContext) -> Result<(), OnnxError> {
 /// [`is_supported_op`] is the cheap pre-filter for this function: when it
 /// returns `false`, this function is guaranteed to return `Ok(None)`.
 ///
+/// # Errors
+///
+/// As [`try_cuda_dispatch_resident`].
+pub fn try_cuda_dispatch(
+    node: &Node,
+    weights: &HashMap<String, Tensor>,
+    intermediates: &HashMap<String, Tensor>,
+    ctx: &CudaContext,
+) -> Result<Option<Vec<Tensor>>, OnnxError> {
+    match try_cuda_dispatch_resident(
+        node,
+        weights,
+        intermediates,
+        &NoActivations,
+        CudaOutputPlacement::Host,
+        ctx,
+    )? {
+        Some(CudaDispatchOutcome::Host(results)) => Ok(Some(results)),
+        // Unreachable: `Host` placement was requested and every arm honours a
+        // host request. Reported rather than unwrapped, because "unreachable"
+        // is a claim about code that can be edited.
+        Some(CudaDispatchOutcome::Device(_)) => Err(OnnxError::Internal(format!(
+            "CUDA provider kept the result of node '{}' ({}) on the device although host \
+             placement was requested",
+            node.name,
+            node.op.as_str(),
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Whether the CUDA arm for `op` can bind a **device-resident** value in slot
+/// `index`, rather than needing its bytes on the host.
+///
+/// The session consults this once per graph, before the first node runs, to
+/// decide which values may stay on the device at all: a name is keepable only
+/// when *every* consumer can bind it in place, because one consumer that
+/// cannot would read it back a node later — the same round trip, moved.
+///
+/// Keeping this in step with the match arms in
+/// [`try_cuda_dispatch_resident`] is the one maintenance obligation residency
+/// adds. Getting it wrong is not a correctness bug — an unlisted slot only
+/// means the value is read back one node earlier, and a wrongly-listed one
+/// means the arm declines and the caller reads it back — but both give up the
+/// traffic residency exists to remove.
+///
+/// Mirrors `oxionnx::session::gpu_dispatch::op_accepts_resident_slot`, which
+/// answers the same question for the wgpu backend.
+///
+/// # Example
+///
+/// ```
+/// use oxionnx_core::graph::OpKind;
+///
+/// // A convolution's activation may be resident; its filter and bias are
+/// // graph initializers, read on the host and cached device-side by name.
+/// assert!(oxionnx_cuda::accepts_resident_slot(&OpKind::Conv, 0));
+/// assert!(!oxionnx_cuda::accepts_resident_slot(&OpKind::Conv, 1));
+/// // Both operands of an element-wise binary are real bindings.
+/// assert!(oxionnx_cuda::accepts_resident_slot(&OpKind::Add, 1));
+/// // No CUDA arm at all.
+/// assert!(!oxionnx_cuda::accepts_resident_slot(&OpKind::Reshape, 0));
+/// ```
+#[must_use]
+pub fn accepts_resident_slot(op: &OpKind, index: usize) -> bool {
+    match op {
+        // Slot 0 is the activation. A convolution's filter/bias and a Gemm's
+        // `B`/`C` are graph initializers whose *host* bytes the arm reads —
+        // to key them into the weight cache, and (for `transB`) to transpose
+        // them — so they are never bound from a run-scoped activation.
+        OpKind::Conv
+        | OpKind::MatMul
+        | OpKind::Gemm
+        | OpKind::Relu
+        | OpKind::Sigmoid
+        | OpKind::Gelu
+        | OpKind::Tanh
+        | OpKind::Exp
+        | OpKind::Sqrt
+        | OpKind::Abs
+        | OpKind::Neg
+        | OpKind::Log
+        | OpKind::Ceil
+        | OpKind::Floor
+        | OpKind::HardSigmoid
+        | OpKind::HardSwish
+        | OpKind::SiLU
+        | OpKind::Softplus
+        | OpKind::LeakyRelu
+        | OpKind::ReduceSum
+        | OpKind::ReduceMax
+        | OpKind::Softmax => index == 0,
+        // Both operands are real bindings.
+        OpKind::Add | OpKind::Sub | OpKind::Mul | OpKind::Div => index < 2,
+        _ => false,
+    }
+}
+
+/// One of a node's operands, wherever it currently lives.
+///
+/// The shape has to come from the *operand*, not from a host `Tensor`, because
+/// a resident operand has no host tensor at all — that is the whole point.
+struct NodeOperand<'a> {
+    /// The ONNX shape.
+    shape: &'a [usize],
+    /// Elements the operand holds.
+    len: usize,
+    /// Where the kernel will read it from.
+    binding: InputBinding<'a>,
+    /// The host tensor, when the operand has one. `None` for a resident value,
+    /// which is what stops it being keyed into the weight cache or handed to
+    /// the shadow-verification oracle.
+    host: Option<&'a Tensor>,
+}
+
+/// Attempt to dispatch a single ONNX node to the CUDA backend, binding
+/// device-resident operands in place and optionally leaving the result on the
+/// device.
+///
+/// This is the dispatcher proper; [`try_cuda_dispatch`] is a thin wrapper that
+/// supplies an empty activation map and a host placement request.
+///
+/// Returns `Ok(Some(outcome))` if CUDA handled the node, `Ok(None)` if the op
+/// is unsupported or this node's configuration is not acceleratable (the
+/// caller falls back), or `Err` on a hard CUDA failure.
+///
 /// # Thread affinity
 ///
 /// Unlike a raw driver context, callers do **not** need to dispatch from
 /// the same OS thread that built `ctx`: this function re-activates `ctx`
 /// on the calling thread itself (see the private `activate_context` helper
-/// just above this function) before doing anything else, defensively, on
-/// every call. See its doc comment for the concrete scenario (concurrent
-/// model loading) that makes this necessary.
+/// above) before doing anything else, defensively, on every call. See its doc
+/// comment for the concrete scenario (concurrent model loading) that makes
+/// this necessary.
 ///
 /// # `weights` is treated as invariant, and that is a contract
 ///
@@ -265,12 +403,35 @@ fn activate_context(ctx: &CudaContext) -> Result<(), OnnxError> {
 /// [`CudaContext::release_device_caches`] between the two.
 ///
 /// `intermediates` is never cached: those bytes are this run's activations.
-pub fn try_cuda_dispatch(
+/// Neither is anything `activations` holds — the session owns those buffers
+/// and releases them on its own last-use schedule.
+///
+/// # Interaction with `OXIONNX_CUDA_VERIFY`
+///
+/// Shadow verification needs the exact host bytes the kernel read *and* the
+/// exact host bytes it wrote, and a resident operand has neither. The session
+/// therefore switches activation residency off wholesale when
+/// [`reference::verify_enabled`] is true, so a verifying run is the fully
+/// materialising run it always was — slower, and comparable node for node with
+/// the oracle. The guard here is the belt to that braces: an arm whose result
+/// stayed on the device is not verified (there is nothing to compare), and an
+/// oracle that cannot be built from host bytes reports "no formula" rather
+/// than comparing against a substitute.
+///
+/// # Errors
+///
+/// [`OnnxError::Internal`] wrapping a [`CudaError`] on a driver, PTX or
+/// allocation failure, or [`error::CudaDispatchError::Verify`] when
+/// `OXIONNX_CUDA_VERIFY=1` proved a kernel wrong and `OXIONNX_CUDA_STRICT=1`
+/// says that ends the run.
+pub fn try_cuda_dispatch_resident(
     node: &Node,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
+    activations: &dyn ResidentActivations,
+    placement: CudaOutputPlacement,
     ctx: &CudaContext,
-) -> Result<Option<Vec<Tensor>>, OnnxError> {
+) -> Result<Option<CudaDispatchOutcome>, OnnxError> {
     activate_context(ctx)?;
 
     let resolve = |name: &str| -> Option<&Tensor> {
@@ -281,383 +442,494 @@ pub fn try_cuda_dispatch(
         }
     };
 
+    // The residency-aware operand lookup: a value this run left on the device
+    // is bound in place, everything else resolves to its host tensor exactly as
+    // before. Arms that read an operand's *contents* on the host (an `axes`
+    // list, a bias to fold, a weight to transpose) keep using `resolve` —
+    // which is why `accepts_resident_slot` names slots and not just ops.
+    let operand = |slot: usize| -> Option<NodeOperand<'_>> {
+        let name = node.inputs.get(slot)?;
+        if name.is_empty() {
+            return None;
+        }
+        if accepts_resident_slot(&node.op, slot) {
+            if let Some(tensor) = activations.resident(name) {
+                return Some(NodeOperand {
+                    shape: tensor.shape(),
+                    len: tensor.len(),
+                    binding: InputBinding::Device(tensor),
+                    host: None,
+                });
+            }
+        }
+        let tensor = resolve(name)?;
+        Some(NodeOperand {
+            shape: &tensor.shape,
+            len: tensor.data.len(),
+            binding: InputBinding::Host(&tensor.data),
+            host: Some(tensor),
+        })
+    };
+
+    // A node with more than one declared output cannot hand back a single
+    // device buffer, and no op below produces more than one result — so this
+    // only ever demotes a malformed request, never a legitimate one.
+    let placement = if node.outputs.len() == 1 {
+        placement
+    } else {
+        CudaOutputPlacement::Host
+    };
+
     match &node.op {
         // ------------------------------------------------------------------ //
         // MatMul / Gemm                                                        //
         // ------------------------------------------------------------------ //
         OpKind::MatMul | OpKind::Gemm => {
-            let a = resolve(&node.inputs[0]);
-            let b = resolve(&node.inputs[1]);
-            if let (Some(a), Some(b)) = (a, b) {
-                // Extract Gemm attributes (MatMul uses defaults).
-                let is_gemm = matches!(node.op, OpKind::Gemm);
-                let alpha = if is_gemm {
-                    node.attrs.f("alpha", 1.0)
-                } else {
-                    1.0
-                };
-                let beta = if is_gemm {
-                    node.attrs.f("beta", 1.0)
-                } else {
-                    0.0
-                };
-                let trans_a = is_gemm && node.attrs.i("transA", 0) != 0;
-                let trans_b = is_gemm && node.attrs.i("transB", 0) != 0;
+            let (Some(a), Some(b)) = (operand(0), operand(1)) else {
+                return Ok(None);
+            };
+            // Extract Gemm attributes (MatMul uses defaults).
+            let is_gemm = matches!(node.op, OpKind::Gemm);
+            let alpha = if is_gemm {
+                node.attrs.f("alpha", 1.0)
+            } else {
+                1.0
+            };
+            let beta = if is_gemm {
+                node.attrs.f("beta", 1.0)
+            } else {
+                0.0
+            };
+            let trans_a = is_gemm && node.attrs.i("transA", 0) != 0;
+            let trans_b = is_gemm && node.attrs.i("transB", 0) != 0;
 
-                let an = a.ndim();
-                let bn = b.ndim();
-                if an >= 2 && bn >= 2 {
-                    // Determine M, K, N accounting for transposes.
-                    let m = if trans_a {
-                        a.shape[an - 1]
-                    } else {
-                        a.shape[an - 2]
-                    };
-                    let k = if trans_a {
-                        a.shape[an - 2]
-                    } else {
-                        a.shape[an - 1]
-                    };
-                    let k2 = if trans_b {
-                        b.shape[bn - 1]
-                    } else {
-                        b.shape[bn - 2]
-                    };
-                    let n = if trans_b {
-                        b.shape[bn - 2]
-                    } else {
-                        b.shape[bn - 1]
-                    };
+            // A transposed operand is consumed as a *different byte sequence*
+            // from the one on the device, and this crate has no transpose
+            // kernel — the transpose is a host copy. So a resident operand the
+            // node wants transposed cannot be bound in place. Declining sends
+            // the node to the CPU, which materialises it; the alternative
+            // (transposing on the host) would need the bytes read back anyway.
+            // Not observed in any model in this workspace: `transA` is for a
+            // weight-shaped operand, and weights are not run-scoped
+            // activations.
+            if (trans_a && a.host.is_none()) || (trans_b && b.host.is_none()) {
+                return Ok(None);
+            }
 
-                    // A malformed model (K mismatch) or a degenerate
-                    // zero-sized operand is declined rather than risking a
-                    // divide-by-zero in the bias epilogue or a nonsensical
-                    // GPU launch; the CPU kernel raises the proper
-                    // diagnostic for the former.
-                    if k != k2 || m == 0 || k == 0 || n == 0 {
-                        return Ok(None);
-                    }
+            let an = a.shape.len();
+            let bn = b.shape.len();
+            if an < 2 || bn < 2 {
+                return Ok(None);
+            }
+            // Determine M, K, N accounting for transposes.
+            let m = if trans_a {
+                a.shape[an - 1]
+            } else {
+                a.shape[an - 2]
+            };
+            let k = if trans_a {
+                a.shape[an - 2]
+            } else {
+                a.shape[an - 1]
+            };
+            let k2 = if trans_b {
+                b.shape[bn - 1]
+            } else {
+                b.shape[bn - 2]
+            };
+            let n = if trans_b {
+                b.shape[bn - 2]
+            } else {
+                b.shape[bn - 1]
+            };
 
-                    // Batch-broadcast the leading dims with the same numpy
-                    // rule the CPU sibling (`oxionnx-ops::math::matmul::matmul`)
-                    // uses for its output shape. Unlike that CPU path, which
-                    // unconditionally modulo-indexes each operand
-                    // (`b_idx % operand_batches`), we additionally require
-                    // each operand's own batch count to be exactly `1`
-                    // (broadcasts) or exactly `batch` (no broadcast on that
-                    // operand) before dispatching to the GPU: unconditional
-                    // modulo indexing silently computes the *wrong* slice
-                    // whenever both operands broadcast on different
-                    // sub-axes of a multi-dimensional batch — e.g. A's
-                    // batch `[2, 1]` against B's `[1, 3]` needs the A-slice
-                    // sequence `0,0,0,1,1,1`, but `i % 2` yields
-                    // `0,1,0,1,0,1`. Declining that narrow case is a missed
-                    // acceleration, not a wrong answer: the CPU path runs
-                    // it either way.
-                    let a_batch_dims = &a.shape[..an - 2];
-                    let b_batch_dims = &b.shape[..bn - 2];
-                    let Ok(out_batch) = Tensor::broadcast_shape(a_batch_dims, b_batch_dims) else {
-                        return Ok(None);
-                    };
-                    let batch: usize = out_batch.iter().product::<usize>().max(1);
-                    let a_batches: usize = a_batch_dims.iter().product::<usize>().max(1);
-                    let b_batches: usize = b_batch_dims.iter().product::<usize>().max(1);
-                    if !(a_batches == 1 || a_batches == batch)
-                        || !(b_batches == 1 || b_batches == batch)
-                    {
-                        return Ok(None);
-                    }
+            // A malformed model (K mismatch) or a degenerate zero-sized
+            // operand is declined rather than risking a divide-by-zero in the
+            // bias epilogue or a nonsensical GPU launch; the CPU kernel raises
+            // the proper diagnostic for the former.
+            if k != k2 || m == 0 || k == 0 || n == 0 {
+                return Ok(None);
+            }
 
-                    // Checked size math: these are all derived from
-                    // model-supplied shape dims, so a corrupted/adversarial
-                    // shape must overflow into a decline, never a panic or a
-                    // silently-wrapped (wrong) buffer size.
-                    let (Some(slice_a), Some(slice_b), Some(slice_c)) =
-                        (m.checked_mul(k), k.checked_mul(n), m.checked_mul(n))
-                    else {
-                        return Ok(None);
-                    };
-                    let (Some(a_needed), Some(b_needed), Some(out_total)) = (
-                        a_batches.checked_mul(slice_a),
-                        b_batches.checked_mul(slice_b),
-                        batch.checked_mul(slice_c),
+            // Batch-broadcast the leading dims with the same numpy rule the
+            // CPU sibling (`oxionnx-ops::math::matmul::matmul`) uses for its
+            // output shape. Unlike that CPU path, which unconditionally
+            // modulo-indexes each operand (`b_idx % operand_batches`), we
+            // additionally require each operand's own batch count to be
+            // exactly `1` (broadcasts) or exactly `batch` (no broadcast on
+            // that operand) before dispatching to the GPU: unconditional
+            // modulo indexing silently computes the *wrong* slice whenever
+            // both operands broadcast on different sub-axes of a
+            // multi-dimensional batch — e.g. A's batch `[2, 1]` against B's
+            // `[1, 3]` needs the A-slice sequence `0,0,0,1,1,1`, but `i % 2`
+            // yields `0,1,0,1,0,1`. Declining that narrow case is a missed
+            // acceleration, not a wrong answer: the CPU path runs it either
+            // way.
+            let a_batch_dims = &a.shape[..an - 2];
+            let b_batch_dims = &b.shape[..bn - 2];
+            let Ok(out_batch) = Tensor::broadcast_shape(a_batch_dims, b_batch_dims) else {
+                return Ok(None);
+            };
+            let batch: usize = out_batch.iter().product::<usize>().max(1);
+            let a_batches: usize = a_batch_dims.iter().product::<usize>().max(1);
+            let b_batches: usize = b_batch_dims.iter().product::<usize>().max(1);
+            if !(a_batches == 1 || a_batches == batch) || !(b_batches == 1 || b_batches == batch) {
+                return Ok(None);
+            }
+
+            // Checked size math: these are all derived from model-supplied
+            // shape dims, so a corrupted/adversarial shape must overflow into
+            // a decline, never a panic or a silently-wrapped (wrong) buffer
+            // size.
+            let (Some(slice_a), Some(slice_b), Some(slice_c)) =
+                (m.checked_mul(k), k.checked_mul(n), m.checked_mul(n))
+            else {
+                return Ok(None);
+            };
+            let (Some(a_needed), Some(b_needed), Some(out_total)) = (
+                a_batches.checked_mul(slice_a),
+                b_batches.checked_mul(slice_b),
+                batch.checked_mul(slice_c),
+            ) else {
+                return Ok(None);
+            };
+            // Bounds-check up front rather than trusting `Tensor::new`'s
+            // debug-only length invariant (a malformed model can violate it in
+            // a release build).
+            if a.len < a_needed || b.len < b_needed {
+                return Ok(None);
+            }
+
+            // ── Operand residency ─────────────────────────────────────────
+            //
+            // A `MatMul`/`Gemm` operand that resolved out of `weights` rather
+            // than `intermediates` is a graph initializer: the same bytes on
+            // frame 1 and frame 10 000. `initializer_id` says so, keyed
+            // additionally by the *form* the GEMM needs, because a
+            // `transA`/`transB` node consumes the transpose of those bytes
+            // rather than the bytes themselves and the two must never share a
+            // cache slot. An operand bound from a run-scoped activation has no
+            // identity at all — `a.host` is `None`, and `initializer_id` is
+            // never reached for it.
+            let a_id = a.host.and_then(|tensor| {
+                initializer_id(
+                    node.inputs.first().map(String::as_str),
+                    weights,
+                    intermediates,
+                    activations,
+                    tensor,
+                    operand_form(trans_a),
+                )
+            });
+            let b_id = b.host.and_then(|tensor| {
+                initializer_id(
+                    node.inputs.get(1).map(String::as_str),
+                    weights,
+                    intermediates,
+                    activations,
+                    tensor,
+                    operand_form(trans_b),
+                )
+            });
+
+            // Ask the device before building anything. A resident transposed
+            // weight means the `transpose_2d_batched` call below -- an O(k*n)
+            // host copy, ~12 MiB of memcpy for ArcFace's head -- does not
+            // happen at all this frame.
+            let a_resident =
+                a_id.and_then(|id| ctx.resident_operand(id, matmul::A_LABEL, a_needed));
+            let b_resident =
+                b_id.and_then(|id| ctx.resident_operand(id, matmul::B_LABEL, b_needed));
+
+            // Materialise only what still has to cross the bus, and only when
+            // it genuinely differs from the tensor's own bytes. Transposition
+            // is done per the operand's *own* batch count, not the (possibly
+            // larger) broadcast `batch`: the host data holds only
+            // `a_batches`/`b_batches` slices, and transposing past that would
+            // read out of bounds.
+            //
+            // The untransposed case borrows the tensor's data in place. It
+            // used to `.clone()` it -- a full host copy of every operand on
+            // every dispatch, which for a 49 MiB weight is a memcpy the size of
+            // the upload it was feeding.
+            //
+            // `|| verify_on` is not an optimisation gap, it closes one: the
+            // oracle below has to see the same bytes the GPU multiplied, and
+            // for a *resident* transposed weight those bytes exist only on the
+            // device. Under `OXIONNX_CUDA_VERIFY=1` the transpose is therefore
+            // rebuilt anyway -- a diagnostic mode that already recomputes every
+            // op on the CPU is the right place to pay it, and skipping it would
+            // silently compare against the untransposed operand and report a
+            // mismatch on a correct dispatch.
+            let verify_on = reference::verify_enabled();
+            let a_transposed = (trans_a && (a_resident.is_none() || verify_on))
+                .then(|| {
+                    a.host.map(|tensor| {
+                        transpose_2d_batched(
+                            &tensor.data,
+                            a_batches,
+                            a.shape[an - 2],
+                            a.shape[an - 1],
+                        )
+                    })
+                })
+                .flatten();
+            let b_transposed = (trans_b && (b_resident.is_none() || verify_on))
+                .then(|| {
+                    b.host.map(|tensor| {
+                        transpose_2d_batched(
+                            &tensor.data,
+                            b_batches,
+                            b.shape[bn - 2],
+                            b.shape[bn - 1],
+                        )
+                    })
+                })
+                .flatten();
+
+            let a_operand = match (a_resident, a.binding) {
+                (Some(resident), _) => matmul::GemmOperand::from_resident(resident),
+                // A run-scoped activation is already a device buffer: bind it
+                // exactly as a resident weight is bound. This is the edge the
+                // whole wave turns on -- for SCRFD's `Conv -> Relu -> Add`
+                // chains it is every operand of every node after the first.
+                (None, InputBinding::Device(tensor)) => {
+                    ctx.caches.note_resident_bind();
+                    matmul::GemmOperand::from_resident(residency::Operand::Resident(tensor.share()))
+                }
+                (None, InputBinding::Host(data)) => {
+                    matmul::GemmOperand::from_host(a_transposed.as_deref().unwrap_or(data), a_id)
+                }
+            };
+            let b_operand = match (b_resident, b.binding) {
+                (Some(resident), _) => matmul::GemmOperand::from_resident(resident),
+                (None, InputBinding::Device(tensor)) => {
+                    ctx.caches.note_resident_bind();
+                    matmul::GemmOperand::from_resident(residency::Operand::Resident(tensor.share()))
+                }
+                (None, InputBinding::Host(data)) => {
+                    matmul::GemmOperand::from_host(b_transposed.as_deref().unwrap_or(data), b_id)
+                }
+            };
+
+            // ── Can the result stay on the device? ────────────────────────
+            //
+            // Only when nothing is left to do to it on the host. Two Gemm
+            // epilogues are computed host-side by design: `alpha` (kept off the
+            // kernel so the oracle grades an unscaled product -- see the
+            // `matmul` module docs) and the `beta * C` bias. Either one demotes
+            // the request to a read-back. Both are absent from a plain
+            // `MatMul`, and `alpha = 1, beta = 0` covers the fused-bias Gemms
+            // this pipeline actually runs... but not ArcFace's embedding head,
+            // whose bias is folded here and which therefore still reads back.
+            let host_epilogue = (alpha - 1.0).abs() > f32::EPSILON
+                || (is_gemm
+                    && beta.abs() > f32::EPSILON
+                    && node.inputs.get(2).and_then(|name| resolve(name)).is_some());
+            let effective_placement = if host_epilogue {
+                CudaOutputPlacement::Host
+            } else {
+                placement
+            };
+
+            let mut out_shape = out_batch;
+            out_shape.push(m);
+            out_shape.push(n);
+
+            // One upload / launch / readback for the whole batch, replacing
+            // what used to be `batch` complete round trips. The broadcast rule
+            // the loop expressed as `(i % operand_batches) * slice` is carried
+            // through unchanged as a batch stride -- see `matmul::plan_gemm`.
+            let request = matmul::BatchedGemm {
+                a: a_operand,
+                b: b_operand,
+                m,
+                k,
+                n,
+                batch,
+                a_batches,
+                b_batches,
+            };
+            let Some(kernel_out) =
+                matmul::cuda_gemm_batched_placed(ctx, request, &out_shape, effective_placement)
+                    .map_err(OnnxError::from)?
+            else {
+                return Ok(None);
+            };
+
+            let mut out = match kernel_out {
+                activation::KernelOutput::Device(tensor) => {
+                    return Ok(Some(CudaDispatchOutcome::Device(tensor)));
+                }
+                activation::KernelOutput::Host(data) => data,
+            };
+
+            // Shadow-verify the whole batch at once against the same per-slice
+            // oracle the loop used, slice by slice, with the same
+            // `(i % operand_batches)` indexing. Built only when verification is
+            // actually on: `verify_or_fallback` takes the oracle as a closure
+            // precisely so this costs nothing in production.
+            if !verify_or_fallback("MatMul/Gemm", &out, || {
+                let a_data = a_transposed.as_deref().or_else(|| a.binding.host())?;
+                let b_data = b_transposed.as_deref().or_else(|| b.binding.host())?;
+                let mut expected = Vec::with_capacity(out_total);
+                for i in 0..batch {
+                    let a_start = (i % a_batches) * slice_a;
+                    let b_start = (i % b_batches) * slice_b;
+                    // `.get()` rather than direct indexing: never index a
+                    // model-derived slice range without a bounds check, even
+                    // though `a_needed`/`b_needed` above already guarantee this
+                    // succeeds.
+                    let (Some(a_slice), Some(b_slice)) = (
+                        a_data.get(a_start..a_start + slice_a),
+                        b_data.get(b_start..b_start + slice_b),
                     ) else {
-                        return Ok(None);
+                        // The oracle cannot be built, so there is nothing to
+                        // compare against; `shadow_verify` treats `None` as "no
+                        // formula" and says so loudly rather than passing
+                        // silently.
+                        return None;
                     };
-                    // Bounds-check up front rather than trusting
-                    // `Tensor::new`'s debug-only length invariant (a
-                    // malformed model can violate it in a release build).
-                    if a.data.len() < a_needed || b.data.len() < b_needed {
-                        return Ok(None);
-                    }
+                    expected.extend(reference::ref_matmul(a_slice, b_slice, m, k, n));
+                }
+                Some(expected)
+            })? {
+                return Ok(None);
+            }
 
-                    // ── Operand residency ─────────────────────────────────
-                    //
-                    // A `MatMul`/`Gemm` operand that resolved out of `weights`
-                    // rather than `intermediates` is a graph initializer: the
-                    // same bytes on frame 1 and frame 10 000. `initializer_id`
-                    // says so, keyed additionally by the *form* the GEMM needs,
-                    // because a `transA`/`transB` node consumes the transpose
-                    // of those bytes rather than the bytes themselves and the
-                    // two must never share a cache slot.
-                    let a_id = initializer_id(
-                        node.inputs.first().map(String::as_str),
-                        weights,
-                        intermediates,
-                        a,
-                        operand_form(trans_a),
-                    );
-                    let b_id = initializer_id(
-                        node.inputs.get(1).map(String::as_str),
-                        weights,
-                        intermediates,
-                        b,
-                        operand_form(trans_b),
-                    );
-
-                    // Ask the device before building anything. A resident
-                    // transposed weight means the `transpose_2d_batched` call
-                    // below -- an O(k*n) host copy, ~12 MiB of memcpy for
-                    // ArcFace's head -- does not happen at all this frame.
-                    let a_resident =
-                        a_id.and_then(|id| ctx.resident_operand(id, matmul::A_LABEL, a_needed));
-                    let b_resident =
-                        b_id.and_then(|id| ctx.resident_operand(id, matmul::B_LABEL, b_needed));
-
-                    // Materialise only what still has to cross the bus, and
-                    // only when it genuinely differs from the tensor's own
-                    // bytes. Transposition is done per the operand's *own*
-                    // batch count, not the (possibly larger) broadcast
-                    // `batch`: `a.data`/`b.data` hold only
-                    // `a_batches`/`b_batches` slices, and transposing past
-                    // that would read out of bounds.
-                    //
-                    // The untransposed case borrows `a.data` in place. It used
-                    // to `.clone()` it -- a full host copy of every operand on
-                    // every dispatch, which for a 49 MiB weight is a memcpy the
-                    // size of the upload it was feeding.
-                    //
-                    // `|| verify_on` is not an optimisation gap, it closes one:
-                    // the oracle below has to see the same bytes the GPU
-                    // multiplied, and for a *resident* transposed weight those
-                    // bytes exist only on the device. Under `OXIONNX_CUDA_VERIFY=1`
-                    // the transpose is therefore rebuilt anyway -- a diagnostic
-                    // mode that already recomputes every op on the CPU is the
-                    // right place to pay it, and skipping it would silently
-                    // compare against the untransposed operand and report a
-                    // mismatch on a correct dispatch.
-                    let verify_on = reference::verify_enabled();
-                    let a_transposed =
-                        (trans_a && (a_resident.is_none() || verify_on)).then(|| {
-                            transpose_2d_batched(
-                                &a.data,
-                                a_batches,
-                                a.shape[an - 2],
-                                a.shape[an - 1],
-                            )
-                        });
-                    let b_transposed =
-                        (trans_b && (b_resident.is_none() || verify_on)).then(|| {
-                            transpose_2d_batched(
-                                &b.data,
-                                b_batches,
-                                b.shape[bn - 2],
-                                b.shape[bn - 1],
-                            )
-                        });
-
-                    let a_operand = match a_resident {
-                        Some(resident) => matmul::GemmOperand::from_resident(resident),
-                        None => matmul::GemmOperand::from_host(
-                            a_transposed.as_deref().unwrap_or(&a.data),
-                            a_id,
-                        ),
-                    };
-                    let b_operand = match b_resident {
-                        Some(resident) => matmul::GemmOperand::from_resident(resident),
-                        None => matmul::GemmOperand::from_host(
-                            b_transposed.as_deref().unwrap_or(&b.data),
-                            b_id,
-                        ),
-                    };
-
-                    // One upload / launch / readback for the whole batch,
-                    // replacing what used to be `batch` complete round trips.
-                    // The broadcast rule the loop expressed as
-                    // `(i % operand_batches) * slice` is carried through
-                    // unchanged as a batch stride -- see `matmul::plan_gemm`.
-                    let request = matmul::BatchedGemm {
-                        a: a_operand,
-                        b: b_operand,
-                        m,
-                        k,
-                        n,
-                        batch,
-                        a_batches,
-                        b_batches,
-                    };
-                    let Some(mut out) =
-                        matmul::cuda_gemm_batched(ctx, request).map_err(OnnxError::from)?
-                    else {
-                        return Ok(None);
-                    };
-
-                    // Shadow-verify the whole batch at once against the same
-                    // per-slice oracle the loop used, slice by slice, with the
-                    // same `(i % operand_batches)` indexing. Built only when
-                    // verification is actually on: `verify_or_fallback` takes
-                    // the oracle as a closure precisely so this costs nothing
-                    // in production.
-                    if !verify_or_fallback("MatMul/Gemm", &out, || {
-                        let a_data = a_transposed.as_deref().unwrap_or(&a.data);
-                        let b_data = b_transposed.as_deref().unwrap_or(&b.data);
-                        let mut expected = Vec::with_capacity(out_total);
-                        for i in 0..batch {
-                            let a_start = (i % a_batches) * slice_a;
-                            let b_start = (i % b_batches) * slice_b;
-                            // `.get()` rather than direct indexing: never
-                            // index a model-derived slice range without a
-                            // bounds check, even though `a_needed`/`b_needed`
-                            // above already guarantee this succeeds.
-                            let (Some(a_slice), Some(b_slice)) = (
-                                a_data.get(a_start..a_start + slice_a),
-                                b_data.get(b_start..b_start + slice_b),
-                            ) else {
-                                // The oracle cannot be built, so there is
-                                // nothing to compare against; `shadow_verify`
-                                // treats `None` as "no formula" and says so
-                                // loudly rather than passing silently.
-                                return None;
-                            };
-                            expected.extend(reference::ref_matmul(a_slice, b_slice, m, k, n));
-                        }
-                        Some(expected)
-                    })? {
-                        return Ok(None);
-                    }
-
-                    // Apply alpha scaling — after verification, so the oracle
-                    // stays the plain unscaled product. See the `matmul`
-                    // module docs' "Alpha stays on the host".
-                    if (alpha - 1.0).abs() > f32::EPSILON {
-                        for v in &mut out {
-                            *v *= alpha;
-                        }
-                    }
-
-                    // Gemm: C = alpha * A @ B + beta * bias
-                    if is_gemm && beta.abs() > f32::EPSILON {
-                        if let Some(bias) = node.inputs.get(2).and_then(|n| resolve(n)) {
-                            if !apply_gemm_bias(&mut out, &bias.data, &bias.shape, m, n, beta) {
-                                // `bias`'s shape isn't unidirectionally
-                                // broadcastable to [m, n] — a malformed
-                                // model. Decline rather than silently
-                                // dropping the bias; the CPU kernel raises
-                                // a proper diagnostic.
-                                return Ok(None);
-                            }
-                        }
-                    }
-
-                    let mut out_shape = out_batch;
-                    out_shape.push(m);
-                    out_shape.push(n);
-                    return Ok(Some(vec![Tensor::new(out, out_shape)]));
+            // Apply alpha scaling — after verification, so the oracle stays the
+            // plain unscaled product. See the `matmul` module docs' "Alpha
+            // stays on the host".
+            if (alpha - 1.0).abs() > f32::EPSILON {
+                for v in &mut out {
+                    *v *= alpha;
                 }
             }
-            Ok(None)
+
+            // Gemm: C = alpha * A @ B + beta * bias
+            if is_gemm && beta.abs() > f32::EPSILON {
+                if let Some(bias) = node.inputs.get(2).and_then(|n| resolve(n)) {
+                    if !apply_gemm_bias(&mut out, &bias.data, &bias.shape, m, n, beta) {
+                        // `bias`'s shape isn't unidirectionally broadcastable
+                        // to [m, n] — a malformed model. Decline rather than
+                        // silently dropping the bias; the CPU kernel raises a
+                        // proper diagnostic.
+                        return Ok(None);
+                    }
+                }
+            }
+
+            Ok(Some(CudaDispatchOutcome::Host(vec![Tensor::new(
+                out, out_shape,
+            )])))
         }
 
         // ------------------------------------------------------------------ //
         // Conv                                                                  //
         //                                                                      //
-        // `conv::cuda_conv` computes a real answer for three validated shape   //
-        // classes — 1x1, true-depthwise, and the general symmetric-padding     //
-        // case, dispatched straight to `oxicuda-dnn`'s `Conv1x1` /             //
-        // `DepthwiseConv` / `ImplicitGemmConv` engines respectively (see the   //
-        // `conv` module docs' "Dispatch rule"; note it never goes through      //
-        // `conv_forward`'s auto-selector) — and declines (`Ok(None)`)          //
-        // everything else, so this arm can yield either `Ok(Some(_))` or       //
-        // `Ok(None)` depending on the node's configuration. Its output is      //
-        // shadow-verified against `reference::ref_conv` through the same       //
-        // `verify_or_fallback` gate every other claimable op below uses, so    //
-        // `OXIONNX_CUDA_VERIFY=1` covers a Conv dispatch exactly like it       //
-        // covers MatMul/elementwise/reduce/Softmax. `is_supported_op` reports  //
-        // `true` for `Conv`, so `decide_placement` routes production           //
+        // `conv::cuda_conv_bound` computes a real answer for three validated   //
+        // shape classes — 1x1, true-depthwise, and the general                 //
+        // symmetric-padding case, dispatched straight to `oxicuda-dnn`'s       //
+        // `Conv1x1` / `DepthwiseConv` / `ImplicitGemmConv` engines             //
+        // respectively (see the `conv` module docs' "Dispatch rule"; note it   //
+        // never goes through `conv_forward`'s auto-selector) — and declines    //
+        // (`Ok(None)`) everything else, so this arm can yield either           //
+        // `Ok(Some(_))` or `Ok(None)` depending on the node's configuration.   //
+        // Its output is shadow-verified against `reference::ref_conv` through  //
+        // the same `verify_or_fallback` gate every other claimable op below    //
+        // uses, so `OXIONNX_CUDA_VERIFY=1` covers a Conv dispatch exactly like //
+        // it covers MatMul/elementwise/reduce/Softmax. `is_supported_op`       //
+        // reports `true` for `Conv`, so `decide_placement` routes production   //
         // convolutions here — this arm is on the hot path, not test-only.      //
         // ------------------------------------------------------------------ //
         OpKind::Conv => {
-            let input = resolve(&node.inputs[0]);
-            let weight = resolve(&node.inputs[1]);
+            let Some(input) = operand(0) else {
+                return Ok(None);
+            };
+            let Some(weight) = node.inputs.get(1).and_then(|n| resolve(n)) else {
+                return Ok(None);
+            };
             let bias = node.inputs.get(2).and_then(|n| resolve(n));
-            if let (Some(input), Some(weight)) = (input, weight) {
-                // Every attribute that changes what a `Conv` node computes is
-                // resolved in exactly one place, and anything this backend
-                // does not model declines the node rather than being ignored —
-                // see [`conv::conv_params_from_attrs`].
-                //
-                // This arm used to read `strides`/`pads`/`dilations`/`group`
-                // inline and nothing else. That silently dropped the
-                // optimizer's *fused activation* — `oxionnx` rewrites every
-                // `Conv -> Relu` pair into one `Conv_*_fused_activation` node
-                // carrying `activation="relu"`, so 26 of SCRFD det_10g's 58
-                // convolutions returned their raw, un-rectified output. The
-                // failure was invisible to `OXIONNX_CUDA_VERIFY=1` because the
-                // oracle read the same `ConvParams` and therefore skipped the
-                // same activation; see `reference::ref_conv`.
-                let Some(conv_params) =
-                    conv::conv_params_from_attrs(&node.attrs, &input.shape, &weight.shape)
-                else {
-                    return Ok(None);
-                };
 
-                // A convolution's filter and bias are the megabyte-scale
-                // invariant bytes in this workload -- InSwapper-128 alone
-                // re-uploaded ~503 MB of them per forward pass before
-                // residency existed. The input activation deliberately has no
-                // identity: it is this frame's data.
-                let conv_ids = conv::ConvWeightIds {
-                    weight: initializer_id(
-                        node.inputs.get(1).map(String::as_str),
+            // Every attribute that changes what a `Conv` node computes is
+            // resolved in exactly one place, and anything this backend does not
+            // model declines the node rather than being ignored — see
+            // [`conv::conv_params_from_attrs`].
+            //
+            // This arm used to read `strides`/`pads`/`dilations`/`group`
+            // inline and nothing else. That silently dropped the optimizer's
+            // *fused activation* — `oxionnx` rewrites every `Conv -> Relu` pair
+            // into one `Conv_*_fused_activation` node carrying
+            // `activation="relu"`, so 26 of SCRFD det_10g's 58 convolutions
+            // returned their raw, un-rectified output. The failure was
+            // invisible to `OXIONNX_CUDA_VERIFY=1` because the oracle read the
+            // same `ConvParams` and therefore skipped the same activation; see
+            // `reference::ref_conv`.
+            let Some(conv_params) =
+                conv::conv_params_from_attrs(&node.attrs, input.shape, &weight.shape)
+            else {
+                return Ok(None);
+            };
+
+            // A convolution's filter and bias are the megabyte-scale invariant
+            // bytes in this workload -- InSwapper-128 alone re-uploaded ~503 MB
+            // of them per forward pass before residency existed. The input
+            // activation deliberately has no identity: it is this frame's data.
+            let conv_ids = conv::ConvWeightIds {
+                weight: initializer_id(
+                    node.inputs.get(1).map(String::as_str),
+                    weights,
+                    intermediates,
+                    activations,
+                    weight,
+                    residency::OperandForm::Raw,
+                ),
+                bias: bias.and_then(|bias_tensor| {
+                    initializer_id(
+                        node.inputs.get(2).map(String::as_str),
                         weights,
                         intermediates,
-                        weight,
+                        activations,
+                        bias_tensor,
                         residency::OperandForm::Raw,
-                    ),
-                    bias: bias.and_then(|bias_tensor| {
-                        initializer_id(
-                            node.inputs.get(2).map(String::as_str),
-                            weights,
-                            intermediates,
-                            bias_tensor,
-                            residency::OperandForm::Raw,
-                        )
-                    }),
-                };
+                    )
+                }),
+            };
 
-                match conv::cuda_conv_cached(ctx, input, weight, bias, &conv_params, conv_ids)
-                    .map_err(OnnxError::from)?
-                {
-                    Some(tensor) => {
-                        let bias_data = bias.map(|b| b.data.as_slice());
-                        if !verify_or_fallback("Conv", &tensor.data, || {
-                            Some(reference::ref_conv(
-                                &input.data,
-                                &weight.data,
-                                bias_data,
-                                &input.shape,
-                                &weight.shape,
-                                &conv_params,
-                            ))
-                        })? {
-                            return Ok(None);
-                        }
-                        return Ok(Some(vec![tensor]));
-                    }
-                    None => return Ok(None),
+            match conv::cuda_conv_bound(
+                ctx,
+                input.binding,
+                input.shape,
+                weight,
+                bias,
+                &conv_params,
+                conv_ids,
+                placement,
+            )
+            .map_err(OnnxError::from)?
+            {
+                Some(conv::ConvOutput::Device(tensor)) => {
+                    Ok(Some(CudaDispatchOutcome::Device(tensor)))
                 }
+                Some(conv::ConvOutput::Host(tensor)) => {
+                    let bias_data = bias.map(|b| b.data.as_slice());
+                    let input_shape = input.shape.to_vec();
+                    if !verify_or_fallback("Conv", &tensor.data, || {
+                        Some(reference::ref_conv(
+                            input.binding.host()?,
+                            &weight.data,
+                            bias_data,
+                            &input_shape,
+                            &weight.shape,
+                            &conv_params,
+                        ))
+                    })? {
+                        return Ok(None);
+                    }
+                    Ok(Some(CudaDispatchOutcome::Host(vec![tensor])))
+                }
+                None => Ok(None),
             }
-            Ok(None)
         }
 
         // ------------------------------------------------------------------ //
@@ -726,141 +998,184 @@ pub fn try_cuda_dispatch(
                 _ => {}
             }
 
-            let input = resolve(&node.inputs[0]);
-            if let Some(input) = input {
-                let op_name = node.op.as_str();
-                let out = elementwise::cuda_elementwise(ctx, &input.data, op_name)
-                    .map_err(OnnxError::from)?;
-                if !verify_or_fallback(op_name, &out, || {
-                    reference::ref_unary_vec(&node.op, &input.data)
-                })? {
-                    return Ok(None);
+            let Some(input) = operand(0) else {
+                return Ok(None);
+            };
+            let op_name = node.op.as_str();
+            let out_shape = input.shape.to_vec();
+            let out = elementwise::cuda_elementwise_bound(
+                ctx,
+                input.binding,
+                &out_shape,
+                op_name,
+                placement,
+            )
+            .map_err(OnnxError::from)?;
+            match out {
+                activation::KernelOutput::Device(tensor) => {
+                    Ok(Some(CudaDispatchOutcome::Device(tensor)))
                 }
-                return Ok(Some(vec![Tensor::new(out, input.shape.clone())]));
+                activation::KernelOutput::Host(data) => {
+                    if !verify_or_fallback(op_name, &data, || {
+                        reference::ref_unary_vec(&node.op, input.binding.host()?)
+                    })? {
+                        return Ok(None);
+                    }
+                    Ok(Some(CudaDispatchOutcome::Host(vec![Tensor::new(
+                        data, out_shape,
+                    )])))
+                }
             }
-            Ok(None)
         }
 
         // ------------------------------------------------------------------ //
         // Binary elementwise (Add, Sub, Mul, Div)                              //
         // ------------------------------------------------------------------ //
         OpKind::Add | OpKind::Sub | OpKind::Mul | OpKind::Div => {
-            let a = resolve(&node.inputs[0]);
-            let b = resolve(&node.inputs[1]);
-            if let (Some(a), Some(b)) = (a, b) {
-                // Only dispatch when shapes match exactly (no broadcasting).
-                if a.shape == b.shape {
-                    let op_name = node.op.as_str();
-                    let out = elementwise::cuda_binary_elementwise(ctx, &a.data, &b.data, op_name)
-                        .map_err(OnnxError::from)?;
-                    if !verify_or_fallback(op_name, &out, || {
-                        reference::ref_binary_vec(&node.op, &a.data, &b.data)
+            let (Some(a), Some(b)) = (operand(0), operand(1)) else {
+                return Ok(None);
+            };
+            // Only dispatch when shapes match exactly (no broadcasting).
+            if a.shape != b.shape {
+                return Ok(None);
+            }
+            let op_name = node.op.as_str();
+            let out_shape = a.shape.to_vec();
+            let out = elementwise::cuda_binary_elementwise_bound(
+                ctx, a.binding, b.binding, &out_shape, op_name, placement,
+            )
+            .map_err(OnnxError::from)?;
+            match out {
+                activation::KernelOutput::Device(tensor) => {
+                    Ok(Some(CudaDispatchOutcome::Device(tensor)))
+                }
+                activation::KernelOutput::Host(data) => {
+                    if !verify_or_fallback(op_name, &data, || {
+                        reference::ref_binary_vec(&node.op, a.binding.host()?, b.binding.host()?)
                     })? {
                         return Ok(None);
                     }
-                    return Ok(Some(vec![Tensor::new(out, a.shape.clone())]));
+                    Ok(Some(CudaDispatchOutcome::Host(vec![Tensor::new(
+                        data, out_shape,
+                    )])))
                 }
             }
-            Ok(None)
         }
 
         // ------------------------------------------------------------------ //
         // Reductions                                                           //
         // ------------------------------------------------------------------ //
         OpKind::ReduceSum | OpKind::ReduceMax => {
-            let input = resolve(&node.inputs[0]);
-            if let Some(input) = input {
-                let axes = node.attrs.ints("axes");
-                if axes.len() == 1 {
-                    let rank = input.shape.len();
-                    let raw_axis = axes[0];
-                    // ONNX permits a negative axis, resolved against rank.
-                    let resolved_axis = if raw_axis < 0 {
-                        raw_axis + rank as i64
-                    } else {
-                        raw_axis
-                    };
-                    if resolved_axis < 0 || resolved_axis as usize >= rank {
-                        // Out of range for `input`'s rank — a malformed
-                        // model; decline and let the CPU kernel raise the
-                        // proper diagnostic.
+            let Some(input) = operand(0) else {
+                return Ok(None);
+            };
+            let axes = node.attrs.ints("axes");
+            if axes.len() != 1 {
+                return Ok(None);
+            }
+            let rank = input.shape.len();
+            let raw_axis = axes[0];
+            // ONNX permits a negative axis, resolved against rank.
+            let resolved_axis = if raw_axis < 0 {
+                raw_axis + rank as i64
+            } else {
+                raw_axis
+            };
+            if resolved_axis < 0 || resolved_axis as usize >= rank {
+                // Out of range for `input`'s rank — a malformed model; decline
+                // and let the CPU kernel raise the proper diagnostic.
+                return Ok(None);
+            }
+            let axis = resolved_axis as usize;
+            // ONNX ReduceSum/ReduceMax default `keepdims` to 1 (the reduced
+            // axis stays, size 1); `keepdims=0` removes it from the output
+            // shape entirely. `cuda_reduce`'s data layout (`[outer, inner]`)
+            // is identical either way — only the declared shape differs.
+            let keepdims = node.attrs.i("keepdims", 1) != 0;
+            let mut out_shape = input.shape.to_vec();
+            if keepdims {
+                out_shape[axis] = 1;
+            } else {
+                out_shape.remove(axis);
+            }
+            let op_name = node.op.as_str();
+            let in_shape = input.shape.to_vec();
+            match reduce::cuda_reduce_bound(
+                ctx,
+                input.binding,
+                &in_shape,
+                axis,
+                op_name,
+                &out_shape,
+                placement,
+            )
+            .map_err(OnnxError::from)?
+            {
+                Some(activation::KernelOutput::Device(tensor)) => {
+                    Ok(Some(CudaDispatchOutcome::Device(tensor)))
+                }
+                Some(activation::KernelOutput::Host(data)) => {
+                    if !verify_or_fallback(op_name, &data, || {
+                        reference::ref_reduce(&node.op, input.binding.host()?, &in_shape, axis)
+                    })? {
                         return Ok(None);
                     }
-                    let axis = resolved_axis as usize;
-                    // ONNX ReduceSum/ReduceMax default `keepdims` to 1 (the
-                    // reduced axis stays, size 1); `keepdims=0` removes it
-                    // from the output shape entirely. `cuda_reduce`'s data
-                    // layout (`[outer, inner]`) is identical either way —
-                    // only the declared shape differs.
-                    let keepdims = node.attrs.i("keepdims", 1) != 0;
-                    let op_name = node.op.as_str();
-                    match reduce::cuda_reduce(ctx, &input.data, &input.shape, axis, op_name)
-                        .map_err(OnnxError::from)?
-                    {
-                        Some(out) => {
-                            if !verify_or_fallback(op_name, &out, || {
-                                reference::ref_reduce(&node.op, &input.data, &input.shape, axis)
-                            })? {
-                                return Ok(None);
-                            }
-                            let mut out_shape = input.shape.clone();
-                            if keepdims {
-                                out_shape[axis] = 1;
-                            } else {
-                                out_shape.remove(axis);
-                            }
-                            return Ok(Some(vec![Tensor::new(out, out_shape)]));
-                        }
-                        None => return Ok(None),
-                    }
+                    Ok(Some(CudaDispatchOutcome::Host(vec![Tensor::new(
+                        data, out_shape,
+                    )])))
                 }
+                None => Ok(None),
             }
-            Ok(None)
         }
 
         // ------------------------------------------------------------------ //
         // Softmax                                                              //
         // ------------------------------------------------------------------ //
         OpKind::Softmax => {
-            let input = resolve(&node.inputs[0]);
-            if let Some(input) = input {
-                let rank = input.shape.len();
-                if rank == 0 {
-                    return Ok(None);
-                }
-                let raw_axis = node.attrs.i("axis", -1);
-                let resolved_axis = if raw_axis < 0 {
-                    raw_axis + rank as i64
-                } else {
-                    raw_axis
-                };
-                // Out of `[-rank, rank)` is a malformed model — decline and
-                // let the CPU kernel raise the proper diagnostic. Anything
-                // other than the last dimension is not malformed, but
-                // `cuda_softmax`'s row/batch decomposition cannot express
-                // it (it always normalizes `shape[rank-1]`), so it also
-                // declines, cleanly, to the axis-aware CPU kernel.
-                if resolved_axis < 0
-                    || resolved_axis as usize >= rank
-                    || resolved_axis as usize != rank - 1
-                {
-                    return Ok(None);
-                }
-                match softmax::cuda_softmax(ctx, &input.data, &input.shape)
-                    .map_err(OnnxError::from)?
-                {
-                    Some(out) => {
-                        if !verify_or_fallback("Softmax", &out, || {
-                            reference::ref_softmax(&input.data, &input.shape)
-                        })? {
-                            return Ok(None);
-                        }
-                        return Ok(Some(vec![Tensor::new(out, input.shape.clone())]));
-                    }
-                    None => return Ok(None),
-                }
+            let Some(input) = operand(0) else {
+                return Ok(None);
+            };
+            let rank = input.shape.len();
+            if rank == 0 {
+                return Ok(None);
             }
-            Ok(None)
+            let raw_axis = node.attrs.i("axis", -1);
+            let resolved_axis = if raw_axis < 0 {
+                raw_axis + rank as i64
+            } else {
+                raw_axis
+            };
+            // Out of `[-rank, rank)` is a malformed model — decline and let the
+            // CPU kernel raise the proper diagnostic. Anything other than the
+            // last dimension is not malformed, but `cuda_softmax`'s row/batch
+            // decomposition cannot express it (it always normalizes
+            // `shape[rank-1]`), so it also declines, cleanly, to the axis-aware
+            // CPU kernel.
+            if resolved_axis < 0
+                || resolved_axis as usize >= rank
+                || resolved_axis as usize != rank - 1
+            {
+                return Ok(None);
+            }
+            let out_shape = input.shape.to_vec();
+            match softmax::cuda_softmax_bound(ctx, input.binding, &out_shape, placement)
+                .map_err(OnnxError::from)?
+            {
+                Some(activation::KernelOutput::Device(tensor)) => {
+                    Ok(Some(CudaDispatchOutcome::Device(tensor)))
+                }
+                Some(activation::KernelOutput::Host(data)) => {
+                    if !verify_or_fallback("Softmax", &data, || {
+                        reference::ref_softmax(input.binding.host()?, &out_shape)
+                    })? {
+                        return Ok(None);
+                    }
+                    Ok(Some(CudaDispatchOutcome::Host(vec![Tensor::new(
+                        data, out_shape,
+                    )])))
+                }
+                None => Ok(None),
+            }
         }
 
         _ => Ok(None),
@@ -877,12 +1192,19 @@ pub fn try_cuda_dispatch(
 /// activation means every later frame is computed against the first frame's
 /// numbers, silently.
 ///
-/// Two conditions, both necessary:
+/// Three conditions, all necessary:
 ///
 /// * **Not an intermediate.** `resolve` prefers `intermediates` over
 ///   `weights`, so a name a node has already produced this run is *not* an
 ///   initializer here whatever the weight map also holds under it. Keying such
 ///   a name would cache one tensor's bytes and then serve them for another's.
+/// * **Not a device-resident node output.** The same rule, for the half of the
+///   run state that no longer lives in `intermediates`: once activations can
+///   stay on the device, a node output need not appear in the host map at all,
+///   so the check above stops covering it. A model that reuses one name for an
+///   initializer *and* a node output — legal ONNX — would otherwise have the
+///   initializer's bytes cached and then served for the activation's. Mirrors
+///   `initializer_key`'s `holds_node_output` guard on the wgpu path.
 /// * **Present in `weights`.** That is what "initializer" means at this layer.
 ///
 /// Mirrors `oxionnx::session::gpu_dispatch`'s `initializer_key`, which makes
@@ -891,11 +1213,12 @@ fn initializer_id<'a>(
     name: Option<&'a str>,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
+    activations: &dyn ResidentActivations,
     tensor: &Tensor,
     form: residency::OperandForm,
 ) -> Option<residency::WeightId<'a>> {
     let name = name?;
-    if name.is_empty() || intermediates.contains_key(name) {
+    if name.is_empty() || intermediates.contains_key(name) || activations.holds_node_output(name) {
         return None;
     }
     weights
