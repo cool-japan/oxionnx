@@ -27,18 +27,18 @@
 //! `TILED_MATMUL_SHADER`) would fix this and is the natural next
 //! optimization once this kernel is integrated into session dispatch.
 //!
-//! See [`kernel_support`](super::kernel_support) for why this kernel's
-//! pipeline is rebuilt on every call and why there is no minimum-size gate.
+//! See [`kernel_support`](super::kernel_support) for why this kernel builds its
+//! pipeline at its entry point rather than eagerly on the context, and why
+//! there is no minimum-size gate.
 
 use crate::context::activation::{GpuOutput, OutputPlacement, TensorSource};
+use crate::context::pipeline_cache::PipelineLookup;
 use crate::context::{GpuContext, WeightFormat, WeightKeys};
 use crate::device_guard::{
     block_on_gpu, checked_storage_bytes, dispatch_2d_fits, finish_output_async, ErrorScope,
 };
 
-use super::kernel_support::{
-    bgl_ro, bgl_rw, bgl_uniform, build_pipeline, insert_for_current_device,
-};
+use super::kernel_support::{bgl_ro, bgl_rw, bgl_uniform, build_pipeline};
 
 /// Tile width/height for the 2-D dispatch grid (`@workgroup_size(16, 16)`).
 const GEMM_WG: u32 = 16;
@@ -120,110 +120,73 @@ fn gemm_nt(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-pub(crate) fn build_gemm_nt_pipeline(
-    device: &wgpu::Device,
-) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-    build_pipeline(
-        device,
-        "gemm_nt",
-        GEMM_NT_SHADER,
-        "gemm_nt",
-        &[bgl_ro(0), bgl_ro(1), bgl_ro(2), bgl_rw(3), bgl_uniform(4)],
-    )
+/// The bind group layout both precision variants of this kernel use:
+/// `A`, `B`, `C`, output, params.
+fn gemm_bgl_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
+    [bgl_ro(0), bgl_ro(1), bgl_ro(2), bgl_rw(3), bgl_uniform(4)]
 }
 
-thread_local! {
-    /// Devices whose `f16` `gemm_nt` pipeline failed to compile. See
-    /// `conv2d`'s `CONV2D_F16_UNAVAILABLE` for why this is a negative cache
-    /// rather than a `mark_degraded`.
-    ///
-    /// Inserted through [`insert_for_current_device`]: these are device
-    /// handles, and a remembered verdict must not keep its device alive for
-    /// the thread's lifetime.
-    static GEMM_F16_UNAVAILABLE: std::cell::RefCell<Vec<wgpu::Device>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// This kernel's shader module label, which is also its `@compute` entry point.
+const GEMM_LABEL: &str = "gemm_nt";
 
-    /// Devices whose `f16` pipeline has already compiled cleanly once.
-    ///
-    /// `build_pipeline` memoizes the pipeline itself, but its cache is private
-    /// to `kernel_support`, so without this marker every dispatch would push
-    /// and pop an error scope around a call that is really a cache hit. This
-    /// mirrors `conv2d_pipeline_f16_async`, which can consult its own positive
-    /// cache directly.
-    ///
-    /// Inserted through [`insert_for_current_device`], for the same reason as
-    /// the negative cache above.
-    static GEMM_F16_READY: std::cell::RefCell<Vec<wgpu::Device>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// [w2-f16] The half-precision variant's label — a different label for the same
+/// entry point, so the two can never share a slot in the pipeline cache.
+const GEMM_F16_LABEL: &str = "gemm_nt_f16";
+
+/// This kernel's `f32` pipeline, compiled once per context.
+fn gemm_nt_pipeline(ctx: &GpuContext) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    build_pipeline(
+        ctx,
+        GEMM_LABEL,
+        GEMM_NT_SHADER,
+        GEMM_LABEL,
+        &gemm_bgl_entries(),
+    )
 }
 
 /// The compiled `f16` `gemm_nt` pipeline for this context, or `None` when half
 /// precision is unavailable here.
 ///
-/// Pipeline-cache keying needs no extra work in this kernel:
-/// [`build_pipeline`] keys on `(device, label, entry_point, src)`, and the two
-/// variants differ in both `label` and `src`. So a context that flips the
-/// toggle cannot be served the other variant's pipeline by construction.
+/// Pipeline-cache keying needs no extra work in this kernel: entries are keyed
+/// on `(label, entry_point, src)`, and the two variants differ in both `label`
+/// and `src`. So a context that flips the toggle cannot be served the other
+/// variant's pipeline by construction.
 ///
-/// Like `conv2d`'s counterpart, the first compile on a device runs inside its
+/// Like `conv2d`'s counterpart, the first compile on a context runs inside its
 /// own error scope so a driver rejecting the extension declines this kernel
-/// rather than degrading the whole context.
+/// rather than degrading the whole context, and the refusal is remembered as a
+/// `Rejected` slot in that context's cache so it is never retried. A hit — of
+/// either kind — costs one lookup and never pushes an error scope at all.
 async fn gemm_nt_pipeline_f16_async(
     ctx: &GpuContext,
 ) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
     if !ctx.f16_compute_enabled() {
         return None;
     }
-    let device = &ctx.device;
-    if GEMM_F16_UNAVAILABLE.with(|cell| cell.borrow().iter().any(|d| d == device)) {
-        return None;
-    }
     let src = super::f16_variant::gemm_nt_f16(GEMM_NT_SHADER)?;
-    let entries = [bgl_ro(0), bgl_ro(1), bgl_ro(2), bgl_rw(3), bgl_uniform(4)];
-
-    // Already known good on this device: `build_pipeline` will serve it from
-    // its own memo, so there is nothing for an error scope to catch.
-    if GEMM_F16_READY.with(|cell| cell.borrow().iter().any(|d| d == device)) {
-        return Some(build_pipeline(
-            device,
-            "gemm_nt_f16",
-            src,
-            "gemm_nt",
-            &entries,
-        ));
+    match ctx.pipelines().lookup(GEMM_F16_LABEL, GEMM_LABEL, src) {
+        PipelineLookup::Ready(pipeline, layout) => return Some((pipeline, layout)),
+        PipelineLookup::Rejected => return None,
+        PipelineLookup::Absent => {}
     }
 
+    let device = &ctx.device;
     let guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let built = build_pipeline(device, "gemm_nt_f16", src, "gemm_nt", &entries);
+    let built = crate::context::pipeline_cache::compile(
+        device,
+        GEMM_F16_LABEL,
+        src,
+        GEMM_LABEL,
+        &gemm_bgl_entries(),
+    );
     if guard.pop().await.is_some() {
-        GEMM_F16_UNAVAILABLE.with(|cell| {
-            insert_for_current_device(&mut cell.borrow_mut(), |d| d == device, device.clone());
-        });
+        ctx.pipelines()
+            .insert_rejected(GEMM_F16_LABEL, GEMM_LABEL, src);
         return None;
     }
-    GEMM_F16_READY.with(|cell| {
-        insert_for_current_device(&mut cell.borrow_mut(), |d| d == device, device.clone());
-    });
+    ctx.pipelines()
+        .insert_ready(GEMM_F16_LABEL, GEMM_LABEL, src, &built);
     Some(built)
-}
-
-/// \[w4\] Drop this thread's `GEMM_F16_UNAVAILABLE` and `GEMM_F16_READY` entries
-/// for a device that is going away.
-///
-/// Both are lists of `wgpu::Device` handles — a remembered verdict, positive or
-/// negative — so both keep their device alive until the thread's next insert.
-/// See `kernel_support::purge_thread_local` for why this is same-thread
-/// best-effort on top of the retain-on-insert rule rather than instead of it.
-pub(super) fn purge_device(device: &wgpu::Device) {
-    super::kernel_support::purge_thread_local(&GEMM_F16_UNAVAILABLE, |cached| cached == device);
-    super::kernel_support::purge_thread_local(&GEMM_F16_READY, |cached| cached == device);
-}
-
-/// \[w4\] Entries this thread holds for `device` across both caches. Test-only.
-#[cfg(test)]
-pub(super) fn cached_entries_for_device(device: &wgpu::Device) -> usize {
-    super::kernel_support::thread_local_matches(&GEMM_F16_UNAVAILABLE, |cached| cached == device)
-        + super::kernel_support::thread_local_matches(&GEMM_F16_READY, |cached| cached == device)
 }
 
 /// GPU-accelerated `out = alpha * A @ B^T + beta * C`.
@@ -392,7 +355,7 @@ pub async fn gpu_gemm_nt_placed_async(
     let scope = ErrorScope::begin(ctx);
     let (pipeline, bgl) = match f16_pipeline {
         Some(pair) => pair,
-        None => build_gemm_nt_pipeline(device),
+        None => gemm_nt_pipeline(ctx),
     };
 
     let a_buf = ctx.operand_source("gemm_a", a, wgpu::BufferUsages::STORAGE)?;

@@ -396,6 +396,7 @@ fn oracle_covers_every_op_try_cuda_dispatch_can_claim() {
                 pads: [0, 0, 0, 0],
                 dilations: [1, 1],
                 group: 1,
+                activation: conv::ConvActivation::None,
             };
             let got = reference::ref_conv(
                 &[1.0, 2.0, 3.0, 4.0],
@@ -964,6 +965,7 @@ fn conv_claimed_by_the_pre_filter_is_actually_dispatched() {
         pads: [1, 1, 1, 1],
         dilations: [1, 1],
         group: 1,
+        activation: conv::ConvActivation::None,
     };
     let expected = reference::ref_conv(
         &input,

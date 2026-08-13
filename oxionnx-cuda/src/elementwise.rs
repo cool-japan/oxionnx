@@ -92,7 +92,10 @@ fn binary_op_for(op_name: &str) -> Result<ElementwiseOp, CudaDispatchError> {
 /// The template is cheap to construct and its `kernel_name` is the cache key,
 /// so a hit costs a hash lookup and an `Arc` clone; only a miss pays for PTX
 /// generation and the driver's JIT.
-fn kernel_for(ctx: &CudaContext, op: ElementwiseOp) -> Result<Kernel, CudaDispatchError> {
+pub(crate) fn kernel_for(
+    ctx: &CudaContext,
+    op: ElementwiseOp,
+) -> Result<Kernel, CudaDispatchError> {
     let template = ElementwiseTemplate::new(op, PtxType::F32, ctx.dnn.sm_version());
     let kernel_name = template.kernel_name();
     let module = ctx.module(&kernel_name, || {
@@ -158,6 +161,51 @@ pub fn cuda_elementwise(
     d_input.retire();
     d_output.retire();
     Ok(out)
+}
+
+/// Launch a unary elementwise kernel **in place** over a buffer that is
+/// already on the device, and do *not* synchronise.
+///
+/// This is the epilogue form of [`cuda_elementwise`]: no upload, no readback,
+/// no fence. Everything is queued on `ctx.dnn.stream()`, so stream order alone
+/// sequences it behind whatever produced `device_ptr` and ahead of whatever
+/// reads it — which is what lets [`crate::conv::cuda_conv_cached`] fold a
+/// fused activation into a convolution it has already launched, without adding
+/// a host/device rendezvous to the dispatch — and what would keep that sequence
+/// legal inside a CUDA graph capture.
+///
+/// In-place aliasing is safe for every op in [`unary_op_for`]'s set: the
+/// generated kernel gives thread `i` exactly one read of `in[i]` and one write
+/// of `out[i]`, so passing the same pointer for both makes each element
+/// thread-private. Do **not** reuse this for an op whose kernel reads a
+/// neighbour.
+///
+/// # Errors
+///
+/// [`CudaDispatchError::Shape`] when `n` exceeds a `u32` launch, or a driver
+/// error from PTX compilation or the launch itself.
+pub(crate) fn launch_unary_in_place(
+    ctx: &CudaContext,
+    op: ElementwiseOp,
+    device_ptr: oxicuda_driver::ffi::CUdeviceptr,
+    n: usize,
+) -> Result<(), CudaDispatchError> {
+    if n == 0 {
+        return Ok(());
+    }
+    let Ok(n_u32) = u32::try_from(n) else {
+        return Err(CudaDispatchError::Shape {
+            op: "elementwise_in_place",
+            msg: format!("{n} elements exceed a u32 kernel launch"),
+        });
+    };
+    let kernel = kernel_for(ctx, op)?;
+    let grid = grid_size_for(n_u32, BLOCK_SIZE);
+    let params = LaunchParams::new(Dim3::from(grid), Dim3::from(BLOCK_SIZE));
+    let args = (device_ptr, device_ptr, n_u32);
+    kernel
+        .launch(&params, ctx.dnn.stream(), &args)
+        .map_err(CudaDispatchError::Driver)
 }
 
 /// Launch a binary elementwise kernel (Add, Sub, Mul, Div) on the CUDA device.

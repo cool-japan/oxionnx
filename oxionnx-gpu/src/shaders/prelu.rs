@@ -71,11 +71,9 @@ fn prelu(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-pub(crate) fn build_prelu_pipeline(
-    device: &wgpu::Device,
-) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+fn build_prelu_pipeline(ctx: &GpuContext) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
     build_pipeline(
-        device,
+        ctx,
         "prelu",
         PRELU_SHADER,
         "prelu",
@@ -157,7 +155,7 @@ pub async fn gpu_prelu_placed_async(
     let queue = &ctx.queue;
 
     let scope = ErrorScope::begin(ctx);
-    let (pipeline, bgl) = build_prelu_pipeline(device);
+    let (pipeline, bgl) = build_prelu_pipeline(ctx);
 
     let input_buf = ctx.operand_source("prelu_in", data, wgpu::BufferUsages::STORAGE)?;
     let slope_buf = ctx.operand_source("prelu_slope", slope, wgpu::BufferUsages::STORAGE)?;

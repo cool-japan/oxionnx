@@ -446,6 +446,25 @@ impl Session {
                         cuda_ctx,
                     ) {
                         Ok(results) => results,
+                        // PROVED WRONG under `OXIONNX_CUDA_STRICT=1` — the same
+                        // rule the sequential path applies, and for the same
+                        // reason: strict mode is a promise that a demonstrated
+                        // GPU fault ends the run, and it must not depend on
+                        // whether the session happens to be running in parallel.
+                        // See `Session::dispatch_to_cuda` in `run/sequential.rs`.
+                        Err(e)
+                            if super::sequential::classify_cuda_failure(&e)
+                                == super::sequential::CudaFailureAction::FailTheRun =>
+                        {
+                            tracing::error!(
+                                op = %node.op.as_str(),
+                                node = %node.name,
+                                err = %e,
+                                "parallel: CUDA was PROVED WRONG by shadow verification and \
+                                 OXIONNX_CUDA_STRICT is set; failing the run",
+                            );
+                            return Err(e);
+                        }
                         Err(_e) => {
                             #[cfg(debug_assertions)]
                             tracing::debug!(

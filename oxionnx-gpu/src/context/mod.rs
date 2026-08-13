@@ -4,6 +4,13 @@ pub mod activation;
 pub mod budget;
 pub mod functions;
 pub mod init_error;
+/// \[w5\] The per-context cache of compiled compute pipelines.
+///
+/// Crate-private: memoizing a pipeline *next to the device that compiled it* is
+/// a detail of how this crate avoids recompiling WGSL, not part of its API. See
+/// the module's own docs for the cross-context crash that made ownership the
+/// only sound arrangement.
+pub(crate) mod pipeline_cache;
 pub mod resident;
 pub mod tracker_pool;
 pub mod tuning;

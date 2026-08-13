@@ -606,46 +606,43 @@ fn test_gpu_reduce_mean() {
     }
 }
 
-/// [w4] Dropping a [`GpuContext`] takes this thread's entries for *its* device
-/// out of all five device-keyed pipeline caches.
+/// \[w5\] A context's compiled pipelines belong to that context, and a second
+/// context compiles its own.
 ///
-/// # Why this is order-independent
+/// # What this replaces, and why the assertion changed shape
 ///
-/// It only ever asks about the device it constructed itself
-/// (`thread_local_entries_for_device`), never about the caches' totals. Under
-/// `--test-threads=1` every test on the thread shares these thread-locals, so a
-/// total would be a statement about whichever context ran last; a per-device
-/// count is a statement about this one. The device handle is cloned before the
-/// drop purely so the question can still be asked afterwards — cloning a
-/// `wgpu::Device` is an `Arc` bump, and the clone is what keeps the *device*
-/// alive here, not a cache entry.
+/// This used to assert that dropping a context purged *this thread's* entries
+/// from five device-keyed thread-local caches. Those caches were the
+/// second-session crash (`crate::context::pipeline_cache`): they identified a
+/// device by `&cached.device == device`, which on wgpu 29 is a per-`Instance`
+/// id comparison, and this crate builds one `Instance` per context — so two
+/// live contexts were indistinguishable and the second was served the first's
+/// `BindGroupLayout`. Purging on drop could not fix that, and the count it
+/// asserted on could not even be attributed to one context.
 ///
-/// What this does **not** claim: that another thread's caches were touched.
-/// They are unreachable from a `Drop` by construction, and
-/// `insert_for_current_device` remains their eviction rule. See
-/// `shaders::purge_thread_local_caches_for`.
+/// The cache is now a field of `GpuContext`, so "dropping a context releases its
+/// pipelines" is a structural fact rather than something to test. What is worth
+/// pinning is the property the old arrangement got wrong: two contexts alive at
+/// once each compile into their own table, and neither is empty because one of
+/// them ran first.
 #[test]
-fn dropping_a_context_purges_this_threads_pipeline_caches() {
-    let Some(ctx) = kernel_ctx() else { return };
-    let device = ctx.device.clone();
+fn each_context_compiles_into_its_own_pipeline_cache() {
+    let Some(first) = kernel_ctx() else { return };
+    assert_eq!(
+        first.pipelines().len(),
+        0,
+        "a fresh context must start with no lazily compiled pipelines",
+    );
 
-    // Populate as many of the five caches as this adapter allows.
-    // `gpu_broadcast_add` compiles through `kernel_support`'s `PIPELINES`; a
-    // convolution populates `CONV2D_PIPELINE`; a half-precision `gemm_nt` on an
-    // adapter that supports `shader-f16` populates `GEMM_F16_READY`.
-    //
-    // The two *negative* caches (`CONV2D_F16_UNAVAILABLE`, `GEMM_F16_UNAVAILABLE`)
-    // are deliberately not reachable from here: an entry lands in one only when
-    // an `f16` shader fails to compile on this device, which no test can provoke
-    // on an adapter where it succeeds. They take the identical
-    // `purge_thread_local` call as the three caches this does cover.
+    // `gpu_broadcast_add` compiles through `kernel_support`'s helper; a
+    // convolution compiles `conv2d`'s own. Both land in this context's table.
     let a = vec![1.0f32; 64 * 64];
     let b = vec![2.0f32; 64];
-    let _ = gpu_broadcast_add(&ctx, &a, &[64, 64], &b, &[1, 64]);
+    let _ = gpu_broadcast_add(&first, &a, &[64, 64], &b, &[1, 64]);
     let input = oxionnx_core::Tensor::new(vec![0.25f32; 32 * 32 * 32], vec![1, 32, 32, 32]);
     let weight = oxionnx_core::Tensor::new(vec![0.05f32; 32 * 32 * 3 * 3], vec![32, 32, 3, 3]);
     let _ = gpu_conv2d_implicit(
-        &ctx,
+        &first,
         &input,
         &weight,
         None,
@@ -655,28 +652,50 @@ fn dropping_a_context_purges_this_threads_pipeline_caches() {
         1,
         ConvActivation::None,
     );
-    if ctx.set_f16_compute(true) {
+
+    // [w2-f16] On an adapter with `shader-f16` this also exercises the variant
+    // path, whose verdict — compiled, or refused by the driver — now lands as a
+    // slot in this same per-context table instead of in a device-keyed
+    // thread-local list of "devices where it failed".
+    if first.set_f16_compute(true) {
         let (m, k, n) = (32usize, 512usize, 512usize);
         let ga: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.01).collect();
         let gb: Vec<f32> = (0..n * k).map(|i| (i % 13) as f32 * 0.02).collect();
-        let _ = gpu_gemm_nt(&ctx, &ga, m, k, &gb, n, None, 1.0, 0.0);
+        let _ = gpu_gemm_nt(&first, &ga, m, k, &gb, n, None, 1.0, 0.0);
+        first.set_f16_compute(false);
     }
 
-    let populated = crate::shaders::thread_local_entries_for_device(&device);
+    let populated = first.pipelines().len();
     if populated == 0 {
-        eprintln!("skip: the adapter declined every dispatch, so no pipeline was cached");
+        eprintln!("skip: the adapter declined every dispatch, so no pipeline was compiled");
         return;
     }
-    // Printed rather than asserted at an exact value: how many entries the
-    // dispatches above leave behind depends on what this adapter accepted, and
-    // pinning the number would make the test a statement about one machine.
-    eprintln!("  {populated} cached entries for this device before the drop");
+    // Printed rather than asserted at an exact value: how many pipelines the
+    // dispatches above compile depends on what this adapter accepted (the `f16`
+    // variants only exist where `SHADER_F16` does), and pinning the number would
+    // make the test a statement about one machine.
+    eprintln!("  {populated} pipelines compiled by the first context");
 
-    drop(ctx);
+    // A second, independent context starts empty however much the first has
+    // compiled — the old thread-local caches would have reported the first
+    // context's entries here, and then handed them out.
+    let Some(second) = kernel_ctx() else { return };
     assert_eq!(
-        crate::shaders::thread_local_entries_for_device(&device),
+        second.pipelines().len(),
         0,
-        "dropping a context must leave none of its {populated} cached pipelines \
-         behind on this thread",
+        "a second context must not inherit the first's {populated} compiled pipelines",
+    );
+
+    // And using the second context does not disturb the first's table.
+    let _ = gpu_broadcast_add(&second, &a, &[64, 64], &b, &[1, 64]);
+    assert_ne!(
+        second.pipelines().len(),
+        0,
+        "the second context compiled nothing of its own",
+    );
+    assert_eq!(
+        first.pipelines().len(),
+        populated,
+        "the second context's dispatch changed the first context's cache",
     );
 }

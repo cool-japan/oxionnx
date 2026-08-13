@@ -11,6 +11,7 @@ use super::functions::{
     TILED_MATMUL_SHADER, TRANSPOSE_SHADER,
 };
 use super::init_error::{GpuInitDiagnostic, GpuInitError};
+use super::pipeline_cache::PipelineCache;
 use super::resident::{Lookup, OperandBuffer, ResidentBuffers, ResidentCounters};
 use super::tracker_pool::{GpuBufferPool, DEFAULT_POOL_BYTE_BUDGET};
 use super::tuning::{GpuPerfClass, GpuTuning};
@@ -94,6 +95,16 @@ pub struct GpuContext {
     /// derived once from this adapter's own [`wgpu::AdapterInfo`]. See
     /// [`super::tuning`] for why these are not compile-time constants.
     tuning: GpuTuning,
+    /// \[w5\] Compute pipelines this context's device has compiled, for the
+    /// kernels that build their own rather than taking one of the fields above.
+    ///
+    /// A field rather than a thread-local keyed on `self.device`, because
+    /// `wgpu::Device` equality is a per-`Instance` id and this crate creates one
+    /// `Instance` per context — so two contexts' devices compare *equal* and a
+    /// device-keyed cache serves the second one the first's pipelines. See
+    /// [`super::pipeline_cache`] for the crash that produced and why no key can
+    /// fix it.
+    pipelines: PipelineCache,
 }
 
 impl GpuContext {
@@ -858,7 +869,22 @@ impl GpuContext {
             // the real classification immediately afterwards, and any other
             // caller can do the same through `set_tuning`.
             tuning: GpuTuning::default(),
+            // [w5] Empty: the kernels that build their own pipelines fill it on
+            // first dispatch. It belongs to this context and dies with it.
+            pipelines: PipelineCache::default(),
         })
+    }
+
+    /// \[w5\] The pipelines this context's device has compiled.
+    ///
+    /// The kernels in `crate::shaders` that construct their own pipeline — the
+    /// standalone batch described in `shaders::kernel_support`, plus `conv2d`
+    /// and `gemm` — memoize through here instead of through a thread-local, so
+    /// a compiled pipeline can never outlive, or be found by, a device other
+    /// than the one that built it. See [`super::pipeline_cache`].
+    #[inline]
+    pub(crate) fn pipelines(&self) -> &PipelineCache {
+        &self.pipelines
     }
 
     /// The size and shape floors this context's kernels decline below.
@@ -1594,13 +1620,18 @@ impl Drop for GpuContext {
         // alive, rather than leaving it to field drop glue that runs after this
         // function returns.
         self.resident.clear();
-        // [w4] The compiled-pipeline caches are thread-locals that store the
-        // device handle, so each entry keeps this device alive. Retain-on-insert
-        // bounds them at one device but only fires on the *next* compile, which
-        // may never come on a thread that has stopped dispatching. Purge this
-        // thread's entries for this device now; other threads' entries are
-        // unreachable from here by construction and keep relying on
-        // retain-on-insert.
-        crate::shaders::purge_thread_local_caches_for(&self.device);
+        // [w5] And the compiled pipelines, for the ordering rather than the
+        // release: a `ComputePipeline` holds its own handle on the device, and
+        // `device` is declared before `pipelines`, so drop glue would destroy
+        // this context's device handle first and its pipelines afterwards.
+        //
+        // The thread-local caches this replaced needed a purge here for a
+        // different, worse reason: their entries kept a device alive across
+        // contexts, the purge could only ever reach the dropping thread's own
+        // copy, and — because they identified a device by a handle comparison
+        // that is really a per-`Instance` id — it could not reliably tell this
+        // context's entries from the next context's in the first place. See
+        // `super::pipeline_cache`.
+        self.pipelines.clear();
     }
 }

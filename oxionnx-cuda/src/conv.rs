@@ -53,6 +53,17 @@
 //! See [`pick_engine`] for the exact, unit-tested-without-a-GPU
 //! implementation.
 //!
+//! ## The fused-activation epilogue
+//!
+//! ONNX `Conv` nodes reaching this module may carry an optimizer-fused
+//! activation ([`ConvActivation`]), which is part of what the node computes.
+//! `cuda_conv_cached` applies it after the bias, either on the device
+//! (`Relu`, via `launch_activation_epilogue` — one extra memory-bound
+//! kernel on the same stream, before the readback) or on the host
+//! (`apply_conv_activation_host` — used for `Clip`, which has no
+//! scalar-bounded kernel, and for any activation on an engine that still owes
+//! a host-side bias add, since the activation must follow the bias).
+//!
 //! Neither [`Conv1x1::execute`](oxicuda_dnn::conv::fprop::direct::Conv1x1)
 //! nor [`DepthwiseConv::execute`](oxicuda_dnn::conv::fprop::direct::DepthwiseConv)
 //! accepts a bias argument at all — their `execute` methods hard-code a
@@ -79,6 +90,19 @@
 //! means "this configuration is not accelerated", not "the model is
 //! broken" — the CPU operator one frame up computes it correctly (or
 //! raises the right diagnostic) either way. See [`problem_from_params`].
+//!
+//! [`conv_params_from_attrs`] declines a second, separate class: a node
+//! whose *attributes* say something this backend does not model. An
+//! `activation` string other than `"relu"`/`"clip"`, an `auto_pad` value
+//! outside `NOTSET`/`VALID`/`SAME_UPPER`/`SAME_LOWER`, a `kernel_shape`
+//! contradicting the filter, a negative stride/dilation/pad, a `group` below
+//! 1, or a spatial attribute that is not 2-D. That whitelist is the fix for
+//! the failure this module actually shipped: it read `strides`/`pads`/
+//! `dilations`/`group` and *ignored everything else*, so the optimizer's
+//! fused activation (`Conv_*_fused_activation`, see [`ConvActivation`]) was
+//! silently dropped from 24 of SCRFD det_10g's convolutions and every
+//! detection collapsed to a degenerate corner box. Ignoring an attribute is
+//! never a safe default; declining is.
 //!
 //! ## Advertised as CUDA-supported
 //!
@@ -139,8 +163,9 @@ use oxicuda_dnn::conv::fprop::direct::{Conv1x1, DepthwiseConv};
 use oxicuda_dnn::conv::fprop::implicit_gemm::ImplicitGemmConv;
 use oxicuda_dnn::{DnnError, TensorDesc, TensorDescMut, TensorLayout};
 use oxicuda_ptx::ir::PtxType;
+use oxicuda_ptx::templates::elementwise::ElementwiseOp;
 
-use oxionnx_core::Tensor;
+use oxionnx_core::{Attributes, Tensor};
 
 use crate::context::CudaContext;
 use crate::error::CudaDispatchError;
@@ -174,11 +199,55 @@ pub(crate) struct ConvWeightIds<'a> {
     pub(crate) bias: Option<WeightId<'a>>,
 }
 
+/// The activation `oxionnx`'s graph optimizer folded **into** a `Conv` node.
+///
+/// `src/optimizer/fusion/conv/relu.rs` and `.../relu6.rs` rewrite a
+/// `Conv -> Relu` / `Conv -> Clip` pair into a *single* `Conv` node named
+/// `<conv>_fused_activation`, carrying the activation as the string attribute
+/// `activation` (`"relu"`, or `"clip"` plus the `activation_min` /
+/// `activation_max` floats). The activation is then no longer a node of its
+/// own: whoever executes that `Conv` **is** responsible for applying it.
+///
+/// `oxionnx-ops`' CPU kernel does so in `apply_fused_activation`
+/// (`oxionnx-ops/src/registry/conv_ops/conv.rs`) and the wgpu backend folds it
+/// into its implicit-GEMM epilogue (`conv_activation_for_gpu` in
+/// `oxionnx/src/session/gpu_dispatch.rs`). This enum is the CUDA backend's
+/// half of that contract; before it existed, this backend read only
+/// `strides`/`pads`/`dilations`/`group` and returned the *raw* convolution,
+/// silently dropping every fused `Relu` in the graph.
+///
+/// The semantics below are copied from `apply_fused_activation`, deliberately
+/// including its edge cases (a NaN bound is unbounded on that side; an
+/// inverted `[min, max]` passes the data through unclamped), because the two
+/// must agree element-for-element — a CUDA node and its CPU fallback are
+/// interchangeable only if they compute the same function.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ConvActivation {
+    /// No fused activation: the node has no `activation` attribute, and the
+    /// convolution's raw output is the node's output.
+    #[default]
+    None,
+    /// `max(x, 0)` — the `"relu"` attribute value.
+    Relu,
+    /// `clamp(x, min, max)` — the `"clip"` attribute value together with its
+    /// `activation_min` / `activation_max` bounds.
+    Clip {
+        /// Lower bound (`activation_min`), or `-inf` when absent.
+        min: f32,
+        /// Upper bound (`activation_max`), or `+inf` when absent.
+        max: f32,
+    },
+}
+
 /// Grouped convolution parameters extracted from ONNX node attributes.
 ///
 /// Constructed by [`crate::try_cuda_dispatch`] from the node's `strides`,
-/// `pads`, `dilations`, and `group` attributes and handed to [`cuda_conv`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `pads`, `dilations`, `group` and fused-`activation` attributes and handed
+/// to [`cuda_conv`].
+///
+/// `Eq` is deliberately *not* derived: [`ConvActivation::Clip`] carries `f32`
+/// bounds.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConvParams {
     /// Stride for `[H, W]`.
     pub strides: [usize; 2],
@@ -188,6 +257,212 @@ pub struct ConvParams {
     pub dilations: [usize; 2],
     /// Convolution groups.
     pub group: usize,
+    /// The activation the optimizer fused into this `Conv` node, applied to
+    /// the convolution's (bias-added) output. See [`ConvActivation`].
+    pub activation: ConvActivation,
+}
+
+/// Reads a 2-entry spatial attribute (`strides` / `dilations`), rejecting
+/// anything this dispatch cannot faithfully represent.
+///
+/// `None` (decline) for: a negative or zero entry — `as usize` on a negative
+/// `i64` wraps to ~1.8e19 and would sail past every downstream `!= 0` check —
+/// and any length other than "absent" or exactly 2, which means the node is
+/// not the 2-D convolution this module knows how to run.
+#[must_use]
+fn read_spatial_pair(raw: &[i64], default: usize) -> Option<[usize; 2]> {
+    match raw.len() {
+        0 => Some([default, default]),
+        2 => {
+            let h = usize::try_from(raw[0]).ok()?;
+            let w = usize::try_from(raw[1]).ok()?;
+            (h >= 1 && w >= 1).then_some([h, w])
+        }
+        _ => None,
+    }
+}
+
+/// Reads the `pads` attribute as `[top, left, bottom, right]`.
+///
+/// `None` (decline) for a negative entry or any length other than "absent" or
+/// exactly 4. ONNX permits negative pads on some operators; this dispatch has
+/// no representation for them, and `as usize` would turn one into a colossal
+/// positive pad.
+#[must_use]
+fn read_pads_quad(raw: &[i64]) -> Option<[usize; 4]> {
+    match raw.len() {
+        0 => Some([0; 4]),
+        4 => {
+            let mut out = [0_usize; 4];
+            for (slot, &v) in out.iter_mut().zip(raw) {
+                *slot = usize::try_from(v).ok()?;
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// One spatial axis' `SAME_UPPER` / `SAME_LOWER` padding split.
+///
+/// The ONNX formula: the total padding is whatever it takes for the output
+/// extent to be `ceil(input / stride)`, split evenly, with the odd pixel going
+/// to the *end* for `SAME_UPPER` and to the *begin* for `SAME_LOWER`. Mirrors
+/// `oxionnx-ops`' `conv::spatial::resolve_pads` and the wgpu backend's
+/// `conv_same_pad_split`.
+#[must_use]
+fn same_pad_split(
+    in_dim: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    lower: bool,
+) -> (usize, usize) {
+    let effective = dilation * (kernel - 1) + 1;
+    let out_dim = in_dim.div_ceil(stride.max(1));
+    let needed = (out_dim.saturating_sub(1))
+        .saturating_mul(stride)
+        .saturating_add(effective)
+        .saturating_sub(in_dim);
+    let half = needed / 2;
+    if lower {
+        (needed - half, half)
+    } else {
+        (half, needed - half)
+    }
+}
+
+/// Resolves the `auto_pad` attribute into an explicit
+/// `[top, left, bottom, right]` quad.
+///
+/// **This is not cosmetic.** `auto_pad` *overrides* the explicit `pads`
+/// attribute for every mode but `NOTSET`, and a `SAME_UPPER` model normally
+/// carries no `pads` at all — so a dispatch that reads only `pads` convolves
+/// such a model completely unpadded and returns a differently-shaped,
+/// numerically unrelated answer. `oxionnx-ops`' CPU kernel resolves it
+/// (`conv::spatial::resolve_pads`) and so does the wgpu backend
+/// (`resolve_conv_pads_for_gpu`); this is the CUDA backend's copy of that
+/// contract.
+///
+/// `None` (decline) for an `auto_pad` value outside the spec'd set — the CPU
+/// kernel's `parse_auto_pad` raises the correct typed error for it.
+#[must_use]
+fn resolve_auto_pad(
+    auto_pad: &str,
+    input_shape: &[usize],
+    weight_shape: &[usize],
+    strides: [usize; 2],
+    dilations: [usize; 2],
+    explicit: [usize; 4],
+) -> Option<[usize; 4]> {
+    match auto_pad {
+        "" | "NOTSET" => Some(explicit),
+        "VALID" => Some([0; 4]),
+        "SAME_UPPER" | "SAME_LOWER" => {
+            if input_shape.len() != 4 || weight_shape.len() != 4 {
+                return None;
+            }
+            let lower = auto_pad == "SAME_LOWER";
+            let mut out = [0_usize; 4];
+            for axis in 0..2 {
+                let (begin, end) = same_pad_split(
+                    input_shape[axis + 2],
+                    weight_shape[axis + 2],
+                    strides[axis],
+                    dilations[axis],
+                    lower,
+                );
+                out[axis] = begin;
+                out[axis + 2] = end;
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Reads the optimizer's fused-activation attributes.
+///
+/// `None` (decline) for an `activation` string this backend has no
+/// implementation of. That polarity is the whole point: an unrecognised
+/// activation must send the node to the CPU, never be silently ignored — see
+/// [`ConvActivation`] for what "silently ignored" cost the first time.
+#[must_use]
+fn read_conv_activation(attrs: &Attributes) -> Option<ConvActivation> {
+    match attrs.s("activation") {
+        "" => Some(ConvActivation::None),
+        "relu" => Some(ConvActivation::Relu),
+        "clip" => Some(ConvActivation::Clip {
+            min: attrs.f("activation_min", f32::NEG_INFINITY),
+            max: attrs.f("activation_max", f32::INFINITY),
+        }),
+        _ => None,
+    }
+}
+
+/// Builds the [`ConvParams`] for an ONNX `Conv` node, or declines the node.
+///
+/// This is the single place that decides **which `Conv` nodes this backend is
+/// allowed to claim**, and it is deliberately a whitelist: every attribute
+/// that changes what a `Conv` node computes is either modelled here or causes
+/// a decline. `try_cuda_dispatch`'s `Conv` arm used to read `strides` / `pads`
+/// / `dilations` / `group` and nothing else, which meant a node carrying
+/// `activation`, `auto_pad` or a contradictory `kernel_shape` was claimed and
+/// computed as if those attributes did not exist.
+///
+/// Pure: unit-testable on a host with no CUDA device, like `pick_engine` and
+/// `problem_from_params`.
+///
+/// `None` means "not accelerated" — the caller returns `Ok(None)` and the CPU
+/// operator runs the node (and raises the proper diagnostic if it is genuinely
+/// malformed).
+#[must_use]
+pub fn conv_params_from_attrs(
+    attrs: &Attributes,
+    input_shape: &[usize],
+    weight_shape: &[usize],
+) -> Option<ConvParams> {
+    let strides = read_spatial_pair(attrs.ints("strides"), 1)?;
+    let dilations = read_spatial_pair(attrs.ints("dilations"), 1)?;
+    let explicit_pads = read_pads_quad(attrs.ints("pads"))?;
+    let group = usize::try_from(attrs.i("group", 1))
+        .ok()
+        .filter(|g| *g >= 1)?;
+
+    // `kernel_shape` is redundant for `Conv` (the filter carries the extents),
+    // but a model may still declare it — and if it *disagrees* with the filter
+    // the CPU kernel rejects the node outright. Claiming it here would answer
+    // where the CPU errors, and would additionally make `auto_pad` derive a
+    // padding for extents the kernel does not have.
+    let declared_kernel = attrs.ints("kernel_shape");
+    if !declared_kernel.is_empty() {
+        if weight_shape.len() != 4 || declared_kernel.len() != 2 {
+            return None;
+        }
+        let kh = usize::try_from(declared_kernel[0]).ok()?;
+        let kw = usize::try_from(declared_kernel[1]).ok()?;
+        if [kh, kw] != [weight_shape[2], weight_shape[3]] {
+            return None;
+        }
+    }
+
+    let pads = resolve_auto_pad(
+        attrs.s("auto_pad"),
+        input_shape,
+        weight_shape,
+        strides,
+        dilations,
+        explicit_pads,
+    )?;
+    let activation = read_conv_activation(attrs)?;
+
+    Some(ConvParams {
+        strides,
+        pads,
+        dilations,
+        group,
+        activation,
+    })
 }
 
 /// Which validated `oxicuda-dnn` forward-convolution engine a given
@@ -357,6 +632,100 @@ fn add_bias_nchw(data: &mut [f32], bias: &[f32], n: usize, channels: usize, spat
                 *v += b;
             }
         }
+    }
+}
+
+/// Applies a fused [`ConvActivation`] to a convolution output already
+/// downloaded to the host.
+///
+/// Element-for-element identical to `oxionnx-ops`'
+/// `registry::conv_ops::conv::apply_fused_activation`, edge cases included —
+/// see [`ConvActivation`] for why that identity is load-bearing.
+///
+/// Used for the two configurations `launch_activation_epilogue` cannot take
+/// on the device: a [`ConvActivation::Clip`] (there is no scalar-bounded clamp
+/// kernel in `oxicuda-ptx`'s elementwise template set), and any activation on
+/// a [`ConvEngine::Conv1x1`] / [`ConvEngine::Depthwise`] dispatch that still
+/// owes a host-side bias add — the activation must come *after* the bias, and
+/// for those two engines the bias only exists once the data is back on the
+/// host.
+fn apply_conv_activation_host(data: &mut [f32], activation: ConvActivation) {
+    match activation {
+        ConvActivation::None => {}
+        ConvActivation::Relu => {
+            for v in data.iter_mut() {
+                *v = v.max(0.0);
+            }
+        }
+        ConvActivation::Clip { min, max } => {
+            // `f32::clamp` asserts `min <= max` (a real, non-debug assert that
+            // a NaN bound also trips). Mirror ONNX `Clip` instead, exactly as
+            // the CPU kernel does: a NaN bound is unbounded on that side, and
+            // an inverted range passes the data through untouched.
+            let lo = if min.is_nan() { f32::NEG_INFINITY } else { min };
+            let hi = if max.is_nan() { f32::INFINITY } else { max };
+            if lo <= hi {
+                for v in data.iter_mut() {
+                    *v = v.clamp(lo, hi);
+                }
+            }
+        }
+    }
+}
+
+/// Applies the fused activation **on the device**, in place, over the
+/// convolution output still sitting in `d_output`.
+///
+/// Returns `Ok(true)` when the host must *not* apply the activation again —
+/// either because there was nothing to apply ([`ConvActivation::None`]) or
+/// because the kernel launched here did it. `Ok(false)` means "no device
+/// kernel for this activation", and the caller applies
+/// `apply_conv_activation_host` after the readback instead.
+///
+/// # Why on the device at all
+///
+/// The output is downloaded immediately after, so a host-side pass would be
+/// *correct*. It would also be slow in the one place it matters: a measured
+/// SCRFD det_10g pass on this workspace's `det_10g.onnx` dispatches 24
+/// fused-activation convolutions totalling 20 588 800 output elements —
+/// 82.4 MB — per frame, and a host read-modify-write pass over that runs at
+/// main-memory speed on one core, on top of a PCIe readback that has to happen
+/// either way. On-device it is a memory-bound kernel over data that is already
+/// in device memory.
+///
+/// The launch rides `ctx.dnn.stream()`, the same stream the convolution and the
+/// readback are queued on, so stream order alone sequences conv → activation →
+/// download with no extra fence. (Convolution does not currently go through
+/// [`crate::graph_cache`] — only `matmul` does — but keeping the epilogue
+/// stream-ordered rather than fenced is what would let it.)
+///
+/// In-place is safe for these kernels by construction: each thread reads
+/// exactly `x[i]` and writes exactly `y[i]` for its own `i`, so aliasing
+/// `x == y` makes every access thread-private.
+fn launch_activation_epilogue(
+    ctx: &CudaContext,
+    d_output: &mut crate::residency::PooledBuffer<'_>,
+    len: usize,
+    activation: ConvActivation,
+) -> Result<bool, CudaDispatchError> {
+    match activation {
+        ConvActivation::None => Ok(true),
+        ConvActivation::Relu => {
+            crate::elementwise::launch_unary_in_place(
+                ctx,
+                ElementwiseOp::Relu,
+                d_output.device_ptr(),
+                len,
+            )?;
+            Ok(true)
+        }
+        // No scalar-bounded clamp kernel exists in `oxicuda-ptx`'s
+        // `ElementwiseOp` set, and inventing one here would put a second,
+        // unverified PTX generator in this crate. The host epilogue computes
+        // it correctly; no model in this workspace emits a `clip` fusion (it
+        // comes from `Clip(0, 6)` — the MobileNet-family Relu6), so this
+        // costs one host pass on a path nothing hot takes.
+        ConvActivation::Clip { .. } => Ok(false),
     }
 }
 
@@ -599,6 +968,21 @@ pub(crate) fn cuda_conv_cached(
         }
     }
 
+    // -- Fused-activation epilogue, device half ----------------------------
+    //
+    // The optimizer folds `Conv -> Relu` / `Conv -> Clip` into this very node
+    // (see `ConvActivation`), so the activation is this dispatch's job — there
+    // is no separate node left to run it. It must come *after* the bias, which
+    // is why the two engines that still owe a host-side bias add are excluded
+    // here and take the host epilogue below instead.
+    let host_bias_pending =
+        matches!(engine, ConvEngine::Conv1x1 | ConvEngine::Depthwise) && bias_data.is_some();
+    let activation_applied_on_device = if host_bias_pending {
+        false
+    } else {
+        launch_activation_epilogue(ctx, &mut d_output, out_needed, params.activation)?
+    };
+
     let mut out_data = vec![0.0_f32; out_needed];
     d_output.download(&mut out_data, stream)?;
     // The kernel launches above are asynchronous, and so is the readback just
@@ -620,6 +1004,14 @@ pub(crate) fn cuda_conv_cached(
         }
     }
 
+    // -- Fused-activation epilogue, host half ------------------------------
+    //
+    // Strictly after the bias add above: `Relu(conv + bias)`, never
+    // `Relu(conv) + bias`.
+    if !activation_applied_on_device {
+        apply_conv_activation_host(&mut out_data, params.activation);
+    }
+
     Ok(Some(Tensor::new(
         out_data,
         vec![n, out_channels, out_h, out_w],
@@ -637,6 +1029,7 @@ mod tests {
             pads: [1, 1, 1, 1],
             dilations: [1, 1],
             group: 1,
+            activation: ConvActivation::None,
         };
         assert_eq!(params.strides, [2, 2]);
         assert_eq!(params.pads, [1, 1, 1, 1]);
@@ -674,6 +1067,7 @@ mod tests {
             pads: [0, 0, 0, 0],
             dilations: [1, 1],
             group: 1,
+            activation: ConvActivation::None,
         }
     }
 
@@ -890,6 +1284,272 @@ mod tests {
         );
     }
 
+    // ── The fused-activation contract, GPU-free ─────────────────────────────
+    //
+    // The bug these pin down: `oxionnx`'s optimizer rewrites every
+    // `Conv -> Relu` pair into a single `Conv` node carrying
+    // `activation="relu"`, and this backend used to read only
+    // `strides`/`pads`/`dilations`/`group`, so it returned the *raw*
+    // convolution for 26 of SCRFD det_10g's 58 convolutions. Shadow
+    // verification could not see it, because `reference::ref_conv` read the
+    // same `ConvParams` and therefore made the same omission.
+
+    /// Build an `Attributes` the way the optimizer's fusion pass does.
+    fn fused_attrs(activation: &str) -> Attributes {
+        let mut attrs = Attributes::default();
+        attrs.int_lists.insert("strides".into(), vec![1, 1]);
+        attrs.int_lists.insert("pads".into(), vec![1, 1, 1, 1]);
+        attrs.int_lists.insert("dilations".into(), vec![1, 1]);
+        attrs.ints.insert("group".into(), 1);
+        if !activation.is_empty() {
+            attrs
+                .strings
+                .insert("activation".into(), activation.to_string());
+        }
+        attrs
+    }
+
+    #[test]
+    fn a_conv_node_with_no_activation_attribute_parses_to_none() {
+        let params = conv_params_from_attrs(&fused_attrs(""), &[1, 3, 8, 8], &[4, 3, 3, 3])
+            .expect("a plain 3x3 Conv must be claimable");
+        assert_eq!(params.activation, ConvActivation::None);
+        assert_eq!(params.strides, [1, 1]);
+        assert_eq!(params.pads, [1, 1, 1, 1]);
+    }
+
+    /// The regression test for the corruption: the optimizer's fused `Relu`
+    /// must reach [`ConvParams`], not be dropped on the floor.
+    #[test]
+    fn the_optimizers_fused_relu_reaches_conv_params() {
+        let params = conv_params_from_attrs(&fused_attrs("relu"), &[1, 3, 8, 8], &[4, 3, 3, 3])
+            .expect("a fused-Relu Conv must still be claimable");
+        assert_eq!(
+            params.activation,
+            ConvActivation::Relu,
+            "a Conv_*_fused_activation node's Relu must survive attribute parsing; dropping it \
+             is what collapsed every SCRFD detection to a degenerate corner box",
+        );
+    }
+
+    #[test]
+    fn the_optimizers_fused_clip_carries_its_bounds() {
+        let mut attrs = fused_attrs("clip");
+        attrs.floats.insert("activation_min".into(), 0.0);
+        attrs.floats.insert("activation_max".into(), 6.0);
+        let params = conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3])
+            .expect("a fused-Clip Conv must still be claimable");
+        assert_eq!(
+            params.activation,
+            ConvActivation::Clip { min: 0.0, max: 6.0 }
+        );
+    }
+
+    /// The polarity that matters: an activation this backend has no
+    /// implementation of must **decline**, never be silently ignored.
+    #[test]
+    fn an_unrecognised_fused_activation_declines_the_node() {
+        for activation in ["sigmoid", "tanh", "leakyrelu", "RELU", "relu6"] {
+            assert!(
+                conv_params_from_attrs(&fused_attrs(activation), &[1, 3, 8, 8], &[4, 3, 3, 3])
+                    .is_none(),
+                "activation={activation:?} has no CUDA implementation and must decline the node \
+                 rather than be ignored",
+            );
+        }
+    }
+
+    #[test]
+    fn auto_pad_same_upper_is_resolved_not_ignored() {
+        let mut attrs = Attributes::default();
+        attrs.int_lists.insert("strides".into(), vec![1, 1]);
+        attrs
+            .strings
+            .insert("auto_pad".into(), "SAME_UPPER".to_string());
+        // 3x3 kernel, stride 1: SAME needs 1 pixel on each side.
+        let params = conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3])
+            .expect("SAME_UPPER is resolvable");
+        assert_eq!(
+            params.pads,
+            [1, 1, 1, 1],
+            "auto_pad overrides `pads`; reading only `pads` convolves a SAME model unpadded",
+        );
+    }
+
+    #[test]
+    fn auto_pad_same_puts_the_odd_pixel_on_the_named_side() {
+        let mut attrs = Attributes::default();
+        attrs.int_lists.insert("strides".into(), vec![1, 1]);
+        attrs
+            .strings
+            .insert("auto_pad".into(), "SAME_UPPER".to_string());
+        // 4x4 kernel, stride 1, input 8: total padding 3, split 1 + 2.
+        let upper = conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 4, 4]).unwrap();
+        assert_eq!(upper.pads, [1, 1, 2, 2]);
+        attrs
+            .strings
+            .insert("auto_pad".into(), "SAME_LOWER".to_string());
+        let lower = conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 4, 4]).unwrap();
+        assert_eq!(lower.pads, [2, 2, 1, 1]);
+    }
+
+    #[test]
+    fn auto_pad_valid_zeroes_the_padding_even_when_pads_says_otherwise() {
+        let mut attrs = fused_attrs("");
+        attrs.strings.insert("auto_pad".into(), "VALID".to_string());
+        let params = conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3]).unwrap();
+        assert_eq!(params.pads, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn an_unknown_auto_pad_value_declines_the_node() {
+        let mut attrs = fused_attrs("");
+        attrs
+            .strings
+            .insert("auto_pad".into(), "SAME_MIDDLE".to_string());
+        assert!(conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3]).is_none());
+    }
+
+    /// `as usize` on a negative `i64` wraps to ~1.8e19 and sails past every
+    /// downstream `!= 0` check, so these must be caught at the parse.
+    #[test]
+    fn negative_geometry_attributes_decline_rather_than_wrapping() {
+        for (name, value) in [
+            ("strides", vec![-1_i64, 1]),
+            ("dilations", vec![1, -2]),
+            ("pads", vec![-1, 0, 0, 0]),
+        ] {
+            let mut attrs = fused_attrs("");
+            attrs.int_lists.insert(name.into(), value.clone());
+            assert!(
+                conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3]).is_none(),
+                "{name}={value:?} must decline, not wrap into a colossal usize",
+            );
+        }
+        let mut attrs = fused_attrs("");
+        attrs.ints.insert("group".into(), 0);
+        assert!(conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3]).is_none());
+        attrs.ints.insert("group".into(), -1);
+        assert!(conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3]).is_none());
+    }
+
+    #[test]
+    fn a_kernel_shape_contradicting_the_filter_declines_the_node() {
+        let mut attrs = fused_attrs("");
+        attrs.int_lists.insert("kernel_shape".into(), vec![5, 5]);
+        assert!(
+            conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3]).is_none(),
+            "the CPU kernel rejects this node; CUDA must not answer where the CPU errors",
+        );
+        attrs.int_lists.insert("kernel_shape".into(), vec![3, 3]);
+        assert!(conv_params_from_attrs(&attrs, &[1, 3, 8, 8], &[4, 3, 3, 3]).is_some());
+    }
+
+    #[test]
+    fn a_non_2d_spatial_attribute_declines_the_node() {
+        let mut attrs = fused_attrs("");
+        attrs.int_lists.insert("strides".into(), vec![1, 1, 1]);
+        assert!(conv_params_from_attrs(&attrs, &[1, 3, 8, 8, 8], &[4, 3, 3, 3, 3]).is_none());
+    }
+
+    // ── the host activation epilogue ────────────────────────────────────────
+
+    #[test]
+    fn host_relu_epilogue_rectifies_in_place() {
+        let mut data = vec![-2.0_f32, -0.0, 0.0, 3.5];
+        apply_conv_activation_host(&mut data, ConvActivation::Relu);
+        assert_eq!(data, vec![0.0, 0.0, 0.0, 3.5]);
+    }
+
+    #[test]
+    fn host_none_epilogue_is_the_identity() {
+        let mut data = vec![-2.0_f32, 7.0];
+        apply_conv_activation_host(&mut data, ConvActivation::None);
+        assert_eq!(data, vec![-2.0, 7.0]);
+    }
+
+    #[test]
+    fn host_clip_epilogue_clamps_to_both_bounds() {
+        let mut data = vec![-1.0_f32, 0.5, 9.0];
+        apply_conv_activation_host(&mut data, ConvActivation::Clip { min: 0.0, max: 6.0 });
+        assert_eq!(data, vec![0.0, 0.5, 6.0]);
+    }
+
+    /// Matches `oxionnx-ops`' `apply_fused_activation`: an inverted range
+    /// passes the data through rather than tripping `f32::clamp`'s assert.
+    #[test]
+    fn host_clip_epilogue_passes_an_inverted_range_through_untouched() {
+        let mut data = vec![-1.0_f32, 0.5, 9.0];
+        apply_conv_activation_host(&mut data, ConvActivation::Clip { min: 6.0, max: 0.0 });
+        assert_eq!(data, vec![-1.0, 0.5, 9.0]);
+    }
+
+    /// Also matches `apply_fused_activation`: a NaN bound is no bound.
+    #[test]
+    fn host_clip_epilogue_treats_a_nan_bound_as_unbounded() {
+        let mut data = vec![-1.0_f32, 0.5, 9.0];
+        apply_conv_activation_host(
+            &mut data,
+            ConvActivation::Clip {
+                min: f32::NAN,
+                max: 6.0,
+            },
+        );
+        assert_eq!(data, vec![-1.0, 0.5, 6.0]);
+    }
+
+    // ── the oracle applies it too ───────────────────────────────────────────
+
+    /// The second half of the bug: even a correct kernel is unprotected if
+    /// the oracle it is checked against makes the same omission.
+    #[test]
+    fn the_reference_oracle_applies_the_fused_activation() {
+        // 1x1x2x2 input, 1x1x1x1 filter of -1: the raw convolution is all
+        // negative, so a Relu-fused node's output must be all zero.
+        let input = [1.0_f32, 2.0, 3.0, 4.0];
+        let weight = [-1.0_f32];
+        let mut params = base_params();
+        let raw = crate::reference::ref_conv(
+            &input,
+            &weight,
+            None,
+            &[1, 1, 2, 2],
+            &[1, 1, 1, 1],
+            &params,
+        );
+        assert_eq!(raw, vec![-1.0, -2.0, -3.0, -4.0]);
+
+        params.activation = ConvActivation::Relu;
+        let rectified = crate::reference::ref_conv(
+            &input,
+            &weight,
+            None,
+            &[1, 1, 2, 2],
+            &[1, 1, 1, 1],
+            &params,
+        );
+        assert_eq!(
+            rectified,
+            vec![0.0, 0.0, 0.0, 0.0],
+            "ref_conv must apply the node's fused activation, or it silently agrees with a \
+             kernel that also skipped it",
+        );
+
+        params.activation = ConvActivation::Clip {
+            min: -2.5,
+            max: -1.5,
+        };
+        let clipped = crate::reference::ref_conv(
+            &input,
+            &weight,
+            None,
+            &[1, 1, 2, 2],
+            &[1, 1, 1, 1],
+            &params,
+        );
+        assert_eq!(clipped, vec![-1.5, -2.0, -2.5, -2.5]);
+    }
+
     // ── On-device numeric validation ────────────────────────────────────────
     //
     // `cargo test -p oxionnx-cuda --features gpu-tests conv` on a
@@ -960,6 +1620,12 @@ mod tests {
             dil_h: usize,
             dil_w: usize,
             group: usize,
+            /// The optimizer-fused activation this case exercises. The
+            /// independent `naive_conv2d_f64` reference below applies it
+            /// itself, so a dispatch that dropped it (the pre-fix behaviour)
+            /// fails these tests on real hardware rather than silently
+            /// agreeing with an equally-forgetful oracle.
+            activation: ConvActivation,
         }
 
         impl ConvCase {
@@ -977,6 +1643,7 @@ mod tests {
                     pads: [self.pad_h, self.pad_w, self.pad_h, self.pad_w],
                     dilations: [self.dil_h, self.dil_w],
                     group: self.group,
+                    activation: self.activation,
                 }
             }
 
@@ -1037,6 +1704,29 @@ mod tests {
                             }
                             let o_idx = ((ni * case.k + ki) * out_h + oh) * out_w + ow;
                             out[o_idx] = acc as f32;
+                        }
+                    }
+                }
+            }
+            // The fused activation is part of what the node computes; see
+            // `ConvActivation`. Written out longhand here rather than calling
+            // `apply_conv_activation_host`, keeping this reference independent
+            // of the code it checks.
+            match case.activation {
+                ConvActivation::None => {}
+                ConvActivation::Relu => {
+                    for v in out.iter_mut() {
+                        if *v < 0.0 {
+                            *v = 0.0;
+                        }
+                    }
+                }
+                ConvActivation::Clip { min, max } => {
+                    for v in out.iter_mut() {
+                        if *v < min {
+                            *v = min;
+                        } else if *v > max {
+                            *v = max;
                         }
                     }
                 }
@@ -1130,6 +1820,7 @@ mod tests {
                 dil_h: 1,
                 dil_w: 1,
                 group: 1,
+                activation: ConvActivation::None,
             };
             assert_eq!(engine_for(case), ConvEngine::Conv1x1);
             run_case_and_compare(case, false, 0x51ED_0000_0000_0001, "conv1x1_no_bias");
@@ -1154,6 +1845,7 @@ mod tests {
                 dil_h: 1,
                 dil_w: 1,
                 group: 1,
+                activation: ConvActivation::None,
             };
             assert_eq!(engine_for(case), ConvEngine::Conv1x1);
             run_case_and_compare(case, true, 0x51ED_0000_0000_0002, "conv1x1_with_bias");
@@ -1181,6 +1873,7 @@ mod tests {
                 dil_h: 2,
                 dil_w: 2,
                 group: 28,
+                activation: ConvActivation::None,
             };
             assert_eq!(engine_for(case), ConvEngine::Depthwise);
             run_case_and_compare(
@@ -1208,6 +1901,7 @@ mod tests {
                 dil_h: 1,
                 dil_w: 1,
                 group: 1,
+                activation: ConvActivation::None,
             };
             assert_eq!(engine_for(case), ConvEngine::ImplicitGemm);
             run_case_and_compare(
@@ -1235,6 +1929,7 @@ mod tests {
                 dil_h: 1,
                 dil_w: 1,
                 group: 1,
+                activation: ConvActivation::None,
             };
             assert_eq!(engine_for(case), ConvEngine::ImplicitGemm);
             // Hand-verified output size: floor((27+2-2-1)/2)+1=14, floor((19+2-2-1)/2)+1=10.
@@ -1244,6 +1939,137 @@ mod tests {
                 true,
                 0x51ED_0000_0000_0005,
                 "implicit_gemm_3x3_stride2_with_bias",
+            );
+        }
+
+        // ── The fused activation, on real hardware ──────────────────────────
+        //
+        // These are the on-device half of the corruption regression: the
+        // random weights make roughly half the raw outputs negative, so a
+        // dispatch that dropped the fused `Relu` disagrees with
+        // `naive_conv2d_f64` on ~half the tensor and the test fails loudly.
+
+        /// The device epilogue path: `ImplicitGemmConv` applies its bias in
+        /// the kernel, so the `Relu` is launched on the device, in place, on
+        /// the same stream, before the readback.
+        #[test]
+        fn implicit_gemm_with_fused_relu_matches_naive_cpu_reference() {
+            let case = ConvCase {
+                n: 1,
+                c: 23,
+                h: 24,
+                w: 18,
+                k: 29,
+                r: 3,
+                s: 3,
+                pad_h: 1,
+                pad_w: 1,
+                stride_h: 1,
+                stride_w: 1,
+                dil_h: 1,
+                dil_w: 1,
+                group: 1,
+                activation: ConvActivation::Relu,
+            };
+            assert_eq!(engine_for(case), ConvEngine::ImplicitGemm);
+            run_case_and_compare(
+                case,
+                true,
+                0x51ED_0000_0000_0006,
+                "implicit_gemm_fused_relu",
+            );
+        }
+
+        /// The host epilogue path: `Conv1x1` has no bias parameter, so the
+        /// bias is added on the host after the readback and the activation
+        /// has to follow it there — `Relu(conv + bias)`, never
+        /// `Relu(conv) + bias`. A dispatch that applied the activation on the
+        /// device here would rectify *before* the bias and disagree wherever
+        /// the bias pushes a negative pre-activation back above zero.
+        #[test]
+        fn conv1x1_with_bias_and_fused_relu_orders_the_epilogue_correctly() {
+            let case = ConvCase {
+                n: 1,
+                c: 30,
+                h: 19,
+                w: 23,
+                k: 26,
+                r: 1,
+                s: 1,
+                pad_h: 0,
+                pad_w: 0,
+                stride_h: 1,
+                stride_w: 1,
+                dil_h: 1,
+                dil_w: 1,
+                group: 1,
+                activation: ConvActivation::Relu,
+            };
+            assert_eq!(engine_for(case), ConvEngine::Conv1x1);
+            run_case_and_compare(case, true, 0x51ED_0000_0000_0007, "conv1x1_bias_fused_relu");
+        }
+
+        /// The host `Clip` epilogue, on the `ImplicitGemmConv` engine (whose
+        /// bias is already on the device, so this isolates "no device kernel
+        /// for Clip" from "bias still owed on the host").
+        #[test]
+        fn implicit_gemm_with_fused_clip_matches_naive_cpu_reference() {
+            let case = ConvCase {
+                n: 1,
+                c: 21,
+                h: 17,
+                w: 22,
+                k: 25,
+                r: 3,
+                s: 3,
+                pad_h: 1,
+                pad_w: 1,
+                stride_h: 1,
+                stride_w: 1,
+                dil_h: 1,
+                dil_w: 1,
+                group: 1,
+                activation: ConvActivation::Clip {
+                    min: -0.5,
+                    max: 0.75,
+                },
+            };
+            assert_eq!(engine_for(case), ConvEngine::ImplicitGemm);
+            run_case_and_compare(
+                case,
+                true,
+                0x51ED_0000_0000_0008,
+                "implicit_gemm_fused_clip",
+            );
+        }
+
+        /// The depthwise engine also owes a host bias add, so it takes the
+        /// host epilogue for the same reason `Conv1x1` does.
+        #[test]
+        fn depthwise_with_bias_and_fused_relu_matches_naive_cpu_reference() {
+            let case = ConvCase {
+                n: 1,
+                c: 26,
+                h: 20,
+                w: 24,
+                k: 26,
+                r: 3,
+                s: 3,
+                pad_h: 1,
+                pad_w: 1,
+                stride_h: 1,
+                stride_w: 1,
+                dil_h: 1,
+                dil_w: 1,
+                group: 26,
+                activation: ConvActivation::Relu,
+            };
+            assert_eq!(engine_for(case), ConvEngine::Depthwise);
+            run_case_and_compare(
+                case,
+                true,
+                0x51ED_0000_0000_0009,
+                "depthwise_bias_fused_relu",
             );
         }
     }

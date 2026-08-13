@@ -185,12 +185,12 @@ impl ResizeKind {
     }
 }
 
-pub(crate) fn build_resize_pipeline(
-    device: &wgpu::Device,
+fn build_resize_pipeline(
+    ctx: &GpuContext,
     kind_entry_point: &str,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
     build_pipeline(
-        device,
+        ctx,
         "resize",
         RESIZE_SHADER,
         kind_entry_point,
@@ -289,7 +289,7 @@ pub async fn gpu_resize_placed_async(
     let queue = &ctx.queue;
 
     let scope = ErrorScope::begin(ctx);
-    let (pipeline, bgl) = build_resize_pipeline(device, kind.entry_point());
+    let (pipeline, bgl) = build_resize_pipeline(ctx, kind.entry_point());
 
     let input_buf = ctx.operand_source("resize_in", data, wgpu::BufferUsages::STORAGE)?;
     let output_buf = ctx.pooled_buffer(

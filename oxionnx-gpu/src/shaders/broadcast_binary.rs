@@ -27,12 +27,14 @@ use super::kernel_support::{bgl_ro, bgl_rw, bgl_uniform, build_pipeline, WG_SIZE
 /// Binary op selected at dispatch time (all four entry points share one
 /// shader module and bind group layout; only the entry point differs).
 ///
-/// `pub(crate)` (not private) purely so [`build_broadcast_pipeline`] can
-/// stay `pub(crate)` too, matching its sibling `build_*_pipeline` functions
-/// in this kernel batch (see `kernel_support`'s module docs on why that
-/// matters for a future cached-pipeline hoist).
+/// Private to this module: \[w5\] retired the crate-level re-export that used to
+/// carry it out of here alongside `build_broadcast_pipeline`, which existed for
+/// a future hoist of the pipeline compile onto `GpuContext`. That hoist has
+/// happened — the compile memoizes into `GpuContext`'s own cache from right
+/// here — so nothing outside this file names either any more. The `pub`
+/// spelling callers use is [`BroadcastKind`], below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BroadcastOp {
+enum BroadcastOp {
     Add,
     Sub,
     Mul,
@@ -142,12 +144,12 @@ fn bcast_div(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-pub(crate) fn build_broadcast_pipeline(
-    device: &wgpu::Device,
+fn build_broadcast_pipeline(
+    ctx: &GpuContext,
     op: BroadcastOp,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
     build_pipeline(
-        device,
+        ctx,
         "broadcast_binary",
         BROADCAST_SHADER,
         op.entry_point(),
@@ -324,7 +326,7 @@ async fn gpu_broadcast_binary_placed(
     // problem would otherwise only surface via the context-wide degraded
     // flag instead of this dispatch's own decline.
     let scope = ErrorScope::begin(ctx);
-    let (pipeline, bgl) = build_broadcast_pipeline(device, op);
+    let (pipeline, bgl) = build_broadcast_pipeline(ctx, op);
 
     let a_buf = ctx.operand_source("bcast_a", a, wgpu::BufferUsages::STORAGE)?;
     let b_buf = ctx.operand_source("bcast_b", b, wgpu::BufferUsages::STORAGE)?;

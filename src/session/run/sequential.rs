@@ -228,6 +228,46 @@ fn accelerator_gate(
     accelerator_rank(candidate) > accelerator_rank(chosen) && provider_supports_op(candidate, op)
 }
 
+// ── What a CUDA dispatch *failure* means ─────────────────────────────────────
+
+/// What the run loop must do with an `Err` a CUDA dispatch handed back.
+///
+/// Two outcomes that used to be one, and had to stop being one: see the
+/// "DECLINED / FAILED / PROVED-WRONG" note above `Session::dispatch_to_cuda`.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CudaFailureAction {
+    /// The node has **not** been executed — a driver error, a PTX failure, an
+    /// allocation refused.  Recoverable: the CPU operator computes it instead,
+    /// and the run continues (logged at `warn!`).
+    FallBackToCpu,
+    /// `OXIONNX_CUDA_VERIFY=1` proved the GPU wrong on this node and
+    /// `OXIONNX_CUDA_STRICT=1` says that ends the run.  Propagated as `Err`.
+    FailTheRun,
+}
+
+/// Classify an error returned by `oxionnx_cuda::try_cuda_dispatch`.
+///
+/// A free function, shared by the sequential and parallel execution paths, so
+/// "what does `OXIONNX_CUDA_STRICT` mean" cannot come out different depending
+/// on `with_parallel_execution` — and so the decision is unit-testable on a
+/// host with no CUDA device, which is where this rule was silently wrong
+/// before.
+///
+/// Note that a verify mismatch is only ever an `Err` **in strict mode**: under
+/// the default `FailurePolicy::Fallback`, `oxionnx_cuda`'s `shadow_verify`
+/// discards the GPU's numbers and reports a decline (`Ok(None)`), which never
+/// reaches this function.  So `FailTheRun` needs no separate strict check —
+/// reaching it *is* strict mode.
+#[cfg(feature = "cuda")]
+pub(super) fn classify_cuda_failure(err: &OnnxError) -> CudaFailureAction {
+    if oxionnx_cuda::is_verify_mismatch(err) {
+        CudaFailureAction::FailTheRun
+    } else {
+        CudaFailureAction::FallBackToCpu
+    }
+}
+
 impl Session {
     /// The model's `ai.onnx` (default-domain) opset version.
     ///
@@ -561,25 +601,35 @@ impl Session {
     // Each returns:
     //   Ok(true)  — the provider executed the node and its outputs are committed
     //               to `state` (validated, all-or-nothing).
-    //   Ok(false) — the node was NOT executed; walk on down the chain.  Two very
-    //               different things currently collapse into this:
+    //   Ok(false) — the node was NOT executed; walk on down the chain.  Two
+    //               distinct-but-both-recoverable things map to this:
     //                 * DECLINED — no live context, no kernel for this op, or the
     //                   node's configuration is out of the kernel's range
     //                   (`Ok(None)`).  A normal, expected fall-back.
-    //                 * FAILED — the backend errored (`Err`).  Abnormal.
-    //   Err(_)    — unrecoverable.  Reserved for a provider that returned results
-    //               violating the write-back contract (wrong arity, internally
-    //               inconsistent tensor, shape disagreeing with shape inference).
-    //               Corrupt results must never be laundered into a quiet CPU
-    //               fallback: the graph is already poisoned at that point, and a
-    //               wrong answer is worse than a slow one.
+    //                 * FAILED — the backend errored (`Err`) while trying to run
+    //                   the node: a driver error, a PTX failure, an allocation
+    //                   refused.  Abnormal, logged at `warn!`, but the node has
+    //                   not been executed and the CPU can still compute it, so
+    //                   the run continues.
+    //   Err(_)    — unrecoverable.  Two things reach it:
+    //                 * a provider returning results that violate the write-back
+    //                   contract (wrong arity, internally inconsistent tensor,
+    //                   shape disagreeing with shape inference).  Corrupt results
+    //                   must never be laundered into a quiet CPU fallback: the
+    //                   graph is already poisoned at that point, and a wrong
+    //                   answer is worse than a slow one.
+    //                 * a **shadow-verification mismatch under
+    //                   `OXIONNX_CUDA_STRICT=1`** — see `dispatch_to_cuda`.
     //
-    // The DECLINED/FAILED collapse is pre-existing and a later wave will separate
-    // them.  It is not made worse here, and the failure information is no longer
-    // thrown away: it used to be logged behind `#[cfg(debug_assertions)]
-    // tracing::debug!`, i.e. invisible in every release build.  It is now a
-    // release-visible `tracing::warn!` carrying the provider, node, op kind and
-    // the error itself — the exact record that wave will need.
+    // # DECLINED / FAILED / PROVED-WRONG
+    //
+    // The first two are recoverable and stay collapsed onto `Ok(false)`: in both
+    // cases the node simply has not run yet, and the CPU operator produces the
+    // right answer.  The third is not, and used to be collapsed with them, which
+    // is what made `OXIONNX_CUDA_STRICT=1` a documented promise the engine did
+    // not keep: a run whose kernels the oracle had just caught disagreeing with
+    // it logged `strict=true` mismatches and then exited `0` with CPU-recomputed
+    // numbers.  "Strict" has to mean the run fails.  It now does.
 
     /// Offer `node` to the CUDA backend.  See the block comment above.
     #[cfg(feature = "cuda")]
@@ -604,8 +654,32 @@ impl Session {
             // DECLINED: no kernel for this op, or this node's configuration is out
             // of the kernel's range.  Fall through to the next provider.
             Ok(None) => Ok(false),
-            // FAILED — not the same thing as declined, however similarly it is
-            // currently treated.  Kept visible in release builds.
+            // PROVED WRONG: `OXIONNX_CUDA_VERIFY=1` recomputed this node on the
+            // CPU oracle, the two disagreed, and `OXIONNX_CUDA_STRICT=1` says a
+            // demonstrated GPU fault ends the run.  (Without STRICT the mismatch
+            // never becomes an `Err` at all: `oxionnx_cuda::reference::shadow_verify`
+            // discards the GPU's numbers and reports a decline, which arrives
+            // above as `Ok(None)` and falls back to the CPU.  So reaching here
+            // *is* strict mode.)
+            //
+            // Falling back would defeat the flag: the user asked to be told, and
+            // a CPU-recomputed result exits `0` and looks identical to a healthy
+            // run.  Propagated instead, aborting the inference.
+            Err(err) if classify_cuda_failure(&err) == CudaFailureAction::FailTheRun => {
+                tracing::error!(
+                    provider = "CUDA",
+                    op = %node.op.as_str(),
+                    node = %node.name,
+                    error = %err,
+                    "execution provider was PROVED WRONG by shadow verification and \
+                     OXIONNX_CUDA_STRICT is set; failing the run instead of falling back",
+                );
+                Err(err)
+            }
+            // FAILED — the backend could not run the node (driver, PTX,
+            // allocation).  Recoverable: nothing was executed, so the CPU
+            // operator below still computes the right answer.  Kept visible in
+            // release builds.
             Err(err) => {
                 tracing::warn!(
                     provider = "CUDA",
@@ -1365,5 +1439,90 @@ mod tests {
                 "{accel:?} must outrank the CPU",
             );
         }
+    }
+
+    // ── OXIONNX_CUDA_STRICT actually being strict ───────────────────────────
+    //
+    // The regression: `dispatch_to_cuda` collapsed every `Err` from
+    // `try_cuda_dispatch` into `Ok(false)` — "declined" — so a run under
+    // `OXIONNX_CUDA_STRICT=1` logged `strict=true` verify mismatches for 22
+    // nodes, silently recomputed each of them on the CPU, and exited `0`.  The
+    // documented contract (`oxiface --device` help, `oxionnx-cuda`'s
+    // `context` module docs) is that strict mode *fails the run*.
+    //
+    // These tests are GPU-free by construction: they exercise the classifier
+    // the run loop consults, on errors built the same way the real path builds
+    // them.
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_shadow_verify_mismatch_fails_the_run_rather_than_falling_back() {
+        // Exactly the error `oxionnx_cuda`'s `verify_or_fallback` produces
+        // under `FailurePolicy::Strict`, through the same lossy
+        // `CudaDispatchError -> OnnxError` conversion the runner sees.
+        let err: OnnxError = oxionnx_cuda::CudaError::Verify(
+            "element 208113: GPU=0.056837104, CPU-oracle=0.056530874".into(),
+        )
+        .into();
+        assert_eq!(
+            classify_cuda_failure(&err),
+            CudaFailureAction::FailTheRun,
+            "a proved-wrong kernel must abort the run; falling back to the CPU is what made \
+             OXIONNX_CUDA_STRICT=1 exit 0 on a run it had just caught misbehaving",
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn an_ordinary_cuda_dispatch_failure_still_falls_back_to_the_cpu() {
+        for err in [
+            oxionnx_cuda::CudaError::Dnn("cuDNN engine refused the problem".into()),
+            oxionnx_cuda::CudaError::Ptx("PTX compilation failed".into()),
+            oxionnx_cuda::CudaError::Shape {
+                op: "MatMul",
+                msg: "K mismatch".into(),
+            },
+            oxionnx_cuda::CudaError::Unsupported {
+                op: "Conv",
+                reason: "asymmetric pads".into(),
+            },
+        ] {
+            let onnx: OnnxError = err.into();
+            assert_eq!(
+                classify_cuda_failure(&onnx),
+                CudaFailureAction::FallBackToCpu,
+                "the node never ran, so the CPU can still compute it: {onnx}",
+            );
+        }
+    }
+
+    /// An `OnnxError` raised anywhere *else* in the engine must not be
+    /// mistaken for a CUDA verify mismatch just because it quotes one.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_non_cuda_error_is_never_treated_as_a_proved_wrong_kernel() {
+        assert_eq!(
+            classify_cuda_failure(&OnnxError::ShapeMismatch(
+                "CUDA VERIFY MISMATCH: not really".into()
+            )),
+            CudaFailureAction::FallBackToCpu,
+        );
+    }
+
+    /// The end-to-end chain, minus the GPU: `oxionnx-cuda`'s own strict-policy
+    /// gate produces an error, and this file's classifier recognises it.  This
+    /// is what stops the two crates drifting apart — `oxionnx-cuda` could
+    /// reword the message and `oxionnx` would keep falling back, silently, and
+    /// only a real GPU fault would ever reveal it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_strict_policy_error_oxionnx_cuda_actually_raises_is_the_one_we_classify() {
+        let mismatch = oxionnx_cuda::error::is_verify_mismatch;
+        let err: OnnxError = oxionnx_cuda::CudaError::Verify("element 0".into()).into();
+        assert!(
+            mismatch(&err),
+            "oxionnx_cuda must recognise the error it raises itself",
+        );
+        assert_eq!(classify_cuda_failure(&err), CudaFailureAction::FailTheRun);
     }
 }

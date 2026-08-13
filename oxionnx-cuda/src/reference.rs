@@ -37,11 +37,31 @@
 //! `generate_leaky_relu` / `generate_hard_sigmoid` / `generate_gelu` doc
 //! comments and PTX literals (`0f3C23D70A` = 0.01, `0f3E4CCCCD` = 0.2,
 //! `0f3F000000` = 0.5).
+//!
+//! # Parallelism
+//!
+//! `ref_conv`/`ref_matmul`/`ref_reduce`/`ref_softmax` split their work
+//! across `rayon` above a size threshold (`PAR_MIN_MACS` /
+//! `PAR_MIN_ELEMENTWISE_LEN`): naive single-threaded `f64` conv is the
+//! entire reason `OXIONNX_CUDA_VERIFY=1` used to turn a 7.7s swap into one
+//! that had not finished after 45 minutes (349 GFLOP of it per InSwapper
+//! frame alone). Every oracle's per-output-unit formula (one conv row, one
+//! matmul row, one reduce/softmax row) is written exactly once and called
+//! identically from the serial and parallel branches, splitting only
+//! across *independent* output rows/elements -- never within a single
+//! output element's own accumulation loop, whose `f64` summation order
+//! (and therefore its rounding) is untouched by parallelism. See the
+//! `*_parallel_matches_serial_on_*` property tests below, which assert
+//! this directly (bit-for-bit, not just "close").
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use oxionnx_core::graph::OpKind;
+use rayon::prelude::*;
 
 use crate::context::{parse_env_flag, FailurePolicy};
-use crate::conv::ConvParams;
+use crate::conv::{ConvActivation, ConvParams};
 use crate::error::CudaDispatchError;
 
 // ─── the verify gate ────────────────────────────────────────────────────────
@@ -196,26 +216,343 @@ pub(crate) fn shadow_verify(
     }
 }
 
+// ─── parallelism plumbing ───────────────────────────────────────────────────
+//
+// `ref_conv`, `ref_matmul`, `ref_reduce`, and `ref_softmax` all follow the
+// same shape: a small per-output-unit formula (one conv row, one matmul
+// row, one reduce/softmax row) written exactly once, called identically
+// from a serial branch (small shapes, where a `rayon` split would cost
+// more than it saves) and a `rayon`-parallel branch (real shapes).
+// Splitting only ever happens across *independent* output rows/elements --
+// never within a single output element's own `f64` accumulation loop, so
+// every element's accumulation order (and therefore its rounding) is
+// bit-for-bit identical to the pre-parallelisation serial code, whichever
+// branch computed it. The `*_parallel_matches_serial_on_*` property tests
+// below assert this directly against randomised shapes, not just this
+// comment.
+
+/// Below this many scalar multiply-adds, a `rayon` split costs more than
+/// the serial loop it would replace: a `rayon::join` still pays a
+/// work-deque push/pop even when nothing gets stolen, and this crate's own
+/// hand-verified unit tests below call `ref_conv`/`ref_matmul`/`ref_reduce`
+/// on 4-to-25-element toy shapes hundreds of times. `1 << 16` sits far
+/// below any real conv/matmul in this pipeline (the smallest is a 1x1
+/// projection, still tens of thousands of MACs) and far above every
+/// hand-verified test shape below. Mirrors the identical small-input guard
+/// `oxionnx-ops`'s `matmul_nt_into_par`/`parallel_sgemm` use for the same
+/// reason (`attention/gemm.rs::PAR_MIN_MACS`,
+/// `conv/conv2d.rs::PARALLEL_GEMM_THRESHOLD`).
+const PAR_MIN_MACS: u64 = 1 << 16;
+
+/// The elementwise-formula equivalent of [`PAR_MIN_MACS`]: below this many
+/// elements, `ref_unary_vec`/`ref_binary_vec`/`ref_softmax` stay serial.
+const PAR_MIN_ELEMENTWISE_LEN: usize = 1 << 14;
+
+/// Is a `rayon`-parallel split worth it for `total_macs` worth of scalar
+/// multiply-adds?
+///
+/// Also declines whenever the global `rayon` pool has been configured down
+/// to a single thread (`RAYON_NUM_THREADS=1`, or a custom single-threaded
+/// pool): splitting work that can never run concurrently only adds
+/// overhead for nothing.
+fn parallel_worthwhile(total_macs: u64) -> bool {
+    total_macs >= PAR_MIN_MACS && rayon::current_num_threads() > 1
+}
+
+/// How often a single long-running oracle call may emit a `tracing::info!`
+/// progress line, in nanoseconds -- frequent enough that a user watching an
+/// `OXIONNX_CUDA_VERIFY=1` run sees liveness, infrequent enough that a
+/// multi-second op does not flood the log. "A few seconds", per this
+/// module's brief.
+const PROGRESS_LOG_INTERVAL_NANOS: u64 = 2_000_000_000;
+
+/// Rate-limited, thread-safe progress reporter shared by every `rayon`
+/// worker computing one oracle call.
+///
+/// Workers call [`ProgressReporter::advance`] once per independent unit of
+/// work they finish (a conv/matmul/reduce output row or `rayon`-chunk, a
+/// softmax row); at most one `tracing::info!` line escapes per
+/// [`PROGRESS_LOG_INTERVAL_NANOS`] *total*, regardless of how many threads
+/// call `advance` concurrently -- the gate is a single atomic
+/// compare-exchange on a shared "nanoseconds of the last log" timestamp, so
+/// only the worker that wins the race logs, and every other call pays one
+/// atomic add plus one atomic load. Only ever constructed on the
+/// large-shape `rayon` branch (see [`PAR_MIN_MACS`]/[`PAR_MIN_ELEMENTWISE_LEN`]
+/// above): a call too small to be worth parallelising is also too small to
+/// ever run long enough to need a progress line.
+struct ProgressReporter {
+    op: &'static str,
+    shape: String,
+    total_units: usize,
+    done: AtomicUsize,
+    last_log_nanos: AtomicU64,
+    start: Instant,
+}
+
+impl ProgressReporter {
+    /// `total_units` is whatever [`ProgressReporter::advance`] counts in
+    /// (output rows, or `rayon`-chunks for `ref_reduce`) -- only used to
+    /// compute a percentage for the log line, so an approximate unit is
+    /// fine.
+    fn new(op: &'static str, shape: String, total_units: usize) -> Self {
+        Self {
+            op,
+            shape,
+            total_units,
+            done: AtomicUsize::new(0),
+            // Starts at 0 ("due immediately"), but `advance` only logs once
+            // *elapsed* time clears the interval, so the very first line
+            // still cannot appear before `PROGRESS_LOG_INTERVAL_NANOS` has
+            // actually passed -- a call that finishes faster than that
+            // never logs at all, which is the point: liveness only matters
+            // once a call has already run long enough to make a user
+            // wonder.
+            last_log_nanos: AtomicU64::new(0),
+            start: Instant::now(),
+        }
+    }
+
+    /// Record `n` newly finished units of work.
+    fn advance(&self, n: usize) {
+        let done = self.done.fetch_add(n, Ordering::Relaxed) + n;
+        let elapsed = self.start.elapsed();
+        let elapsed_nanos = elapsed.as_nanos() as u64;
+        let last = self.last_log_nanos.load(Ordering::Relaxed);
+        if elapsed_nanos.saturating_sub(last) < PROGRESS_LOG_INTERVAL_NANOS {
+            return;
+        }
+        // CAS, not a plain store: if two threads cross the interval at
+        // once, exactly one updates the timestamp and logs; the loser's
+        // `compare_exchange` fails and it returns without logging.
+        if self
+            .last_log_nanos
+            .compare_exchange(last, elapsed_nanos, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let percent = if self.total_units == 0 {
+                100.0
+            } else {
+                100.0 * (done.min(self.total_units) as f64) / (self.total_units as f64)
+            };
+            tracing::info!(
+                op = self.op,
+                shape = %self.shape,
+                percent = format!("{percent:.1}"),
+                elapsed_s = format!("{:.1}", elapsed.as_secs_f64()),
+                "OXIONNX_CUDA_VERIFY CPU oracle still computing",
+            );
+        }
+    }
+}
+
 // ─── the oracle itself ──────────────────────────────────────────────────────
+
+/// Compute one output row `out[i, 0..n]` of a naive `[m,k] x [k,n] ->
+/// [m,n]` row-major matmul.
+///
+/// The single place the per-element formula is written down -- both of
+/// [`ref_matmul`]'s branches call exactly this, once per row `i`, so there
+/// is no second copy that could silently drift from the first. Each output
+/// element's own `f64` accumulation order (`p` ascending from 0) is
+/// unaffected by which branch calls it or which thread runs it.
+fn matmul_row(row_out: &mut [f32], a_row: &[f32], b: &[f32], k: usize, n: usize) {
+    for (j, out_val) in row_out.iter_mut().enumerate() {
+        let mut acc = 0.0_f64;
+        for p in 0..k {
+            acc += f64::from(a_row[p]) * f64::from(b[p * n + j]);
+        }
+        *out_val = acc as f32;
+    }
+}
+
+/// Fill every row of `out` serially -- no `rayon` involvement at all. See
+/// [`ref_matmul`].
+fn ref_matmul_fill_serial(out: &mut [f32], a: &[f32], b: &[f32], k: usize, n: usize) {
+    for (i, row) in out.chunks_mut(n).enumerate() {
+        matmul_row(row, &a[i * k..i * k + k], b, k, n);
+    }
+}
+
+/// Fill every row of `out` via a `rayon` split across rows. See
+/// [`ref_matmul`].
+///
+/// Exposed as its own function (rather than inlined into [`ref_matmul`]) so
+/// the `*_parallel_matches_serial_on_*` property tests below can call it
+/// directly against [`ref_matmul_fill_serial`] on the *same* large shape --
+/// [`ref_matmul`] itself only ever runs one branch or the other for a given
+/// `m`/`k`/`n`, decided by [`parallel_worthwhile`], so there is no other way
+/// to force both branches over identical data.
+fn ref_matmul_fill_parallel(
+    out: &mut [f32],
+    a: &[f32],
+    b: &[f32],
+    k: usize,
+    n: usize,
+    reporter: &ProgressReporter,
+) {
+    out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+        matmul_row(row, &a[i * k..i * k + k], b, k, n);
+        reporter.advance(1);
+    });
+}
 
 /// Naive `[m, k] x [k, n] -> [m, n]` row-major matmul.
 ///
 /// `O(m*k*n)` with an `f64` accumulator per output element — deliberately
 /// unoptimised; this exists to be obviously correct, not fast, and is only
-/// ever called behind [`verify_enabled`].
+/// ever called behind [`verify_enabled`]. Above `PAR_MIN_MACS` total
+/// multiply-adds, the `m` output rows are split across `rayon` (see
+/// `ref_matmul_fill_parallel` and the [module-level parallelism
+/// note](self)); below it, runs as a single serial loop with no `rayon`
+/// involvement at all (`ref_matmul_fill_serial`).
 #[must_use]
 pub fn ref_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut out = vec![0.0_f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = 0.0_f64;
-            for p in 0..k {
-                acc += f64::from(a[i * k + p]) * f64::from(b[p * n + j]);
-            }
-            out[i * n + j] = acc as f32;
-        }
+    if n == 0 {
+        return out;
+    }
+
+    let total_macs = (m as u64).saturating_mul(k as u64).saturating_mul(n as u64);
+    if parallel_worthwhile(total_macs) {
+        let reporter =
+            ProgressReporter::new("MatMul", format!("[{m},{k}]x[{k},{n}]->[{m},{n}]"), m);
+        ref_matmul_fill_parallel(&mut out, a, b, k, n, &reporter);
+    } else {
+        ref_matmul_fill_serial(&mut out, a, b, k, n);
     }
     out
+}
+
+/// Per-row geometry for [`ref_conv`]'s naive cross-correlation: everything
+/// that stays fixed across every output row of one call, resolved once so
+/// [`conv_row`] only does index arithmetic and never re-derives strides or
+/// group boundaries. Also carries the output shape (`n`/`out_channels`/
+/// `out_h`/`out_w`) so [`ref_conv_fill_serial`]/[`ref_conv_fill_parallel`]
+/// need no parameters beyond `out` itself and this struct.
+#[derive(Clone, Copy)]
+struct ConvGeometry {
+    n: usize,
+    in_channels: usize,
+    in_h: usize,
+    in_w: usize,
+    out_channels: usize,
+    out_h: usize,
+    out_w: usize,
+    in_ch_per_group: usize,
+    filter_h: usize,
+    filter_w: usize,
+    out_ch_per_group: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+    dil_h: usize,
+    dil_w: usize,
+}
+
+/// The operands [`conv_row`] needs, bundled so its own parameter list stays
+/// under `clippy::too_many_arguments` -- every field is a borrow or a
+/// `Copy` value, so grouping them costs nothing at the call site.
+struct ConvRowInputs<'a> {
+    input: &'a [f32],
+    weight: &'a [f32],
+    bias: Option<&'a [f32]>,
+    geom: ConvGeometry,
+}
+
+/// Compute one output row `out[n=ni, k=ki, h=oh, 0..out_w]` of a naive NCHW
+/// cross-correlation.
+///
+/// The single place the per-element formula is written down -- [`ref_conv`]'s
+/// serial (small-shape) and `rayon`-parallel (large-shape) branches both
+/// call exactly this function, once per `(ni, ki, oh)`, so there is no
+/// second copy that could silently drift from the first. Each output
+/// element's own `f64` accumulation order (`cg` outermost, then `ri`, then
+/// `si` -- byte for byte the original fully-serial loop nest) is
+/// unaffected by which branch calls it or which thread runs it: only
+/// *which rows* run concurrently changes, never the arithmetic inside one
+/// row.
+#[allow(clippy::needless_range_loop)]
+fn conv_row(row_out: &mut [f32], ops: &ConvRowInputs<'_>, ni: usize, ki: usize, oh: usize) {
+    let geom = &ops.geom;
+    // Which group this output channel belongs to -- `weight`'s leading
+    // `[K, ...]` dim is laid out group-major (the first `out_ch_per_group`
+    // filters belong to group 0, the next `out_ch_per_group` to group 1,
+    // and so on), matching ONNX's `Conv` spec and `oxicuda_dnn`'s own
+    // kernel bodies.
+    let g = ki / geom.out_ch_per_group;
+    for (ow, out_val) in row_out.iter_mut().enumerate() {
+        let mut acc = 0.0_f64;
+        for cg in 0..geom.in_ch_per_group {
+            let ci = g * geom.in_ch_per_group + cg;
+            for ri in 0..geom.filter_h {
+                // Implicit zero-padding: an input coordinate that lands
+                // outside `[0, in_h)`/`[0, in_w)` contributes nothing,
+                // rather than being an error -- this is what makes the
+                // padding "same"-style output sizes correct.
+                let ih = oh as isize * geom.stride_h as isize - geom.pad_h as isize
+                    + ri as isize * geom.dil_h as isize;
+                if ih < 0 || ih as usize >= geom.in_h {
+                    continue;
+                }
+                let ih = ih as usize;
+                for si in 0..geom.filter_w {
+                    let iw = ow as isize * geom.stride_w as isize - geom.pad_w as isize
+                        + si as isize * geom.dil_w as isize;
+                    if iw < 0 || iw as usize >= geom.in_w {
+                        continue;
+                    }
+                    let iw = iw as usize;
+                    let in_idx = ((ni * geom.in_channels + ci) * geom.in_h + ih) * geom.in_w + iw;
+                    let f_idx = ((ki * geom.in_ch_per_group + cg) * geom.filter_h + ri)
+                        * geom.filter_w
+                        + si;
+                    acc += f64::from(ops.input[in_idx]) * f64::from(ops.weight[f_idx]);
+                }
+            }
+        }
+        if let Some(bv) = ops.bias {
+            acc += f64::from(bv[ki]);
+        }
+        *out_val = acc as f32;
+    }
+}
+
+/// Fill every row of `out` serially -- no `rayon` involvement at all. See
+/// [`ref_conv`].
+fn ref_conv_fill_serial(out: &mut [f32], ops: &ConvRowInputs<'_>) {
+    let geom = &ops.geom;
+    for ni in 0..geom.n {
+        for ki in 0..geom.out_channels {
+            let row_base = (ni * geom.out_channels + ki) * geom.out_h;
+            for oh in 0..geom.out_h {
+                let row = &mut out[(row_base + oh) * geom.out_w..(row_base + oh + 1) * geom.out_w];
+                conv_row(row, ops, ni, ki, oh);
+            }
+        }
+    }
+}
+
+/// Fill every row of `out` via a `rayon` split across `(ni, ki, oh)` rows.
+/// See [`ref_conv`].
+///
+/// Exposed as its own function (rather than inlined into [`ref_conv`]) so
+/// the `*_parallel_matches_serial_on_*` property tests below can call it
+/// directly against [`ref_conv_fill_serial`] on the *same* large shape --
+/// [`ref_conv`] itself only ever runs one branch or the other for a given
+/// shape, decided by [`parallel_worthwhile`], so there is no other way to
+/// force both branches over identical data.
+fn ref_conv_fill_parallel(out: &mut [f32], ops: &ConvRowInputs<'_>, reporter: &ProgressReporter) {
+    let geom = ops.geom;
+    out.par_chunks_mut(geom.out_w)
+        .enumerate()
+        .for_each(|(row_idx, row)| {
+            let oh = row_idx % geom.out_h;
+            let ki = (row_idx / geom.out_h) % geom.out_channels;
+            let ni = row_idx / (geom.out_h * geom.out_channels);
+            conv_row(row, ops, ni, ki, oh);
+            reporter.advance(1);
+        });
 }
 
 /// Naive NCHW cross-correlation (the `cuDNN`/ONNX `Conv` convention — no
@@ -239,7 +576,11 @@ pub fn ref_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
 /// `O(N*K*P*Q*(C/groups)*R*S)` with an `f64` accumulator per output
 /// element, cast to `f32` only once, at the very end — deliberately
 /// unoptimised, the same discipline as [`ref_matmul`]: this exists to be
-/// obviously correct, not fast.
+/// obviously correct, not fast. Above `PAR_MIN_MACS` total multiply-adds,
+/// the `N*K*out_h` output rows are split across `rayon`
+/// (`ref_conv_fill_parallel`, see also the [module-level parallelism
+/// note](self)); below it, runs as a single serial loop with no `rayon`
+/// involvement at all (`ref_conv_fill_serial`).
 ///
 /// # Panics
 /// Indexes `input`/`weight`/`bias`/`in_shape`/`weight_shape` directly with
@@ -253,7 +594,6 @@ pub fn ref_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
 /// means the caller passed shapes it never validated — a bug in the caller,
 /// not a normal outcome.
 #[must_use]
-#[allow(clippy::needless_range_loop)]
 pub fn ref_conv(
     input: &[f32],
     weight: &[f32],
@@ -288,55 +628,175 @@ pub fn ref_conv(
     let out_w = (in_w + 2 * pad_w - eff_w) / stride_w + 1;
 
     let mut out = vec![0.0_f32; n * out_channels * out_h * out_w];
-    for ni in 0..n {
-        for ki in 0..out_channels {
-            // Which group this output channel belongs to -- `weight`'s
-            // leading `[K, ...]` dim is laid out group-major (the first
-            // `out_ch_per_group` filters belong to group 0, the next
-            // `out_ch_per_group` to group 1, and so on), matching ONNX's
-            // `Conv` spec and `oxicuda_dnn`'s own kernel bodies.
-            let g = ki / out_ch_per_group;
-            for oh in 0..out_h {
-                for ow in 0..out_w {
-                    let mut acc = 0.0_f64;
-                    for cg in 0..in_ch_per_group {
-                        let ci = g * in_ch_per_group + cg;
-                        for ri in 0..filter_h {
-                            // Implicit zero-padding: an input coordinate
-                            // that lands outside `[0, in_h)`/`[0, in_w)`
-                            // contributes nothing, rather than being an
-                            // error -- this is what makes the padding
-                            // "same"-style output sizes correct.
-                            let ih = oh as isize * stride_h as isize - pad_h as isize
-                                + ri as isize * dil_h as isize;
-                            if ih < 0 || ih as usize >= in_h {
-                                continue;
-                            }
-                            let ih = ih as usize;
-                            for si in 0..filter_w {
-                                let iw = ow as isize * stride_w as isize - pad_w as isize
-                                    + si as isize * dil_w as isize;
-                                if iw < 0 || iw as usize >= in_w {
-                                    continue;
-                                }
-                                let iw = iw as usize;
-                                let in_idx = ((ni * in_channels + ci) * in_h + ih) * in_w + iw;
-                                let f_idx =
-                                    ((ki * in_ch_per_group + cg) * filter_h + ri) * filter_w + si;
-                                acc += f64::from(input[in_idx]) * f64::from(weight[f_idx]);
-                            }
-                        }
-                    }
-                    if let Some(bv) = bias {
-                        acc += f64::from(bv[ki]);
-                    }
-                    let o_idx = ((ni * out_channels + ki) * out_h + oh) * out_w + ow;
-                    out[o_idx] = acc as f32;
+    if out_w == 0 {
+        // Only reachable when `out` is already empty (a 0-width row can
+        // only coexist with a 0-length `out`, since `out.len()` is a
+        // product that includes `out_w`) -- guarded explicitly, before the
+        // `par_chunks_mut(out_w)` below, because `chunks_mut(0)` panics
+        // even on an empty slice, where a 0-length `out` would otherwise be
+        // the (already correct) answer.
+        return out;
+    }
+
+    let ops = ConvRowInputs {
+        input,
+        weight,
+        bias,
+        geom: ConvGeometry {
+            n,
+            in_channels,
+            in_h,
+            in_w,
+            out_channels,
+            out_h,
+            out_w,
+            in_ch_per_group,
+            filter_h,
+            filter_w,
+            out_ch_per_group,
+            stride_h,
+            stride_w,
+            pad_h,
+            pad_w,
+            dil_h,
+            dil_w,
+        },
+    };
+
+    let total_macs = (n as u64)
+        .saturating_mul(out_channels as u64)
+        .saturating_mul(out_h as u64)
+        .saturating_mul(out_w as u64)
+        .saturating_mul(in_ch_per_group as u64)
+        .saturating_mul(filter_h as u64)
+        .saturating_mul(filter_w as u64);
+
+    if parallel_worthwhile(total_macs) {
+        let reporter = ProgressReporter::new(
+            "Conv",
+            format!(
+                "[{n},{in_channels},{in_h},{in_w}]*[{out_channels},{in_ch_per_group},\
+                 {filter_h},{filter_w}]->[{n},{out_channels},{out_h},{out_w}]"
+            ),
+            n * out_channels * out_h,
+        );
+        ref_conv_fill_parallel(&mut out, &ops, &reporter);
+    } else {
+        ref_conv_fill_serial(&mut out, &ops);
+    }
+
+    // The optimizer's fused activation is part of what the *node* computes,
+    // not a separate node — see [`crate::conv::ConvActivation`]. An oracle
+    // that skipped it would agree with a GPU dispatch that also skipped it,
+    // which is exactly how a dropped `Relu` survived `OXIONNX_CUDA_VERIFY=1`
+    // and corrupted every SCRFD detection while every verified node "passed".
+    apply_conv_activation_ref(&mut out, params.activation);
+    out
+}
+
+/// The oracle's own implementation of the fused activation [`ref_conv`]
+/// applies.
+///
+/// Written from the ONNX / `oxionnx-ops` semantics rather than by calling
+/// `crate::conv`'s dispatch-side helper, for the same reason [`ref_conv`] does
+/// not call the CUDA kernel: an oracle that shares an implementation with the
+/// thing it checks checks nothing.
+fn apply_conv_activation_ref(out: &mut [f32], activation: ConvActivation) {
+    match activation {
+        ConvActivation::None => {}
+        ConvActivation::Relu => {
+            for v in out.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
+            }
+        }
+        ConvActivation::Clip { min, max } => {
+            // ONNX `Clip`: a NaN bound is no bound on that side, and an
+            // inverted `[min, max]` leaves the data alone.
+            let lo = if min.is_nan() { f32::NEG_INFINITY } else { min };
+            let hi = if max.is_nan() { f32::INFINITY } else { max };
+            if lo > hi {
+                return;
+            }
+            for v in out.iter_mut() {
+                if *v < lo {
+                    *v = lo;
+                } else if *v > hi {
+                    *v = hi;
                 }
             }
         }
     }
-    out
+}
+
+/// One `ReduceSum` output element at flattened `(o, i)` -- see [`ref_reduce`]
+/// for the `[outer, axis_len, inner]` layout this indexes into.
+fn reduce_sum_at(data: &[f32], axis_len: usize, inner: usize, o: usize, i: usize) -> f32 {
+    let mut acc = 0.0_f64;
+    for a in 0..axis_len {
+        acc += f64::from(data[(o * axis_len + a) * inner + i]);
+    }
+    acc as f32
+}
+
+/// One `ReduceMax` output element. See [`reduce_sum_at`].
+fn reduce_max_at(data: &[f32], axis_len: usize, inner: usize, o: usize, i: usize) -> f32 {
+    let mut acc = f32::NEG_INFINITY;
+    for a in 0..axis_len {
+        acc = acc.max(data[(o * axis_len + a) * inner + i]);
+    }
+    acc
+}
+
+/// Fill every output element of `out` serially -- no `rayon` involvement at
+/// all. See [`ref_reduce`].
+fn ref_reduce_fill_serial(
+    out: &mut [f32],
+    data: &[f32],
+    compute: fn(&[f32], usize, usize, usize, usize) -> f32,
+    axis_len: usize,
+    inner: usize,
+    outer: usize,
+) {
+    for o in 0..outer {
+        for (i, out_val) in out[o * inner..(o + 1) * inner].iter_mut().enumerate() {
+            *out_val = compute(data, axis_len, inner, o, i);
+        }
+    }
+}
+
+/// Fill every output element of `out` via a `rayon` split into flat chunks
+/// of `chunk_len` elements. See [`ref_reduce`].
+///
+/// Exposed as its own function (rather than inlined into [`ref_reduce`]),
+/// and taking `chunk_len` as a parameter rather than deriving it internally
+/// the way [`ref_conv_fill_parallel`]/[`ref_matmul_fill_parallel`] do, so
+/// the `*_parallel_matches_serial_on_*` property tests below can call it
+/// directly against [`ref_reduce_fill_serial`] on the *same* large shape at
+/// several different chunk sizes -- the per-element `compute` call does not
+/// depend on chunk boundaries at all, so this doubles as a check that the
+/// result is chunk-size-invariant, not just "matches one specific `rayon`
+/// config".
+fn ref_reduce_fill_parallel(
+    out: &mut [f32],
+    data: &[f32],
+    compute: fn(&[f32], usize, usize, usize, usize) -> f32,
+    axis_len: usize,
+    inner: usize,
+    chunk_len: usize,
+    reporter: &ProgressReporter,
+) {
+    out.par_chunks_mut(chunk_len)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let base = chunk_idx * chunk_len;
+            for (offset, out_val) in chunk.iter_mut().enumerate() {
+                let idx = base + offset;
+                *out_val = compute(data, axis_len, inner, idx / inner, idx % inner);
+            }
+            reporter.advance(1);
+        });
 }
 
 /// Naive per-axis `ReduceSum` / `ReduceMax`.
@@ -344,7 +804,13 @@ pub fn ref_conv(
 /// `shape` is decomposed as `[outer, axis_len, inner]` around `axis`,
 /// matching [`crate::reduce::cuda_reduce`]'s own layout. Returns `None` for
 /// an out-of-range axis or an op this oracle has no formula for (the caller
-/// treats that as "skip the check", not "the GPU is wrong").
+/// treats that as "skip the check", not "the GPU is wrong"). Above
+/// `PAR_MIN_MACS` total multiply-adds, the `outer*inner` output elements
+/// are split across `rayon` in `rayon::current_num_threads() * 4`-ish flat
+/// chunks (`ref_reduce_fill_parallel` -- finer than "one chunk per `o`",
+/// so a reduce over a small `outer` with a large `inner` -- or vice versa --
+/// still parallelises well); below it, runs as a single serial loop with no
+/// `rayon` involvement at all (`ref_reduce_fill_serial`).
 #[must_use]
 pub fn ref_reduce(op: &OpKind, data: &[f32], shape: &[usize], axis: usize) -> Option<Vec<f32>> {
     if axis >= shape.len() {
@@ -357,29 +823,104 @@ pub fn ref_reduce(op: &OpKind, data: &[f32], shape: &[usize], axis: usize) -> Op
         return None;
     }
 
-    let mut out = vec![0.0_f32; outer * inner];
-    for o in 0..outer {
-        for i in 0..inner {
-            match op {
-                OpKind::ReduceSum => {
-                    let mut acc = 0.0_f64;
-                    for a in 0..axis_len {
-                        acc += f64::from(data[(o * axis_len + a) * inner + i]);
-                    }
-                    out[o * inner + i] = acc as f32;
-                }
-                OpKind::ReduceMax => {
-                    let mut acc = f32::NEG_INFINITY;
-                    for a in 0..axis_len {
-                        acc = acc.max(data[(o * axis_len + a) * inner + i]);
-                    }
-                    out[o * inner + i] = acc;
-                }
-                _ => return None,
-            }
-        }
+    // Resolved once, outside every loop below, rather than re-matched on
+    // `op` for every one of `outer*inner` output elements: a bare function
+    // pointer costs nothing to call (no captured state, `Send + Sync` for
+    // free), and re-matching on every element is exactly the per-element
+    // cost the original code paid.
+    let compute: fn(&[f32], usize, usize, usize, usize) -> f32 = match op {
+        OpKind::ReduceSum => reduce_sum_at,
+        OpKind::ReduceMax => reduce_max_at,
+        _ => return None,
+    };
+
+    let total = outer * inner;
+    let mut out = vec![0.0_f32; total];
+    let total_macs = (total as u64).saturating_mul(axis_len as u64);
+
+    if parallel_worthwhile(total_macs) {
+        // Chunked flat over `total`, not by `inner` (one chunk per `o`):
+        // unlike a conv/matmul row, a reduce output element's cost does not
+        // depend on its position, so a flat chunking that ignores the
+        // `outer`/`inner` split costs nothing in locality and stays
+        // balanced even when `outer` is small (e.g. axis 0) and `inner` is
+        // large, where "one chunk per `o`" would degenerate to a single
+        // chunk.
+        let chunk_len = total
+            .div_ceil((rayon::current_num_threads() * 4).max(1))
+            .max(1);
+        let reporter = ProgressReporter::new(
+            "Reduce",
+            format!("outer={outer} axis_len={axis_len} inner={inner}"),
+            total.div_ceil(chunk_len),
+        );
+        ref_reduce_fill_parallel(
+            &mut out, data, compute, axis_len, inner, chunk_len, &reporter,
+        );
+    } else {
+        ref_reduce_fill_serial(&mut out, data, compute, axis_len, inner, outer);
     }
     Some(out)
+}
+
+/// One softmax row: max-subtraction, `f64`-accumulated `exp`-sum, then
+/// normalise.
+///
+/// `exps` is scratch space of length `in_row.len()`, supplied by the
+/// caller so [`ref_softmax`]'s serial branch allocates it once for the
+/// whole call and its `rayon`-parallel branch allocates it once per worker
+/// (via `for_each_init`) rather than once per row.
+fn softmax_row(out_row: &mut [f32], in_row: &[f32], exps: &mut [f64]) {
+    let max = in_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0_f64;
+    for (i, &x) in in_row.iter().enumerate() {
+        let e = f64::from(x - max).exp();
+        exps[i] = e;
+        sum += e;
+    }
+    for (i, &e) in exps.iter().enumerate() {
+        out_row[i] = (e / sum) as f32;
+    }
+}
+
+/// Fill every row of `out` serially -- no `rayon` involvement at all. See
+/// [`ref_softmax`].
+fn ref_softmax_fill_serial(out: &mut [f32], data: &[f32], row: usize, rows: usize) {
+    let mut exps = vec![0.0_f64; row];
+    for r in 0..rows {
+        let base = r * row;
+        softmax_row(
+            &mut out[base..base + row],
+            &data[base..base + row],
+            &mut exps,
+        );
+    }
+}
+
+/// Fill every row of `out` via a `rayon` split across rows. See
+/// [`ref_softmax`].
+///
+/// Exposed as its own function (rather than inlined into [`ref_softmax`])
+/// so the `*_parallel_matches_serial_on_*` property tests below can call it
+/// directly against [`ref_softmax_fill_serial`] on the *same* large shape --
+/// [`ref_softmax`] itself only ever runs one branch or the other for a
+/// given shape, decided by its own size guard, so there is no other way to
+/// force both branches over identical data.
+fn ref_softmax_fill_parallel(
+    out: &mut [f32],
+    data: &[f32],
+    row: usize,
+    reporter: &ProgressReporter,
+) {
+    out.par_chunks_mut(row)
+        .zip(data.par_chunks(row))
+        .for_each_init(
+            || vec![0.0_f64; row],
+            |exps, (out_row, in_row)| {
+                softmax_row(out_row, in_row, exps);
+                reporter.advance(1);
+            },
+        );
 }
 
 /// Naive Softmax over the last dimension: the standard
@@ -388,7 +929,11 @@ pub fn ref_reduce(op: &OpKind, data: &[f32], shape: &[usize], axis: usize) -> Op
 ///
 /// `shape` must be non-empty (mirrors [`crate::softmax::cuda_softmax`]'s own
 /// precondition; the caller already declined an empty shape before this
-/// would ever run).
+/// would ever run). Above `PAR_MIN_ELEMENTWISE_LEN` total elements (and
+/// given at least two rows to split across), the rows are independent and
+/// split across `rayon` (`ref_softmax_fill_parallel`); below it, runs as
+/// a single serial loop with no `rayon` involvement at all
+/// (`ref_softmax_fill_serial`).
 #[must_use]
 pub fn ref_softmax(data: &[f32], shape: &[usize]) -> Option<Vec<f32>> {
     let &row = shape.last()?;
@@ -401,21 +946,13 @@ pub fn ref_softmax(data: &[f32], shape: &[usize]) -> Option<Vec<f32>> {
     }
 
     let mut out = vec![0.0_f32; data.len()];
-    let mut exps = vec![0.0_f64; row];
-    for r in 0..rows {
-        let base = r * row;
-        let slice = &data[base..base + row];
-        let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0_f64;
-        for (i, &x) in slice.iter().enumerate() {
-            let e = f64::from(x - max).exp();
-            exps[i] = e;
-            sum += e;
-        }
-        for (i, &e) in exps.iter().enumerate() {
-            out[base + i] = (e / sum) as f32;
-        }
+    if rows < 2 || data.len() < PAR_MIN_ELEMENTWISE_LEN || rayon::current_num_threads() < 2 {
+        ref_softmax_fill_serial(&mut out, data, row, rows);
+        return Some(out);
     }
+
+    let reporter = ProgressReporter::new("Softmax", format!("rows={rows} row_len={row}"), rows);
+    ref_softmax_fill_parallel(&mut out, data, row, &reporter);
     Some(out)
 }
 
@@ -470,15 +1007,27 @@ pub fn ref_unary(op: &OpKind, x: f32) -> Option<f32> {
     Some(y as f32)
 }
 
-/// Map `ref_unary` over every element of `data`.
+/// Map [`ref_unary`] over every element of `data`, in parallel above
+/// `PAR_MIN_ELEMENTWISE_LEN` elements.
 ///
-/// `None` if `op` has no formula — `Option<Vec<_>>`'s `FromIterator` impl
-/// short-circuits the whole collection to `None` on the first element
-/// [`ref_unary`] cannot compute, rather than silently passing that element
-/// through unchanged.
+/// `None` if `op` has no formula — `Option<Vec<_>>`'s `FromIterator` (below
+/// the threshold) or `FromParallelIterator` (above it) impl short-circuits
+/// the whole collection to `None` on the first element [`ref_unary`] cannot
+/// compute, rather than silently passing that element through unchanged.
+///
+/// No `ProgressReporter` here (unlike `ref_conv`/`ref_matmul`/
+/// `ref_reduce`/`ref_softmax`): every [`ref_unary`] formula is a handful of
+/// scalar FLOPs, so even the largest real activation tensor in this
+/// pipeline (InSwapper's ~1.18M-element feature maps) finishes in tens of
+/// milliseconds — far under `PROGRESS_LOG_INTERVAL_NANOS`, so a progress
+/// line could structurally never fire and the plumbing would be dead
+/// weight.
 #[must_use]
 pub fn ref_unary_vec(op: &OpKind, data: &[f32]) -> Option<Vec<f32>> {
-    data.iter().map(|&x| ref_unary(op, x)).collect()
+    if data.len() < PAR_MIN_ELEMENTWISE_LEN || rayon::current_num_threads() < 2 {
+        return data.iter().map(|&x| ref_unary(op, x)).collect();
+    }
+    data.par_iter().map(|&x| ref_unary(op, x)).collect()
 }
 
 /// The elementwise binary formula for `Add` / `Sub` / `Mul` / `Div`.
@@ -495,16 +1044,25 @@ pub fn ref_binary(op: &OpKind, a: f32, b: f32) -> Option<f32> {
     }
 }
 
-/// Map `ref_binary` over two equal-length operand slices.
+/// Map [`ref_binary`] over two equal-length operand slices, in parallel
+/// above `PAR_MIN_ELEMENTWISE_LEN` elements.
 ///
-/// `None` if the lengths disagree or `op` has no formula.
+/// `None` if the lengths disagree or `op` has no formula. See
+/// [`ref_unary_vec`] for why this has no `ProgressReporter`.
 #[must_use]
 pub fn ref_binary_vec(op: &OpKind, a: &[f32], b: &[f32]) -> Option<Vec<f32>> {
     if a.len() != b.len() {
         return None;
     }
-    a.iter()
-        .zip(b.iter())
+    if a.len() < PAR_MIN_ELEMENTWISE_LEN || rayon::current_num_threads() < 2 {
+        return a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| ref_binary(op, x, y))
+            .collect();
+    }
+    a.par_iter()
+        .zip(b.par_iter())
         .map(|(&x, &y)| ref_binary(op, x, y))
         .collect()
 }
@@ -606,6 +1164,7 @@ mod tests {
             pads: [0, 0, 0, 0],
             dilations: [1, 1],
             group: 1,
+            activation: ConvActivation::None,
         }
     }
 
@@ -949,6 +1508,372 @@ mod tests {
                 matches!(result, Ok(true)),
                 "policy {policy:?} got {result:?}"
             );
+        }
+    }
+
+    // ── honest wall-clock timing ─────────────────────────────────────────────
+    //
+    // Measures whatever `ref_conv` currently is (serial or `rayon`-parallel)
+    // on two real shapes, so a future change to this module's parallelism
+    // can be re-measured the same way it was validated when the `rayon`
+    // split was first added. Run explicitly (never part of a plain
+    // `cargo test`, and only meaningful in `--release`):
+    //   cargo test -p oxionnx-cuda --release -- --ignored --nocapture ref_conv_oracle_timing
+    //
+    // Shapes come straight from the CUDA performance audit's real per-layer
+    // measurements: InSwapper's 1024ch residual-block conv (3x3, stride 1,
+    // pad 1, 34x34) and SCRFD's C28->C56 stage (3x3, stride 1, pad 1,
+    // 320x320) -- both symmetric "same"-padding convs, so `out_h == h` and
+    // `out_w == w` and the naive `2*N*K*C*R*S*out_h*out_w` FLOP count below
+    // is exact, not approximate.
+    fn pseudo_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let unit = f64::from((state >> 32) as u32) / 4_294_967_296.0;
+                (unit * 2.0 - 1.0) as f32
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn time_conv_shape(
+        label: &str,
+        n: usize,
+        c: usize,
+        h: usize,
+        w: usize,
+        k: usize,
+        r: usize,
+        s: usize,
+    ) {
+        let input = pseudo_random(n * c * h * w, 1);
+        let weight = pseudo_random(k * c * r * s, 2);
+        let params = ConvParams {
+            strides: [1, 1],
+            pads: [1, 1, 1, 1],
+            dilations: [1, 1],
+            group: 1,
+            activation: ConvActivation::None,
+        };
+        let start = std::time::Instant::now();
+        let out = ref_conv(&input, &weight, None, &[n, c, h, w], &[k, c, r, s], &params);
+        let elapsed = start.elapsed();
+        // Symmetric pad=1, k=3, stride=1 => out spatial size equals input's.
+        let macs = (n * k * h * w * c * r * s) as f64;
+        let gflop = 2.0 * macs / 1.0e9;
+        println!(
+            "{label}: in=[{n},{c},{h},{w}] w=[{k},{c},{r},{s}] -> {} elems, {:.4}s, {gflop:.3} GFLOP, {:.3} GFLOP/s",
+            out.len(),
+            elapsed.as_secs_f64(),
+            gflop / elapsed.as_secs_f64(),
+        );
+    }
+
+    #[test]
+    #[ignore = "wall-clock timing, not correctness -- run explicitly with --ignored --nocapture"]
+    fn ref_conv_oracle_timing() {
+        time_conv_shape("InSwapper-class", 1, 1024, 34, 34, 1024, 3, 3);
+        time_conv_shape("SCRFD-class", 1, 28, 320, 320, 56, 3, 3);
+    }
+
+    // ── parallel-vs-serial identity ──────────────────────────────────────────
+    //
+    // Every oracle parallelised in this module exposes its two branches as
+    // separately callable `*_fill_serial`/`*_fill_parallel` functions (see
+    // their doc comments) purely so the tests below can force *both* over
+    // the *same* randomised large-shape data and assert the outputs are
+    // bit-for-bit identical (`assert_eq!` on `Vec<f32>`, not an epsilon
+    // comparison) -- proving the `rayon` split changed nothing about the
+    // arithmetic, only which thread ran which independent row/element.
+    // `ref_conv`/`ref_matmul`/`ref_reduce`/`ref_softmax` themselves only
+    // ever run one branch or the other for a given shape (picked by
+    // [`parallel_worthwhile`]), so this direct-call approach is the only way
+    // to exercise both over identical inputs.
+    //
+    // Every generated shape is asserted to clear the relevant parallel
+    // threshold itself (`total_macs >= PAR_MIN_MACS` / `total >=
+    // PAR_MIN_ELEMENTWISE_LEN`) -- a shape that accidentally fell under the
+    // threshold would make the test pass vacuously (both "branches" being
+    // the exact same serial call), which would defeat the point.
+
+    /// A small deterministic LCG (Knuth/MMIX multiplier), matching
+    /// `conv.rs`'s own `gpu_numeric::Lcg` -- reproducible randomised shapes
+    /// and data without a `rand` dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 32) as u32
+        }
+
+        /// Uniform `usize` in `[lo, hi]` (inclusive both ends).
+        fn range_usize(&mut self, lo: usize, hi: usize) -> usize {
+            debug_assert!(lo <= hi);
+            let span = u64::from(self.next_u32());
+            lo + (span % (hi - lo + 1) as u64) as usize
+        }
+
+        /// Uniform `f32` in `[-1, 1)`.
+        fn unit_f32(&mut self) -> f32 {
+            let unit = f64::from(self.next_u32()) / 4_294_967_296.0;
+            (unit * 2.0 - 1.0) as f32
+        }
+
+        fn vec_f32(&mut self, len: usize) -> Vec<f32> {
+            (0..len).map(|_| self.unit_f32()).collect()
+        }
+    }
+
+    #[test]
+    fn ref_conv_parallel_matches_serial_on_randomized_shapes() {
+        let mut rng = Lcg::new(0xC0FF_EE01_u64);
+        for case in 0..6_usize {
+            let group = [1_usize, 2, 4][case % 3];
+            let in_ch_per_group = rng.range_usize(6, 8);
+            let out_ch_per_group = rng.range_usize(6, 8);
+            let in_channels = in_ch_per_group * group;
+            let out_channels = out_ch_per_group * group;
+            let n = 1 + case % 2;
+            let in_h = rng.range_usize(48, 56);
+            let in_w = rng.range_usize(48, 56);
+            let filter_h = 3;
+            let filter_w = 3;
+            let stride_h = 1 + (case / 3) % 2;
+            let stride_w = stride_h;
+            let dil_h = 1 + (case / 2) % 2;
+            let dil_w = dil_h;
+            let pad_h = 1;
+            let pad_w = 1;
+
+            let input = rng.vec_f32(n * in_channels * in_h * in_w);
+            let weight = rng.vec_f32(out_channels * in_ch_per_group * filter_h * filter_w);
+            let bias_data = rng.vec_f32(out_channels);
+            let bias: Option<&[f32]> = if case % 2 == 0 {
+                Some(&bias_data)
+            } else {
+                None
+            };
+
+            let eff_h = dil_h * (filter_h - 1) + 1;
+            let eff_w = dil_w * (filter_w - 1) + 1;
+            let out_h = (in_h + 2 * pad_h - eff_h) / stride_h + 1;
+            let out_w = (in_w + 2 * pad_w - eff_w) / stride_w + 1;
+
+            let geom = ConvGeometry {
+                n,
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                out_h,
+                out_w,
+                in_ch_per_group,
+                filter_h,
+                filter_w,
+                out_ch_per_group,
+                stride_h,
+                stride_w,
+                pad_h,
+                pad_w,
+                dil_h,
+                dil_w,
+            };
+            let total_macs = (n as u64)
+                .saturating_mul(out_channels as u64)
+                .saturating_mul(out_h as u64)
+                .saturating_mul(out_w as u64)
+                .saturating_mul(in_ch_per_group as u64)
+                .saturating_mul((filter_h * filter_w) as u64);
+            assert!(
+                total_macs >= PAR_MIN_MACS,
+                "case {case}: shape too small to actually exercise the rayon branch \
+                 ({total_macs} MACs, need >= {PAR_MIN_MACS}) -- widen the generator's ranges"
+            );
+
+            let ops = ConvRowInputs {
+                input: &input,
+                weight: &weight,
+                bias,
+                geom,
+            };
+            let total_out = n * out_channels * out_h * out_w;
+            let mut out_serial = vec![0.0_f32; total_out];
+            let mut out_parallel = vec![0.0_f32; total_out];
+            ref_conv_fill_serial(&mut out_serial, &ops);
+            let reporter = ProgressReporter::new("Conv", "test".to_string(), 1);
+            ref_conv_fill_parallel(&mut out_parallel, &ops, &reporter);
+
+            assert_eq!(
+                out_serial,
+                out_parallel,
+                "case {case}: n={n} group={group} in=[{in_channels},{in_h},{in_w}] \
+                 out_ch_per_group={out_ch_per_group} stride=({stride_h},{stride_w}) \
+                 dilation=({dil_h},{dil_w}) bias={}",
+                bias.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn ref_matmul_parallel_matches_serial_on_randomized_shapes() {
+        let mut rng = Lcg::new(0xFEED_BEEF_u64);
+        for case in 0..6_usize {
+            let m = rng.range_usize(45, 90);
+            let k = rng.range_usize(45, 90);
+            let n = rng.range_usize(45, 90);
+            let total_macs = (m as u64) * (k as u64) * (n as u64);
+            assert!(
+                total_macs >= PAR_MIN_MACS,
+                "case {case}: {m}x{k}x{n} = {total_macs} MACs, too small -- widen the ranges"
+            );
+
+            let a = rng.vec_f32(m * k);
+            let b = rng.vec_f32(k * n);
+
+            let mut out_serial = vec![0.0_f32; m * n];
+            ref_matmul_fill_serial(&mut out_serial, &a, &b, k, n);
+            let mut out_parallel = vec![0.0_f32; m * n];
+            let reporter = ProgressReporter::new("MatMul", "test".to_string(), 1);
+            ref_matmul_fill_parallel(&mut out_parallel, &a, &b, k, n, &reporter);
+
+            assert_eq!(out_serial, out_parallel, "case {case}: m={m} k={k} n={n}");
+        }
+    }
+
+    #[test]
+    fn ref_reduce_parallel_matches_serial_on_randomized_shapes_and_chunk_sizes() {
+        let mut rng = Lcg::new(0xDEAD_10CC_u64);
+        for case in 0..6_usize {
+            let outer = rng.range_usize(40, 60);
+            let inner = rng.range_usize(40, 60);
+            let axis_len = rng.range_usize(80, 120);
+            let total = outer * inner;
+            let total_macs = (total as u64) * (axis_len as u64);
+            assert!(
+                total_macs >= PAR_MIN_MACS,
+                "case {case}: outer={outer} inner={inner} axis_len={axis_len} = {total_macs} \
+                 MACs, too small -- widen the ranges"
+            );
+
+            let data = rng.vec_f32(outer * axis_len * inner);
+            let compute: fn(&[f32], usize, usize, usize, usize) -> f32 = if case % 2 == 0 {
+                reduce_sum_at
+            } else {
+                reduce_max_at
+            };
+
+            let mut out_serial = vec![0.0_f32; total];
+            ref_reduce_fill_serial(&mut out_serial, &data, compute, axis_len, inner, outer);
+
+            // Deliberately awkward chunk sizes too (1, a small prime, and a
+            // size larger than `total` so `par_chunks_mut` yields a single
+            // chunk) -- `compute`'s per-index arithmetic never reads
+            // `chunk_len`, so the result must be identical regardless of how
+            // the work was cut up.
+            for &chunk_len in &[1, 3, 17, total.div_ceil(5).max(1), total, total * 2] {
+                let mut out_parallel = vec![0.0_f32; total];
+                let reporter = ProgressReporter::new("Reduce", "test".to_string(), 1);
+                ref_reduce_fill_parallel(
+                    &mut out_parallel,
+                    &data,
+                    compute,
+                    axis_len,
+                    inner,
+                    chunk_len,
+                    &reporter,
+                );
+                assert_eq!(
+                    out_serial, out_parallel,
+                    "case {case} chunk_len={chunk_len}: outer={outer} inner={inner} \
+                     axis_len={axis_len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ref_softmax_parallel_matches_serial_on_randomized_shapes() {
+        let mut rng = Lcg::new(0xABCD_1234_u64);
+        for case in 0..6_usize {
+            let row = rng.range_usize(16, 64);
+            let rows = rng.range_usize(1200, 2000);
+            let total = rows * row;
+            assert!(
+                total >= PAR_MIN_ELEMENTWISE_LEN && rows >= 2,
+                "case {case}: rows={rows} row={row} total={total}, too small -- widen the ranges"
+            );
+            let data = rng.vec_f32(total);
+
+            let mut out_serial = vec![0.0_f32; total];
+            ref_softmax_fill_serial(&mut out_serial, &data, row, rows);
+            let mut out_parallel = vec![0.0_f32; total];
+            let reporter = ProgressReporter::new("Softmax", "test".to_string(), 1);
+            ref_softmax_fill_parallel(&mut out_parallel, &data, row, &reporter);
+
+            assert_eq!(
+                out_serial, out_parallel,
+                "case {case}: rows={rows} row={row}"
+            );
+        }
+    }
+
+    #[test]
+    fn ref_unary_vec_parallel_matches_serial_on_large_input() {
+        // Non-negative data: `Sqrt`/`Log` would otherwise produce `NaN` for
+        // negative inputs, and `NaN != NaN` would make `assert_eq!` fail
+        // even when both sides computed the identical bit pattern. The
+        // negative-input branch of each formula is already covered by
+        // `ref_unary`'s own hand-verified tests above; this test's job is
+        // only to prove the parallel *mapping* doesn't drop/reorder/corrupt
+        // elements, which needs no negative coverage of its own.
+        let mut rng = Lcg::new(0x5EED_0001_u64);
+        let len = PAR_MIN_ELEMENTWISE_LEN * 3 + 17; // comfortably above the threshold, not a round multiple
+        let data: Vec<f32> = rng.vec_f32(len).into_iter().map(f32::abs).collect();
+
+        for op in [
+            OpKind::Relu,
+            OpKind::Sigmoid,
+            OpKind::Softplus,
+            OpKind::Sqrt,
+            OpKind::HardSwish,
+        ] {
+            let expected: Vec<f32> = data.iter().map(|&x| ref_unary(&op, x).unwrap()).collect();
+            let got = ref_unary_vec(&op, &data).unwrap();
+            assert_eq!(expected, got, "op={op:?}");
+        }
+    }
+
+    #[test]
+    fn ref_binary_vec_parallel_matches_serial_on_large_input() {
+        let mut rng = Lcg::new(0x5EED_0002_u64);
+        let len = PAR_MIN_ELEMENTWISE_LEN * 3 + 17;
+        let a = rng.vec_f32(len);
+        // Shifted well away from 0 so `Div` never divides by (or produces)
+        // something that could make two mathematically-identical results
+        // round differently, and never hits an exact `0.0/0.0 = NaN` that
+        // would trip the same `NaN != NaN` `assert_eq!` gotcha noted above.
+        let b: Vec<f32> = rng.vec_f32(len).into_iter().map(|x| x + 2.0).collect();
+
+        for op in [OpKind::Add, OpKind::Sub, OpKind::Mul, OpKind::Div] {
+            let expected: Vec<f32> = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| ref_binary(&op, x, y).unwrap())
+                .collect();
+            let got = ref_binary_vec(&op, &a, &b).unwrap();
+            assert_eq!(expected, got, "op={op:?}");
         }
     }
 }

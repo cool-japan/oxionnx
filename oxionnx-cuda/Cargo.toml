@@ -28,6 +28,17 @@ thiserror = { workspace = true }
 # fallback keeps inference correct, but only `tracing::error!` tells the user their "GPU
 # acceleration" just quietly stopped applying. Costs nothing when no subscriber is attached.
 tracing = { workspace = true }
+# `crate::reference`'s CPU oracle (`OXIONNX_CUDA_VERIFY=1`) recomputes every
+# claimed op in naive, single-threaded `f64` to shadow-verify the GPU's
+# answer -- for a real conv layer that is tens of GFLOP of scalar work per
+# node. `rayon` splits it across cores (pure map-parallelism over
+# independent output rows, never across a single output element's own
+# accumulation), which is the difference between a diagnostic mode a
+# developer can actually leave on and one that turns a 7.7s swap into a
+# 45-minute one. Already a workspace dependency (`oxionnx-ops` uses it the
+# same way for its own conv/matmul kernels); this is oxionnx-cuda's first use
+# of it.
+rayon = { workspace = true }
 
 [features]
 default = []

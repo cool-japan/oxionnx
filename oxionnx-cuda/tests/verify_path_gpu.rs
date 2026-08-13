@@ -475,6 +475,7 @@ fn conv_verify_path_agrees_live_on_real_hardware() {
         pads: [pad, pad, pad, pad],
         dilations: [dilation, dilation],
         group,
+        activation: conv::ConvActivation::None,
     };
     let expected = reference::ref_conv(
         &input_data,

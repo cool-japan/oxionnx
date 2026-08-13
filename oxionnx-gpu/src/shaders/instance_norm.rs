@@ -150,11 +150,11 @@ fn instance_norm(
 }
 "#;
 
-pub(crate) fn build_instance_norm_pipeline(
-    device: &wgpu::Device,
+fn build_instance_norm_pipeline(
+    ctx: &GpuContext,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
     build_pipeline(
-        device,
+        ctx,
         "instance_norm",
         INSTANCE_NORM_SHADER,
         "instance_norm",
@@ -240,7 +240,7 @@ pub async fn gpu_instance_norm_placed_async(
     let queue = &ctx.queue;
 
     let scope = ErrorScope::begin(ctx);
-    let (pipeline, bgl) = build_instance_norm_pipeline(device);
+    let (pipeline, bgl) = build_instance_norm_pipeline(ctx);
 
     let input_buf = ctx.operand_source("in_input", input, wgpu::BufferUsages::STORAGE)?;
     let output_buf = ctx.pooled_buffer(

@@ -55,6 +55,10 @@ pub mod residency;
 pub mod softmax;
 
 pub use context::CudaContext;
+/// Re-exported at the crate root because the *session runner* — not a CUDA
+/// caller — is what has to ask this question, on the error it just got back
+/// from [`try_cuda_dispatch`]. See [`error::is_verify_mismatch`].
+pub use error::is_verify_mismatch;
 pub use error::CudaDispatchError as CudaError;
 
 use std::collections::HashMap;
@@ -587,31 +591,24 @@ pub fn try_cuda_dispatch(
             let weight = resolve(&node.inputs[1]);
             let bias = node.inputs.get(2).and_then(|n| resolve(n));
             if let (Some(input), Some(weight)) = (input, weight) {
-                let attrs = &node.attrs;
-                let strides_v = attrs.ints("strides");
-                let strides = [
-                    strides_v.first().copied().unwrap_or(1) as usize,
-                    strides_v.get(1).copied().unwrap_or(1) as usize,
-                ];
-                let pads_v = attrs.ints("pads");
-                let pads = [
-                    pads_v.first().copied().unwrap_or(0) as usize,
-                    pads_v.get(1).copied().unwrap_or(0) as usize,
-                    pads_v.get(2).copied().unwrap_or(0) as usize,
-                    pads_v.get(3).copied().unwrap_or(0) as usize,
-                ];
-                let dilations_v = attrs.ints("dilations");
-                let dilations = [
-                    dilations_v.first().copied().unwrap_or(1) as usize,
-                    dilations_v.get(1).copied().unwrap_or(1) as usize,
-                ];
-                let group = attrs.i("group", 1) as usize;
-
-                let conv_params = conv::ConvParams {
-                    strides,
-                    pads,
-                    dilations,
-                    group,
+                // Every attribute that changes what a `Conv` node computes is
+                // resolved in exactly one place, and anything this backend
+                // does not model declines the node rather than being ignored —
+                // see [`conv::conv_params_from_attrs`].
+                //
+                // This arm used to read `strides`/`pads`/`dilations`/`group`
+                // inline and nothing else. That silently dropped the
+                // optimizer's *fused activation* — `oxionnx` rewrites every
+                // `Conv -> Relu` pair into one `Conv_*_fused_activation` node
+                // carrying `activation="relu"`, so 26 of SCRFD det_10g's 58
+                // convolutions returned their raw, un-rectified output. The
+                // failure was invisible to `OXIONNX_CUDA_VERIFY=1` because the
+                // oracle read the same `ConvParams` and therefore skipped the
+                // same activation; see `reference::ref_conv`.
+                let Some(conv_params) =
+                    conv::conv_params_from_attrs(&node.attrs, &input.shape, &weight.shape)
+                else {
+                    return Ok(None);
                 };
 
                 // A convolution's filter and bias are the megabyte-scale
