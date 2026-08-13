@@ -14,7 +14,7 @@ acceleration ships for native targets today; an async WebGPU path for
 `wasm32` now compiles and is exercised by native tests, but is not yet
 wired into the browser bindings (see [Feature Flags](#feature-flags)).
 
-**143,426 lines of Rust | 3,212 tests | 0 clippy warnings**
+**149,481 lines of Rust | 3,320 tests | 0 clippy warnings**
 
 ## Live Demo
 
@@ -70,18 +70,18 @@ full resolution:
 
 | Crate | Status | Tests (all-features)* |
 |-------|--------|-------|
-| `oxionnx` (root) | Alpha | 1,089 passing (2 skipped) |
+| `oxionnx` (root) | Alpha | 1,094 passing (2 skipped) |
 | `oxionnx-core` | Stable | 69 passing |
 | `oxionnx-ops` | Alpha | 1,325 passing (8 skipped) |
 | `oxionnx-proto` | Stable | 134 passing |
-| `oxionnx-gpu` | Alpha | 240 passing |
-| `oxionnx-cuda` | Partial | 70 passing (GEMM/elementwise/softmax/Conv via OxiCUDA; Conv dispatches directly to `oxicuda-dnn`'s `Conv1x1`/`DepthwiseConv`/`ImplicitGemmConv` engines and is advertised by `is_supported_op`) |
+| `oxionnx-gpu` | Alpha | 265 passing |
+| `oxionnx-cuda` | Partial | 148 passing (GEMM/elementwise/softmax/Conv via OxiCUDA; Conv dispatches directly to `oxicuda-dnn`'s `Conv1x1`/`DepthwiseConv`/`ImplicitGemmConv` engines and is advertised by `is_supported_op`). 118 of those need no GPU; the 30 `gpu-tests` on-device tests skip on a host with no CUDA device, so this row's count is *not* evidence the device paths ran |
 | `oxionnx-directml` | Implemented (opt-in; GPU path not yet hardware-verified) | 242 tests, all Linux-executed or cross-target type-checked. Dual backend — DirectML operators + HLSL/D3D12 compute fallback — routing 15 ops: MatMul, Gemm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, ReduceSum, ReduceMean, ReduceMax, ReduceMin, Conv; kernels compile/lint-verified for Windows and proven on Linux vs a CPU oracle, but not yet run on GPU hardware |
-| `oxionnx-coreml` | Alpha | 8 passing on non-Apple hosts (compiles to a stub); 43 passing + 8 skipped on macOS/iOS/tvOS/visionOS (predict/predict_raw/predict_features, compute-plan + model metadata) |
+| `oxionnx-coreml` | Alpha (opt-in; predict path not yet verified against a real model) | 8 passing on non-Apple hosts (compiles to a stub); 43 passing + 8 skipped on macOS/iOS/tvOS/visionOS. The 43 cover the surrounding logic -- tensor/`MLMultiArray` layout conversion, f16 up-conversion, metadata handling. The 8 that skip are exactly the end-to-end ones (`test_load_arcface`, `test_predict_arcface_returns_512_dim_embedding`, the two compute-plan tests, `test_model_metadata_returns_ok_map`): they need a real `.mlpackage`, so `predict`/`predict_raw`/`predict_features`, ANE engagement and the compute plan are **not** exercised by the passing count. Apple frameworks are reached through `objc2`/`objc2-core-ml`, behind the off-by-default `coreml` feature |
 
-\* Per-crate figures are all-features counts from this release (the `oxionnx-coreml` row uses its macOS figure, 43, since that is the host this run used) and sum exactly to the workspace total below: 1,089 + 69 + 1,325 + 134 + 240 + 70 + 242 + 43 = 3,212 passing; 2 + 0 + 8 + 0 + 0 + 0 + 0 + 8 = 18 skipped.
+\* Per-crate figures are all-features counts from this release (the `oxionnx-coreml` row uses its macOS figure, 43, since that is the host this run used) and sum exactly to the workspace total below: 1,094 + 69 + 1,325 + 134 + 265 + 148 + 242 + 43 = 3,320 passing; 2 + 0 + 8 + 0 + 0 + 0 + 0 + 8 = 18 skipped.
 
-**Total: 3,212 tests passing with all features (`cargo nextest run --workspace --all-features`, run on macOS; the exact count drifts between runs as the workspace evolves under active development), 2,984 with default features. 0 clippy warnings on the host target (`cargo clippy --all-features --all-targets -- -D warnings`). Platform-gated suites still run only on their target OS — this run's macOS host exercises `oxionnx-coreml`'s Apple-only paths, included above (8 of its tests still skip, needing a real `.mlpackage`), but not `oxionnx-directml`'s Windows FFI tests — so no single machine runs the entire cross-platform set. 170,415 lines of Rust (143,426 excluding blanks/comments).**
+**Total: 3,320 tests passing with all features (`cargo nextest run --workspace --all-features`, run on macOS; the exact count drifts between runs as the workspace evolves under active development), 3,057 with default features. 0 clippy warnings on the host target (`cargo clippy --all-features --all-targets -- -D warnings`). Platform-gated suites still run only on their target OS — this run's macOS host exercises `oxionnx-coreml`'s Apple-only paths, included above (8 of its tests still skip, needing a real `.mlpackage`), but not `oxionnx-directml`'s Windows FFI tests, and its 30 `oxionnx-cuda` on-device tests skip for want of an NVIDIA device — so no single machine runs the entire cross-platform set, and a green total is not by itself evidence every hardware path ran. 177,927 lines of Rust (149,481 excluding blanks/comments).**
 
 ## Quick Start
 
@@ -142,6 +142,7 @@ OxiONNX implements 189 ONNX operators (plus 15 aliases: short-forms like `LayerN
 | `cuda` | CUDA GPU acceleration via OxiCUDA |
 | `mmap` | Memory-mapped weight loading |
 | `wasm` | WebAssembly browser bindings -- CPU inference on `wasm32-unknown-unknown` via wasm-bindgen. Combining this with `gpu` now builds: `Session`'s `Send + Sync` requirement is wasm32-exempt and an async WebGPU path exists (`enable_gpu_async`/`run_gpu_async`, `BROWSER_WEBGPU` adapter, `map_async` read-back), proven on native targets only -- not yet wired into these bindings or run in a browser |
+| `wasm-threads` | Re-enables rayon's intra-operator parallelism on `wasm32`. Needs a nightly `-Z build-std` browser build with `+atomics,+bulk-memory`, a cross-origin-isolated page, and a `wasm-bindgen-rayon` `initThreadPool()` call before the first operator. Inert on every non-wasm32 target |
 | `ndarray` | ndarray interop for Tensor conversion |
 | `directml` | DirectML GPU acceleration (Windows, via D3D12) |
 | `coreml` | CoreML execution provider (Apple Silicon: macOS/iOS/tvOS/visionOS) |
@@ -166,16 +167,10 @@ Run `cargo bench --bench performance` to measure on your hardware.
 
 ### Operator Microbenchmarks
 
-| Operation | Size | Implementation | Notes |
-|-----------|------|----------------|-------|
-| MatMul | 512×512 | `matrixmultiply` crate | Run `cargo bench` to measure |
-| MatMul | 1024×1024 | `matrixmultiply` crate | Run `cargo bench` to measure |
-| MatMul | 2048×2048 | `matrixmultiply` crate | Run `cargo bench` to measure |
-| Conv2D | 64ch, 56×56, 3×3 | im2col + matmul | Run `cargo bench` to measure |
-| Softmax | [1, 128, 768] | Numerically stable (log-sum-exp) | Run `cargo bench` to measure |
-| LayerNorm | [1, 128, 768] | Fused mean/var + scale/bias | Run `cargo bench` to measure |
-| GELU | 100K elements | SIMD-accelerated (with `simd` feature) | Run `cargo bench` to measure |
-| Add (broadcast) | [1, 128, 768] + [768] | Auto-broadcast | Run `cargo bench` to measure |
+`benches/performance.rs` covers MatMul (512², 1024², 2048², via `matrixmultiply`), Conv2D
+(64ch 56×56 3×3, im2col + matmul), Softmax and LayerNorm at `[1, 128, 768]`, GELU over 100K
+elements (SIMD-accelerated under `--features simd`), and broadcast `Add`. Numbers are
+hardware-specific and deliberately not reproduced here -- run the bench to get yours.
 
 ### End-to-End Model Workloads
 
