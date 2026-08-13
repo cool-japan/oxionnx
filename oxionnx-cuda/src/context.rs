@@ -14,7 +14,11 @@
 //! Cargo feature — off by default, run manually with `cargo test -p
 //! oxionnx-cuda --features gpu-tests` on a CUDA-capable machine — covers the
 //! rest: real dispatches against a real device, including the cross-thread
-//! `CudaContext` regression tests in this crate's own `tests` module. What
+//! `CudaContext` regression tests in this crate's own `tests` module.
+//! Enabling that feature on a host with no device is harmless: every
+//! on-device fixture returns `Option<CudaContext>` and its tests skip, so
+//! `--all-features` stays green on a CPU-only machine (see the feature's
+//! own comment in `Cargo.toml`). What
 //! stays true regardless is the point this section is making: *default*
 //! `cargo test`/CI never touches a GPU, so the table below is what actually
 //! gates whether a user's inference run does.

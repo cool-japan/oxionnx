@@ -49,14 +49,15 @@
 //! `required-features = ["gpu-tests"]` in `Cargo.toml` keeps this file's
 //! tests out of a plain `cargo test -p oxionnx-cuda` entirely (see that
 //! entry's own comment for why that matters — on a CUDA-capable host it is
-//! not a cosmetic distinction). With the feature on, [`gpu_ctx`] `.expect()`s
-//! rather than skips when no device is present: `oxionnx-cuda`'s own
-//! on-device suites (`src/lib.rs`'s cross-thread tests,
-//! `conv::tests::gpu_numeric`) all treat a `gpu-tests`-gated run with no GPU
-//! as a misconfigured invocation rather than a case to degrade quietly out
-//! of, and this file now follows the same rule for the same reason: run
-//! with `cargo test -p oxionnx-cuda --features gpu-tests --test
-//! matmul_shape_sweep_gpu` on a CUDA-capable machine.
+//! not a cosmetic distinction). With the feature on, [`gpu_ctx`] returns
+//! `None` and each test skips when no device is present, so that a
+//! `--all-features` run stays green on a CPU-only host (a Mac, this
+//! workspace's own CI). That is the OxiCUDA convention this crate follows —
+//! see `oxicuda-blas`'s `src/gpu_tests.rs` ("Every device test returns early
+//! (skips) when no CUDA device is present, so the suite stays green on
+//! CPU-only machines") and its `tests/gemm_shape_sweep_gpu.rs`. For the
+//! tests to actually *run*, use `cargo test -p oxionnx-cuda --features
+//! gpu-tests --test matmul_shape_sweep_gpu` on a CUDA-capable machine.
 
 use oxionnx_cuda::context::{Activation, CudaContext};
 use oxionnx_cuda::{matmul, reference};
@@ -68,11 +69,10 @@ use oxionnx_cuda::{matmul, reference};
 /// Acquires a real GPU context, bypassing the `OXIONNX_CUDA` env-gate
 /// (`Activation::Enabled`) so this test doesn't depend on the invoking
 /// shell's environment beyond the `gpu-tests` feature that already gates
-/// this whole file. `.expect()`, not a quiet skip — see the module docs'
-/// "Gating" section.
-fn gpu_ctx() -> CudaContext {
+/// this whole file, or `None` when no CUDA driver / device is present —
+/// each test then skips. See the module docs' "Gating" section.
+fn gpu_ctx() -> Option<CudaContext> {
     CudaContext::try_new_with(Activation::Enabled)
-        .expect("gpu-tests requires a real CUDA device -- run on a CUDA-capable host")
 }
 
 /// A small deterministic LCG (same algorithm as `oxicuda-blas`'s
@@ -138,7 +138,10 @@ fn assert_matches_oracle(
 /// Pre-fix this failed with 3456/4096 elements silently reading back `0.0`.
 #[test]
 fn square_64_all_ones_matches_64_everywhere() {
-    let ctx = gpu_ctx();
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!("no CUDA device present, skipping square_64_all_ones_matches_64_everywhere");
+        return;
+    };
     let (m, k, n) = (64usize, 64usize, 64usize);
     let a = vec![1.0f32; m * k];
     let b = vec![1.0f32; k * n];
@@ -156,7 +159,10 @@ fn square_64_all_ones_matches_64_everywhere() {
 /// report names as "100% wrong (every element)" pre-fix.
 #[test]
 fn arcface_and_inswapper_dominant_shapes_match_cpu_oracle() {
-    let ctx = gpu_ctx();
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!("no CUDA device present, skipping arcface_and_inswapper_dominant_shapes_match_cpu_oracle");
+        return;
+    };
     let mut rng = Lcg::new(0xA4CE_FACE_0000_0002);
     for &m in &[1usize, 8] {
         let (k, n) = (25088usize, 512usize);
@@ -180,7 +186,10 @@ fn arcface_and_inswapper_dominant_shapes_match_cpu_oracle() {
 /// establishes without paying `2048`'s extra upload/readback cost twice.
 #[test]
 fn m_sweep_matches_cpu_oracle_exactly() {
-    let ctx = gpu_ctx();
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!("no CUDA device present, skipping m_sweep_matches_cpu_oracle_exactly");
+        return;
+    };
     let m_values = [1usize, 2, 7, 8, 16, 17, 32, 64, 100, 128, 1024];
     let kn_pairs = [(64usize, 64usize), (257, 129)];
     let mut rng = Lcg::new(0x5EED_F00D_9999_0001);

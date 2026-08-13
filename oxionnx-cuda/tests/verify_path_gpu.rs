@@ -81,10 +81,17 @@
 //! Gated the same way as every other on-device suite in this crate:
 //! `required-features = ["gpu-tests"]` in `Cargo.toml` keeps a plain `cargo
 //! test -p oxionnx-cuda` (no feature flag) from touching a GPU at all, and
-//! [`gpu_ctx`] `.expect()`s rather than skips when the feature is on but no
-//! device is present -- a misconfigured invocation, not a case to degrade
-//! quietly out of (same rationale as `lib.rs`'s cross-thread tests and
-//! `conv::tests::gpu_numeric`).
+//! [`gpu_ctx`] returns `None` (each test skipping) when the feature is on
+//! but no device is present, so `--all-features` stays green on a CPU-only
+//! host -- the OxiCUDA convention, same as `lib.rs`'s cross-thread tests and
+//! `conv::tests::gpu_numeric`.
+//!
+//! Note the interaction between the two gates: the device check runs
+//! *first*, so a CPU-only host skips rather than tripping
+//! [`require_verify_enabled`]'s assert. The env-var assert is deliberately
+//! still loud on a host that *does* have a GPU -- there, a missing
+//! `OXIONNX_CUDA_VERIFY=1` means the run proves nothing, which is exactly
+//! the failure mode this file exists to rule out.
 
 use std::collections::HashMap;
 
@@ -99,11 +106,15 @@ use oxionnx_cuda::{conv, reference, try_cuda_dispatch};
 
 /// A real GPU context, bypassing the `OXIONNX_CUDA` env-var opt-in gate
 /// (that policy is unit-tested independently in `context::tests`, and is
-/// orthogonal to what this file proves). `.expect()`, not a quiet skip --
-/// see the module docs' "Running" section.
-fn gpu_ctx() -> CudaContext {
+/// orthogonal to what this file proves), or `None` when no CUDA driver /
+/// device is present -- each test then skips, per the OxiCUDA convention.
+/// See the module docs' "Running" section.
+///
+/// Every test acquires this *before* calling [`require_verify_enabled`]:
+/// on a host with no GPU there is nothing for shadow verification to have
+/// verified, so "no device" must skip rather than trip the env-var assert.
+fn gpu_ctx() -> Option<CudaContext> {
     CudaContext::try_new_with(Activation::Enabled)
-        .expect("gpu-tests requires a real CUDA device -- run on a CUDA-capable host")
 }
 
 /// The one thing every test in this file must confirm before it does
@@ -172,8 +183,13 @@ fn make_vec(rng: &mut Lcg, len: usize, lo: f64, hi: f64) -> Vec<f32> {
 /// `MatMul`/`Gemm` arm: oracle is `reference::ref_matmul`.
 #[test]
 fn matmul_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!(
+            "no CUDA device present, skipping matmul_verify_path_agrees_live_on_real_hardware"
+        );
+        return;
+    };
     require_verify_enabled();
-    let ctx = gpu_ctx();
 
     let (m, k, n) = (5usize, 7usize, 3usize);
     let mut rng = Lcg::new(0x7E71_FADE_7457_0001);
@@ -206,8 +222,11 @@ fn matmul_verify_path_agrees_live_on_real_hardware() {
 /// ops share one dispatch arm and one `verify_or_fallback` call site.
 #[test]
 fn add_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!("no CUDA device present, skipping add_verify_path_agrees_live_on_real_hardware");
+        return;
+    };
     require_verify_enabled();
-    let ctx = gpu_ctx();
 
     let shape = vec![3usize, 4, 2];
     let elems: usize = shape.iter().product();
@@ -242,8 +261,13 @@ fn add_verify_path_agrees_live_on_real_hardware() {
 /// the oracle.
 #[test]
 fn reduce_sum_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!(
+            "no CUDA device present, skipping reduce_sum_verify_path_agrees_live_on_real_hardware"
+        );
+        return;
+    };
     require_verify_enabled();
-    let ctx = gpu_ctx();
 
     let shape = vec![4usize, 3];
     let axis = 0usize;
@@ -282,8 +306,11 @@ fn reduce_sum_verify_path_agrees_live_on_real_hardware() {
 /// `Relu` exercises the call site itself most directly).
 #[test]
 fn relu_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!("no CUDA device present, skipping relu_verify_path_agrees_live_on_real_hardware");
+        return;
+    };
     require_verify_enabled();
-    let ctx = gpu_ctx();
 
     let mut rng = Lcg::new(0x7E71_FADE_7457_0004);
     let mut data = make_vec(&mut rng, 32, -4.0, 4.0);
@@ -321,8 +348,13 @@ fn relu_verify_path_agrees_live_on_real_hardware() {
 /// `cuda_softmax` can claim -- no explicit attrs needed.
 #[test]
 fn softmax_verify_path_agrees_live_on_real_hardware() {
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!(
+            "no CUDA device present, skipping softmax_verify_path_agrees_live_on_real_hardware"
+        );
+        return;
+    };
     require_verify_enabled();
-    let ctx = gpu_ctx();
 
     let shape = vec![3usize, 5];
     let mut rng = Lcg::new(0x7E71_FADE_7457_0005);
@@ -363,13 +395,16 @@ fn softmax_verify_path_agrees_live_on_real_hardware() {
 /// over-claiming what it proves.
 #[test]
 fn conv_verify_path_agrees_live_on_real_hardware() {
-    require_verify_enabled();
     assert!(
         oxionnx_cuda::is_supported_op(&OpKind::Conv),
         "Conv is no longer advertised, so this test no longer covers a path oxionnx's \
          placement logic reaches -- update this file's claims along with the predicate",
     );
-    let ctx = gpu_ctx();
+    let Some(ctx) = gpu_ctx() else {
+        eprintln!("no CUDA device present, skipping conv_verify_path_agrees_live_on_real_hardware");
+        return;
+    };
+    require_verify_enabled();
 
     let (n, in_channels, in_h, in_w) = (1usize, 3usize, 6usize, 7usize);
     let (out_channels, filter_h, filter_w) = (4usize, 3usize, 3usize);

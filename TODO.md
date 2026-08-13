@@ -962,3 +962,47 @@ only from direct `try_cuda_dispatch`/`cuda_conv` calls, i.e. from tests.
   (493 lib + every integration binary); `cargo fmt --check` and `cargo clippy --all-targets`
   clean on both crates; `cargo check --workspace` green in the downstream `oxiface` tree.
 - Same dev-only `[patch.crates-io]` wiring as §21/§22 — not yet published.
+
+## 24. `oxionnx-cuda` on-device tests: restore the OxiCUDA skip convention (2026-08-13) — COMPLETE
+
+`cargo nextest run --all-features` on a CPU-only host (this Mac, Apple M3) failed 30 tests, all
+in `oxionnx-cuda`, every one panicking with `"gpu-tests requires a real CUDA device -- run on a
+CUDA-capable host"`. Cargo has no "all features except X", so `--all-features` unavoidably
+switches `gpu-tests` on, and §22 had made that fatal without a device.
+
+- **§22's premise was wrong.** §22 aligned `matmul_shape_sweep_gpu.rs` away from a quiet runtime
+  skip and onto `.expect()`-and-fail, described as "the crate's dominant convention" and, in
+  `Cargo.toml`, as mirroring `oxicuda-driver`/`oxicuda-blas`/`oxicuda-dnn`. OxiCUDA does the
+  opposite: `oxicuda-blas/src/gpu_tests.rs` states "Every device test returns early (skips) when
+  no CUDA device is present, so the suite stays green on CPU-only machines", and both it and
+  `tests/gemm_shape_sweep_gpu.rs` use `Option`-returning fixtures (`gpu_fixture()`,
+  `try_handle()`) with `let Some(..) = .. else { eprintln!(..); return; }`. Verified empirically:
+  `cargo nextest run -p oxicuda-blas -p oxicuda-dnn -p oxicuda-driver --all-features` on this M3
+  is 2753 passed / 0 failed. So this was a divergence from OxiCUDA, not a mirror of it.
+- **Restored the skip convention** across all five on-device files — `src/dispatch_tests.rs`
+  (`build_context_on_a_thread_that_then_exits` plus two inline `CudaContext::try_new_with`
+  sites), `src/conv.rs` (`gpu_ctx`, consumed by `run_case_and_compare`, which skips per `tag`),
+  `tests/matmul_shape_sweep_gpu.rs`, `tests/verify_path_gpu.rs`, `tests/batched_matmul_gpu.rs`.
+  Every fixture now returns `Option<CudaContext>`; every test skips by name. Note
+  `CudaContext::try_new_with` already returned `Option`, not `Result` — the old `.expect()` was
+  reading as a `Result` idiom but never was one.
+- **`verify_path_gpu.rs` gate ordering.** Its six tests called `require_verify_enabled()` (asserts
+  `OXIONNX_CUDA_VERIFY=1` live) *before* acquiring the device, so on a CPU-only host they failed
+  on the env-var assert rather than the device. The device check now runs first: no device →
+  skip. The env-var assert is deliberately still loud on a host that *does* have a GPU, since
+  there a missing var means the run proves nothing — that half of §22's design is preserved.
+- `examples/dispatch_bench.rs` already skipped gracefully (`"no CUDA device -- run this on a
+  CUDA-capable host"`); left as is. `required-features = ["gpu-tests"]` on the `[[test]]`/
+  `[[example]]` targets is untouched — §22's *other* finding was real and still holds: a plain
+  `cargo test -p oxionnx-cuda` must not touch a GPU on a CUDA-capable host.
+- **Verified on this M3 Mac:** `cargo nextest run -p oxionnx-cuda --features gpu-tests` — 148
+  run, 148 passed, 0 failed (previously 148 run / 30 failed; the feature adds exactly those 30
+  on-device tests to the 118 that build without it). Under `--no-capture`, exactly 30 distinct
+  `"no CUDA device present, skipping <name>"` lines are emitted — the same 30 that used to fail,
+  confirming each test genuinely reaches its skip rather than having had its body orphaned by
+  the refactor. Full workspace `cargo nextest run --workspace --all-features` — 3296 run, 3296
+  passed, 18 skipped, 0 failed (was 30 failed).
+  `cargo fmt --check` and `cargo clippy --all-targets --all-features -D warnings` clean.
+- Still to re-verify on the RTX A4000 box: that the suite genuinely *runs* (not skips) there,
+  i.e. all 148 execute for real — the skip path is by construction invisible on a GPU host, so
+  a green run there must be checked for test count, not just exit status.

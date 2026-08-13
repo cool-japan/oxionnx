@@ -32,11 +32,31 @@ tracing = { workspace = true }
 [features]
 default = []
 # On-device GPU validation tests (`#[cfg(feature = "gpu-tests")]` in
-# `src/lib.rs`'s test module). Mirrors the identical convention in
-# `oxicuda-driver`/`oxicuda-blas`/`oxicuda-dnn`: off by default because this
-# crate's own CI has no CUDA-capable host (see the `context` module docs),
-# run manually with `cargo test -p oxionnx-cuda --features gpu-tests` on a
-# machine with a real NVIDIA GPU.
+# `src/dispatch_tests.rs` and `src/conv.rs`, plus the `[[test]]` targets
+# below). Mirrors the convention in `oxicuda-driver`/`oxicuda-blas`/
+# `oxicuda-dnn`: off by default because this crate's own CI has no
+# CUDA-capable host (see the `context` module docs), run manually with
+# `cargo test -p oxionnx-cuda --features gpu-tests` on a machine with a real
+# NVIDIA GPU.
+#
+# Turning the feature ON does NOT require a GPU. Every device fixture in
+# this crate returns `Option<CudaContext>` and each test skips (early
+# `return` after an `eprintln!`) when no driver / device is present, so
+# `cargo nextest run --all-features` stays green on a CPU-only host -- a Mac,
+# most notably, where `--all-features` unavoidably switches this feature on
+# because Cargo has no "all features except X". That is exactly what
+# OxiCUDA does: see `oxicuda-blas`'s `src/gpu_tests.rs` ("Every device test
+# returns early (skips) when no CUDA device is present, so the suite stays
+# green on CPU-only machines") and its `tests/gemm_shape_sweep_gpu.rs`
+# `try_handle() -> Option<_>`. Verified: `cargo nextest run -p oxicuda-blas
+# -p oxicuda-dnn -p oxicuda-driver --all-features` on an M3 Mac is 2753
+# passed / 0 failed.
+#
+# This crate briefly diverged from that (TODO.md section 22 replaced the
+# skips with `.expect()`-and-fail, on the stated but mistaken premise that
+# `.expect()` was the OxiCUDA convention being mirrored); section 24 restored
+# it. Do not reintroduce `.expect()` here -- it makes `--all-features` fail
+# on every non-CUDA host.
 gpu-tests = []
 
 # The `tests/*_gpu.rs` integration-test binaries below are gated on the same

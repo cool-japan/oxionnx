@@ -671,17 +671,18 @@ fn gemm_bias_row_broadcast_applies_across_every_stacked_batch_slice() {
 /// `Activation::Enabled` bypasses the `OXIONNX_CUDA` env-var opt-in gate
 /// -- that policy is unit-tested separately in `context::tests` and is
 /// orthogonal to what these tests are proving -- but still requires a
-/// real, working CUDA driver and device 0 to succeed. The `expect` is
-/// deliberate: a `gpu-tests`-gated run with no GPU present is a
-/// misconfigured test invocation, not a case to degrade quietly out of.
+/// real, working CUDA driver and device 0 to succeed. Returns `None` when
+/// no driver / device is present, so each test skips and `--all-features`
+/// stays green on a CPU-only host (the OxiCUDA convention -- see
+/// `oxicuda-blas`'s `src/gpu_tests.rs`).
+///
+/// The `expect` on `join` stays: a *panic* in the building thread is a
+/// real bug, distinct from "this host has no GPU".
 #[cfg(feature = "gpu-tests")]
-fn build_context_on_a_thread_that_then_exits() -> CudaContext {
+fn build_context_on_a_thread_that_then_exits() -> Option<CudaContext> {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| {
-                CudaContext::try_new_with(context::Activation::Enabled)
-                    .expect("gpu-tests requires a real CUDA device -- run on a CUDA-capable host")
-            })
+            .spawn(|| CudaContext::try_new_with(context::Activation::Enabled))
             .join()
             .expect("context-building thread panicked")
     })
@@ -699,7 +700,10 @@ fn build_context_on_a_thread_that_then_exits() -> CudaContext {
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn matmul_dispatch_succeeds_from_a_different_thread_than_construction() {
-    let ctx = build_context_on_a_thread_that_then_exits();
+    let Some(ctx) = build_context_on_a_thread_that_then_exits() else {
+        eprintln!("no CUDA device present, skipping matmul_dispatch_succeeds_from_a_different_thread_than_construction");
+        return;
+    };
 
     let mut weights = HashMap::new();
     // A = [[1, 2], [3, 4]], B = [[5, 6], [7, 8]] (both 2x2, row-major).
@@ -744,7 +748,10 @@ fn matmul_dispatch_succeeds_from_a_different_thread_than_construction() {
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn relu_dispatch_succeeds_from_a_different_thread_than_construction() {
-    let ctx = build_context_on_a_thread_that_then_exits();
+    let Some(ctx) = build_context_on_a_thread_that_then_exits() else {
+        eprintln!("no CUDA device present, skipping relu_dispatch_succeeds_from_a_different_thread_than_construction");
+        return;
+    };
 
     let weights: HashMap<String, Tensor> = HashMap::new();
     let mut intermediates = HashMap::new();
@@ -787,7 +794,10 @@ fn relu_dispatch_succeeds_from_a_different_thread_than_construction() {
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn conv_dispatch_succeeds_from_a_different_thread_than_construction() {
-    let ctx = build_context_on_a_thread_that_then_exits();
+    let Some(ctx) = build_context_on_a_thread_that_then_exits() else {
+        eprintln!("no CUDA device present, skipping conv_dispatch_succeeds_from_a_different_thread_than_construction");
+        return;
+    };
 
     // N=1, Cin=2, H=2, W=2, a 1x1 filter to Cout=3: unpadded, unit
     // stride, unit dilation, 1x1 kernel -- `pick_engine` selects
@@ -872,8 +882,10 @@ fn conv_dispatch_succeeds_from_a_different_thread_than_construction() {
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn conv_claimed_by_the_pre_filter_is_actually_dispatched() {
-    let ctx = CudaContext::try_new_with(context::Activation::Enabled)
-        .expect("gpu-tests requires a real CUDA device -- run on a CUDA-capable host");
+    let Some(ctx) = CudaContext::try_new_with(context::Activation::Enabled) else {
+        eprintln!("no CUDA device present, skipping conv_claimed_by_the_pre_filter_is_actually_dispatched");
+        return;
+    };
 
     let (batch, in_ch, in_h, in_w, out_ch) = (1usize, 4usize, 8usize, 8usize, 6usize);
     let in_shape = vec![batch, in_ch, in_h, in_w];
@@ -985,8 +997,10 @@ fn conv_claimed_by_the_pre_filter_is_actually_dispatched() {
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn advertised_conv_still_declines_the_configurations_it_cannot_compute() {
-    let ctx = CudaContext::try_new_with(context::Activation::Enabled)
-        .expect("gpu-tests requires a real CUDA device -- run on a CUDA-capable host");
+    let Some(ctx) = CudaContext::try_new_with(context::Activation::Enabled) else {
+        eprintln!("no CUDA device present, skipping advertised_conv_still_declines_the_configurations_it_cannot_compute");
+        return;
+    };
 
     let mut weights = HashMap::new();
     weights.insert(
@@ -1051,7 +1065,10 @@ fn advertised_conv_still_declines_the_configurations_it_cannot_compute() {
 #[cfg(feature = "gpu-tests")]
 #[test]
 fn without_reactivation_a_context_from_a_dead_thread_is_unusable() {
-    let ctx = build_context_on_a_thread_that_then_exits();
+    let Some(ctx) = build_context_on_a_thread_that_then_exits() else {
+        eprintln!("no CUDA device present, skipping without_reactivation_a_context_from_a_dead_thread_is_unusable");
+        return;
+    };
     let a = [1.0_f32, 2.0, 3.0, 4.0];
     let b = [5.0_f32, 6.0, 7.0, 8.0];
     let err = matmul::cuda_matmul(&ctx, &a, &b, 2, 2, 2).expect_err(
