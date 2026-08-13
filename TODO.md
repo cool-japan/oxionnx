@@ -4,7 +4,7 @@
 **License:** Apache-2.0
 **Author:** COOLJAPAN OU (Team Kitasan)
 
-**Current stats (2026-08-11):** ~143,426 SLoC (Rust code, tokei) | 190 OpKind variants | 189 registered operators (204 op-type strings incl. aliases) | 3,212 tests passing | workspace layout (8 crates)
+**Current stats (2026-08-14):** ~159,672 SLoC (Rust code, tokei) | 190 OpKind variants | 189 registered operators (204 op-type strings incl. aliases) | 3,595 tests passing (all-features; 3,289 with default features) | workspace layout (8 crates)
 **Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)
 **Zero C/C++ dependencies.**
 
@@ -852,8 +852,11 @@ Investigation into Linux+NVIDIA underperformance vs. `oxiface`'s CoreML path tra
   plus an M-sweep, element-for-element against `reference::ref_matmul`, through `cuda_matmul` end
   to end (fails against the pre-fix code with the exact wrong-element counts quoted above, passes
   after); `oxicuda-dnn`'s `gpu_tests/handle_sync.rs`.
-- Dev-only against the local `oxicuda` checkout (`[patch.crates-io]` path patch in this
-  workspace's `Cargo.toml`) — not yet published.
+- Developed against a local `oxicuda` checkout (`[patch.crates-io]` path patch) — since
+  published: `oxicuda-driver`/`-memory`/`-blas`/`-dnn`/`-ptx`/`-launch` 0.5.5 is live on
+  crates.io (`Cargo.lock` confirms a `registry+…crates.io-index` source, no `[patch]` section
+  remains in this workspace's `Cargo.toml`), so this fix ships to every consumer, not just this
+  dev tree.
 
 ## 22. `oxionnx-cuda` on-device regression-test audit for §21 (2026-08-12) — COMPLETE
 
@@ -897,7 +900,7 @@ file exists somewhere.
   cross-thread test) while the sibling ref-conv task's bias handling was mid-edit in the shared
   working tree; both settled to consistently green immediately after and stayed green over many
   subsequent reruns — not a bug in §21's fixes or in this task's own additions.
-- Same dev-only `[patch.crates-io]` wiring as §21 — not yet published.
+- Same `oxicuda` fix as §21 — now published as 0.5.5 (see §21's note); no longer dev-only.
 
 ## 23. `oxionnx-cuda`: `Conv` advertised as CUDA-supported (2026-08-12) — COMPLETE
 
@@ -961,7 +964,7 @@ only from direct `try_cuda_dispatch`/`cuda_conv` calls, i.e. from tests.
   `cargo test -p oxionnx-cuda` 101 + 1 green; `cargo test -p oxionnx --features cuda` all green
   (493 lib + every integration binary); `cargo fmt --check` and `cargo clippy --all-targets`
   clean on both crates; `cargo check --workspace` green in the downstream `oxiface` tree.
-- Same dev-only `[patch.crates-io]` wiring as §21/§22 — not yet published.
+- Same `oxicuda` fix as §21/§22 — now published as 0.5.5 (see §21's note); no longer dev-only.
 
 ## 24. `oxionnx-cuda` on-device tests: restore the OxiCUDA skip convention (2026-08-13) — COMPLETE
 
@@ -1006,3 +1009,49 @@ switches `gpu-tests` on, and §22 had made that fatal without a device.
 - Still to re-verify on the RTX A4000 box: that the suite genuinely *runs* (not skips) there,
   i.e. all 148 execute for real — the skip path is by construction invisible on a GPU host, so
   a green run there must be checked for test count, not just exit status.
+
+## 25. v0.1.7 release prep — full validation (2026-08-14) — COMPLETE
+
+`/runall 0.1.7` full-mode pipeline: `/changelog-gen` → `/release-check` → `/final-call` →
+`/readme`, run end to end on this M3 Mac. Ties together §21-24 above (all landed within this
+same release cycle, after v0.1.6's §20) plus the `is_supported_op` op-family growth documented
+in `CHANGELOG.md`'s `## [0.1.7]` entry (25 → 40 CUDA-accelerated ops).
+
+- **Full workspace validation, this run:** `RUSTFLAGS="-C debuginfo=0" CARGO_INCREMENTAL=0
+  cargo nextest run --no-fail-fast --workspace` — 3,289 run, 3,289 passed, 19 skipped, 0 failed.
+  Same with `--all-features` — 3,595 run, 3,595 passed, 19 skipped, 0 failed. Both zero
+  compiler warnings and zero nextest config warnings. `cargo clippy --all-features --all-targets
+  -- -D warnings` clean. `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps` clean.
+  Doc tests (`~/work/doctest-parallel.sh`): 15 passed, 0 failed, 8/8 crates. `cargo audit`: 0
+  vulnerabilities. `cargo deny check bans`: ok. `cargo +nightly udeps --all-targets
+  --all-features`: no unused dependencies. `unwrap()` audit (brace-matching classifier, not a
+  naive grep): 0 production-code call sites across all 8 crates — every hit lands inside a
+  `#[cfg(test)]`-gated region.
+- **Docs fixed as part of this run:** `oxionnx-cuda/README.md`'s "Accelerated operators" table
+  was stale at 26 ops (Conv-era) against the crate's actual 40 (re-verified directly against
+  `is_supported_op`'s `matches!` arm) — six new rows added (Pooling, Resize, Pad, Data movement,
+  Shape (zero-cost), PRelu) and the Binary row corrected (channel-broadcast and scalar-broadcast
+  are no longer "same-shape only"). `src/session/run/parallel.rs`'s doc comment had the same
+  stale "26"; corrected. This TODO.md's own §21-23 said the `oxicuda` cross-stream-race /
+  Conv-wiring fix was "dev-only … not yet published" — `Cargo.lock` now shows
+  `oxicuda-driver`/`-memory`/`-blas`/`-dnn`/`-ptx`/`-launch` 0.5.5 sourced from
+  `registry+…crates.io-index` with no `[patch.crates-io]` section anywhere in this workspace's
+  `Cargo.toml`, so that fix ships to every consumer now, not just this dev tree; corrected in
+  place rather than left to read as still-pending.
+- **Publish readiness:** `cargo publish --dry-run --allow-dirty` per crate in topological order
+  (`oxionnx-core` → `oxionnx-coreml`/`oxionnx-cuda`/`oxionnx-ops`/`oxionnx-proto` →
+  `oxionnx-directml`/`oxionnx-gpu` → `oxionnx`) — `oxionnx-core` (Tier 0, no internal deps)
+  packages cleanly (18 files, 167.6 KiB); every dependent crate fails identically with `failed to
+  select a version for the requirement oxionnx-core = "^0.1.7"` because that version is not yet
+  on crates.io — the expected pre-publish chicken-and-egg for a fresh multi-tier release, not a
+  packaging defect (confirmed: all seven failures share this one root cause, no other error
+  shape).
+- **Not addressed this run, tracked for later:** `oxionnx-cuda/src/reference.rs` is 1,953 lines
+  — 47 lines under this project's 2,000-line-per-file cap. Not a violation yet, but the closest
+  file to the ceiling in the workspace; worth a `splitrs` pass in a future cycle before it forces
+  one mid-change. `oxionnx-gpu/README.md` already documents `GpuTuning` and
+  `try_new_diagnosed()` (verified: both are covered in its own text), but not yet the
+  multi-context `PipelineCache` fix (the `BindGroupLayout does not exist` panic from opening a
+  second `GpuContext` in one process) or activation-buffer recycling — both real 0.1.7
+  capabilities (see `CHANGELOG.md`'s Fixed/Changed sections) — added later in the cycle than the
+  README's last content pass; worth a follow-up addition, scoped separately from this run.

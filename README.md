@@ -14,7 +14,7 @@ acceleration ships for native targets today; an async WebGPU path for
 `wasm32` now compiles and is exercised by native tests, but is not yet
 wired into the browser bindings (see [Feature Flags](#feature-flags)).
 
-**149,481 lines of Rust | 3,320 tests | 0 clippy warnings**
+**159,672 lines of Rust | 3,595 tests | 0 clippy warnings**
 
 ## Live Demo
 
@@ -70,18 +70,18 @@ full resolution:
 
 | Crate | Status | Tests (all-features)* |
 |-------|--------|-------|
-| `oxionnx` (root) | Alpha | 1,094 passing (2 skipped) |
+| `oxionnx` (root) | Alpha | 1,113 passing |
 | `oxionnx-core` | Stable | 69 passing |
-| `oxionnx-ops` | Alpha | 1,325 passing (8 skipped) |
+| `oxionnx-ops` | Alpha | 1,325 passing |
 | `oxionnx-proto` | Stable | 134 passing |
-| `oxionnx-gpu` | Alpha | 265 passing |
-| `oxionnx-cuda` | Partial | 148 passing (GEMM/elementwise/softmax/Conv via OxiCUDA; Conv dispatches directly to `oxicuda-dnn`'s `Conv1x1`/`DepthwiseConv`/`ImplicitGemmConv` engines and is advertised by `is_supported_op`). 118 of those need no GPU; the 30 `gpu-tests` on-device tests skip on a host with no CUDA device, so this row's count is *not* evidence the device paths ran |
+| `oxionnx-gpu` | Alpha | 272 passing |
+| `oxionnx-cuda` | Partial | 397 passing -- MatMul/Gemm (batched, with session-lifetime buffer-pool/weight/PTX-module caching), Conv (direct dispatch to `oxicuda-dnn`'s `Conv1x1`/`DepthwiseConv`/`ImplicitGemmConv`), 16 unary activations, Add/Sub/Mul/Div (incl. channel and scalar broadcast), PRelu, BatchNorm/OxiInstanceNorm, ReduceSum/Max/Mean, Softmax, MaxPool/AveragePool, Resize, Pad, Slice, Concat, and zero-cost Reshape/Squeeze/Unsqueeze/Flatten -- 40 ops total via `is_supported_op`, plus opt-in CUDA Graph capture for MatMul/Gemm. Most of these tests need no GPU; the on-device `gpu-tests` suite skips gracefully on a host with no CUDA device, so this row's count is *not* evidence the device paths ran |
 | `oxionnx-directml` | Implemented (opt-in; GPU path not yet hardware-verified) | 242 tests, all Linux-executed or cross-target type-checked. Dual backend — DirectML operators + HLSL/D3D12 compute fallback — routing 15 ops: MatMul, Gemm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, ReduceSum, ReduceMean, ReduceMax, ReduceMin, Conv; kernels compile/lint-verified for Windows and proven on Linux vs a CPU oracle, but not yet run on GPU hardware |
 | `oxionnx-coreml` | Alpha (opt-in; predict path not yet verified against a real model) | 8 passing on non-Apple hosts (compiles to a stub); 43 passing + 8 skipped on macOS/iOS/tvOS/visionOS. The 43 cover the surrounding logic -- tensor/`MLMultiArray` layout conversion, f16 up-conversion, metadata handling. The 8 that skip are exactly the end-to-end ones (`test_load_arcface`, `test_predict_arcface_returns_512_dim_embedding`, the two compute-plan tests, `test_model_metadata_returns_ok_map`): they need a real `.mlpackage`, so `predict`/`predict_raw`/`predict_features`, ANE engagement and the compute plan are **not** exercised by the passing count. Apple frameworks are reached through `objc2`/`objc2-core-ml`, behind the off-by-default `coreml` feature |
 
-\* Per-crate figures are all-features counts from this release (the `oxionnx-coreml` row uses its macOS figure, 43, since that is the host this run used) and sum exactly to the workspace total below: 1,094 + 69 + 1,325 + 134 + 265 + 148 + 242 + 43 = 3,320 passing; 2 + 0 + 8 + 0 + 0 + 0 + 0 + 8 = 18 skipped.
+\* Per-crate figures are all-features passing counts from this release (the `oxionnx-coreml` row uses its macOS figure, 43, since that is the host this run used) and sum exactly to the workspace total below: 1,113 + 69 + 1,325 + 134 + 272 + 397 + 242 + 43 = 3,595 passing.
 
-**Total: 3,320 tests passing with all features (`cargo nextest run --workspace --all-features`, run on macOS; the exact count drifts between runs as the workspace evolves under active development), 3,057 with default features. 0 clippy warnings on the host target (`cargo clippy --all-features --all-targets -- -D warnings`). Platform-gated suites still run only on their target OS — this run's macOS host exercises `oxionnx-coreml`'s Apple-only paths, included above (8 of its tests still skip, needing a real `.mlpackage`), but not `oxionnx-directml`'s Windows FFI tests, and its 30 `oxionnx-cuda` on-device tests skip for want of an NVIDIA device — so no single machine runs the entire cross-platform set, and a green total is not by itself evidence every hardware path ran. 177,927 lines of Rust (149,481 excluding blanks/comments).**
+**Total: 3,595 tests passing with all features (`cargo nextest run --workspace --all-features`, run on macOS; the exact count drifts between runs as the workspace evolves under active development), 3,289 with default features (19 pre-filtered/ignored tests either way). 0 clippy warnings on the host target (`cargo clippy --all-features --all-targets -- -D warnings`). Platform-gated suites still run only on their target OS — this run's macOS host exercises `oxionnx-coreml`'s Apple-only paths, included above (8 of its tests still skip, needing a real `.mlpackage`), but not `oxionnx-directml`'s Windows FFI tests, and `oxionnx-cuda`'s on-device tests skip for want of an NVIDIA device — so no single machine runs the entire cross-platform set, and a green total is not by itself evidence every hardware path ran. 190,392 lines of Rust (159,672 excluding blanks/comments).**
 
 ## Quick Start
 

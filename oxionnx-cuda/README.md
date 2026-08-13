@@ -29,14 +29,20 @@ to the wgpu or CPU backend — no crash.
 
 ## Accelerated operators
 
-| Category         | Operators                                                         |
-|------------------|-------------------------------------------------------------------|
-| Linear algebra   | MatMul, Gemm — batched with numpy-style batch broadcasting (e.g. 3-D activations × a 2-D weight), `transA`/`transB`, and a bias epilogue for `[]`/`[N]`/`[M,N]`-shaped `C` — via `oxicuda_blas::gemm` |
-| Convolution      | Conv — NCHW forward, dispatched *directly* to one of three `oxicuda-dnn` engines: `Conv1x1` (1x1 filter, unit stride and dilation, no padding), `DepthwiseConv` (`groups == in_channels == out_channels`), otherwise `ImplicitGemmConv` (arbitrary stride, dilation and grouping). Deliberately does **not** go through `oxicuda_dnn::conv::api::conv_forward`, whose auto-selector can route into the Winograd path. Asymmetric `pads` declines to the CPU rather than silently computing with one side's padding value — ONNX allows `[top, left, bottom, right]` to differ per side, `ConvProblem` carries one value per spatial dimension — as do non-4-D shapes and group/channel mismatches. |
-| Unary activation | Relu, Sigmoid, Gelu, Tanh, Exp, Sqrt, Abs, Neg, Log, Ceil, Floor, HardSigmoid, HardSwish, SiLU, Softplus, LeakyRelu (16 ops via PTX) |
-| Binary           | Add, Sub, Mul, Div (same-shape only)                              |
-| Reduction        | ReduceSum, ReduceMax (single axis, any axis length)                |
-| Normalization    | Softmax — last axis only; a non-default `axis` attribute declines to the CPU instead of computing the wrong axis; row width ≤ 1024 |
+| Category           | Operators                                                         |
+|--------------------|--------------------------------------------------------------------|
+| Linear algebra     | MatMul, Gemm — batched with numpy-style batch broadcasting (e.g. 3-D activations × a 2-D weight), `transA`/`transB`, and a bias epilogue for `[]`/`[N]`/`[M,N]`-shaped `C` — via `oxicuda_blas::gemm` |
+| Convolution        | Conv — NCHW forward, dispatched *directly* to one of three `oxicuda-dnn` engines: `Conv1x1` (1x1 filter, unit stride and dilation, no padding), `DepthwiseConv` (`groups == in_channels == out_channels`), otherwise `ImplicitGemmConv` (arbitrary stride, dilation and grouping). Deliberately does **not** go through `oxicuda_dnn::conv::api::conv_forward`, whose auto-selector can route into the Winograd path. Asymmetric `pads` declines to the CPU rather than silently computing with one side's padding value — ONNX allows `[top, left, bottom, right]` to differ per side, `ConvProblem` carries one value per spatial dimension — as do non-4-D shapes and group/channel mismatches. |
+| Unary activation   | Relu, Sigmoid, Gelu, Tanh, Exp, Sqrt, Abs, Neg, Log, Ceil, Floor, HardSigmoid, HardSwish, SiLU, Softplus, LeakyRelu (16 ops via PTX) |
+| PRelu              | PRelu — `f(x) = x` if `x ≥ 0` else `slope[c] * x`, with per-channel (`[C]`) or scalar (`[1]`) slope broadcasting. The slope operand is weight-cached in the same residency cache as a `Conv`/`Gemm` operand, when it resolves to a graph initializer. |
+| Binary             | Add, Sub, Mul, Div — exact-shape (equal-length operands) via `elementwise.rs`, plus two broadcast patterns via `broadcast.rs`: `[1,C,1,1]`-vs-`[1,C,H,W]` channel broadcast and scalar-vs-tensor. `Sub`/`Div` track which operand is the broadcast one, since operand order matters for non-commutative ops; any other broadcast shape still declines to the CPU. |
+| Reduction          | ReduceSum, ReduceMax (single axis, any axis length) — via `oxicuda_blas::reduction::reduce_axis`; ReduceMean (contiguous axis range, e.g. ONNX `axes=[2,3]`) — `ReduceSum` over the range followed by an in-place device-side divide, so the whole op stays on the GPU |
+| Normalization      | Softmax — last axis only; a non-default `axis` attribute declines to the CPU instead of computing the wrong axis; row width ≤ 1024. `BatchNormalization` — inference mode only (precomputed running mean/var). `OxiInstanceNorm` — the fused per-`(n,c)`-plane mean/var op behind AdaIN, with an identity `gamma=1`/`beta=0` affine (it has none of its own). Both dispatch through `oxicuda_ptx::templates::batch_norm::BatchNormTemplate`. |
+| Pooling            | MaxPool, AveragePool — 2-D forward pooling via `oxicuda_dnn::pool::{max_pool2d, avg_pool2d}`. Declines non-unit `dilations` (neither kernel models dilation), non-`NOTSET` `auto_pad`, asymmetric `pads`, and a requested `Indices` output. |
+| Resize             | Resize — nearest (`coordinate_transformation_mode="asymmetric"`, `nearest_mode="floor"`) and bilinear (`half_pixel`/`pytorch_half_pixel`/`align_corners`) interpolation, 4-D NCHW with `N`/`C` unchanged, matching `oxicuda_dnn::resize`'s coordinate-transform formulas. Requires `sizes` XOR `scales`; `axes` must be absent. |
+| Pad                | Pad — `reflect` and `constant` modes over the spatial axes of a 4-D NCHW tensor (`N`/`C` must stay unpadded); own PTX — no `oxicuda-dnn` kernel exists for this op. Supports ONNX-legal negative pads (cropping). |
+| Data movement      | Slice — rank-4 strided copy, own PTX; every output index is provably in-bounds by construction, so the kernel needs no bounds check. Concat — any rank, `outer * num_inputs` device-to-device copies (no compute kernel); declines when operands disagree on rank or on a non-concatenated dimension. |
+| Shape (zero-cost)  | Reshape, Squeeze, Unsqueeze, Flatten — no kernel at all: a device-resident input is re-exposed under the new shape via `CudaDeviceTensor::alias` (an `Arc::clone` of the same allocation). A host-resident input declines — a CPU reshape is already O(1). |
 
 Unsupported or unrecognised operators, and unsupported configurations of an
 otherwise-accelerated operator, return `Ok(None)` so the caller falls back to
@@ -50,7 +56,7 @@ anything else declines to the attribute-aware CPU kernel instead of silently
 computing the wrong constant.
 
 `oxionnx_cuda::is_supported_op(op: &OpKind) -> bool` is a cheap, pure,
-allocation-free predicate reporting exactly which of the 26 ops above
+allocation-free predicate reporting exactly which of the 40 ops above
 `try_cuda_dispatch` is capable of claiming (everything else is `false`).
 Placement logic in the `oxionnx` workspace crate consults it before
 paying for an upload/dispatch/readback; returning `true` is necessary but

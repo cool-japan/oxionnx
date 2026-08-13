@@ -1136,7 +1136,7 @@ mod tests {
     /// moment a CUDA or DirectML context existed.**
     ///
     /// The old gate was literally `if self.cuda.is_some() { return true; }` — no op
-    /// check at all — while `OpKind` has ~166 variants and CUDA implements 26 of
+    /// check at all — while `OpKind` has ~166 variants and CUDA implements 40 of
     /// them (DirectML, 15).  So merely *owning* a CUDA context dragged every node in
     /// the graph out of `par_iter` and into the serial phase, to be probed one at a
     /// time on the main thread only to be declined and handed back to the CPU.
