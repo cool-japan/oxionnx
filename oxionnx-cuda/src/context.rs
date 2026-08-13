@@ -42,6 +42,16 @@
 //! | [`ACTIVATION_ENV_VAR`] (`OXIONNX_CUDA`) | **off** | [`CudaContext::try_new`] returns `None` until this is set (or the embedder passes [`Activation::Enabled`]).  `Session` holds `cuda: None`, and every node runs on the CPU. |
 //! | [`crate::reference::VERIFY_ENV_VAR`] (`OXIONNX_CUDA_VERIFY`) | off | Shadow-compare every dispatched op against the CPU oracle in [`crate::reference`].  A mismatch is a kernel *failure*: the wrong numbers are thrown away, not returned. |
 //! | [`STRICT_ENV_VAR`] (`OXIONNX_CUDA_STRICT`) | off | A shadow-verification *failure* becomes a hard `Err` instead of a silent CPU fallback. |
+//! | [`crate::graph_cache::GRAPH_ENV_VAR`] (`OXIONNX_CUDA_GRAPH`) | off | Record each repeated fixed-shape `MatMul`/`Gemm` dispatch into a CUDA graph once and replay it with `cuGraphLaunch` thereafter.  Measured between -10% and +11% per call **depending on the shape** — see [`mod@crate::graph_cache`] for the table and for why the ceiling is that low. |
+//!
+//! ## `OXIONNX_CUDA_GRAPH` and `OXIONNX_CUDA_VERIFY` do not compose, deliberately
+//!
+//! Setting both leaves graphs **off** (with a `warn!`), because verification's
+//! whole value is that it grades the code path production runs. Grading a
+//! replayed graph instead would quietly change what a `VERIFY=1` run is
+//! evidence for — it would stop being evidence that the *kernels* are right.
+//! `OXIONNX_CUDA_STRICT` is orthogonal to both: it only decides whether a
+//! verification mismatch is fatal.
 //!
 //! The bar for flipping [`ACTIVATION_ENV_VAR`]'s default to on is the same as
 //! `oxionnx-directml`'s: run with `OXIONNX_CUDA_VERIFY=1` on real hardware,
@@ -216,6 +226,15 @@ pub struct CudaContext {
     /// guard against that (unlike `Module`'s, which tracks its owning
     /// context). Same reasoning for `modules` below.
     pub(crate) caches: DeviceCaches,
+    /// Recorded CUDA graphs for repeated fixed-shape dispatches, and the
+    /// device buffers whose addresses those recordings baked in.
+    ///
+    /// **Declared alongside `caches`, above `context`, for the same reason**:
+    /// every buffer it owns frees itself with a `cuMemFree` against `context`,
+    /// and every `GraphExec` it owns destroys itself against the same context.
+    /// Empty (and untouched on every dispatch) unless
+    /// [`GRAPH_ENV_VAR`](crate::graph_cache::GRAPH_ENV_VAR) is set.
+    pub(crate) graphs: crate::graph_cache::GraphCache,
     /// Compiled PTX modules for this crate's *own* kernels, keyed by kernel
     /// name.
     ///
@@ -350,6 +369,45 @@ impl CudaContext {
         self.caches.is_resident(name)
     }
 
+    /// Turn CUDA graph capture/replay on or off for this context, overriding
+    /// [`GRAPH_ENV_VAR`](crate::graph_cache::GRAPH_ENV_VAR).
+    ///
+    /// The embedder-facing counterpart of [`Activation::Enabled`] — an
+    /// explicit request is as clear an opt-in as an environment variable, and
+    /// this crate already takes that position for GPU acquisition itself.
+    ///
+    /// Safe to call at any time, including while another thread is
+    /// dispatching: it decides only whether *subsequent* dispatches consult
+    /// the graph cache. Already-recorded graphs and the buffers they own are
+    /// untouched, so switching back on reuses them rather than re-recording.
+    ///
+    /// Turning it on does **not** override the interaction documented in the
+    /// [module docs](self): under `OXIONNX_CUDA_VERIFY=1` a context is built
+    /// with graphs off, and turning them on here is exactly as unwise as it
+    /// sounds — verification would then grade replays instead of kernels.
+    pub fn set_graph_capture(&self, on: bool) {
+        self.graphs.set_enabled(on);
+    }
+
+    /// Whether this context currently takes the CUDA graph path.
+    #[must_use]
+    pub fn graph_capture_enabled(&self) -> bool {
+        self.graphs.enabled()
+    }
+
+    /// How many CUDA graphs this context has recorded, and how many of those
+    /// keys are poisoned (a capture that failed and permanently fell back).
+    ///
+    /// Always `(0, 0)` unless
+    /// [`GRAPH_ENV_VAR`](crate::graph_cache::GRAPH_ENV_VAR) is set. A
+    /// *poisoned* count above zero is the signal worth watching: it means some
+    /// node could not be recorded and is running through ordinary launches, so
+    /// a run with graphs "on" is partly not.
+    #[must_use]
+    pub fn graph_stats(&self) -> (usize, usize) {
+        self.graphs.stats()
+    }
+
     /// Device bytes this context is holding in its caches: resident weights
     /// plus buffers sitting idle in the pool.
     ///
@@ -431,8 +489,16 @@ impl CudaContext {
             );
         }
 
+        if crate::graph_cache::graph_enabled() {
+            tracing::info!(
+                env = crate::graph_cache::GRAPH_ENV_VAR,
+                "CUDA graph capture is ON for this context."
+            );
+        }
+
         Some(Self {
             caches: DeviceCaches::new(),
+            graphs: crate::graph_cache::GraphCache::new(),
             modules: RwLock::new(HashMap::new()),
             context,
             dnn,

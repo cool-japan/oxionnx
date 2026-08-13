@@ -88,6 +88,11 @@ name = "batched_matmul_gpu"
 path = "tests/batched_matmul_gpu.rs"
 required-features = ["gpu-tests"]
 
+[[test]]
+name = "graph_cache_gpu"
+path = "tests/graph_cache_gpu.rs"
+required-features = ["gpu-tests"]
+
 # Steady-state per-call dispatch cost on a real device. Carries
 # `required-features` for exactly the reason the test targets above do: it
 # allocates GPU memory and launches real kernels the moment it runs, so a host
@@ -95,4 +100,20 @@ required-features = ["gpu-tests"]
 [[example]]
 name = "dispatch_bench"
 path = "examples/dispatch_bench.rs"
+required-features = ["gpu-tests"]
+
+# Hardware probe for driver-backed CUDA stream capture / graph replay, and the
+# measurement that decides whether `graph_cache` is worth enabling on a given
+# machine. Same `required-features` reasoning as every target above: it touches
+# a real device the moment it runs.
+[[example]]
+name = "graph_capture_probe"
+path = "examples/graph_capture_probe.rs"
+required-features = ["gpu-tests"]
+
+# Interleaved A/B of `try_cuda_dispatch` with and without graph replay. Same
+# `required-features` reasoning again.
+[[example]]
+name = "graph_dispatch_bench"
+path = "examples/graph_dispatch_bench.rs"
 required-features = ["gpu-tests"]

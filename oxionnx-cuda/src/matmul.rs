@@ -61,6 +61,7 @@
 
 use oxicuda_blas::batched::gemm_strided_batched;
 use oxicuda_blas::{level3::gemm_api::gemm, Layout, MatrixDesc, MatrixDescMut, Transpose};
+use oxicuda_driver::ffi::CUdeviceptr;
 use oxicuda_driver::Stream;
 
 use crate::context::CudaContext;
@@ -298,87 +299,62 @@ pub(crate) fn cuda_gemm_batched(
     // at the end is then the only host/device rendezvous in the dispatch.
     let stream = ctx.dnn.blas().stream();
 
+    // ── Graph replay, when it applies ─────────────────────────────────────
+    //
+    // Tried before anything is uploaded, because the graph path uploads into
+    // its *own* buffers rather than the pool's (see `mod@crate::graph_cache`
+    // on pointer stability) and doing it after would pay for both. Declines —
+    // graphs off, an operand not yet resident, a poisoned key — cost one
+    // boolean and fall through to the ordinary path below with `a`/`b`
+    // untouched.
+    if ctx.graphs.enabled() {
+        let plan = plan_gemm(m, k, n, a_batches, b_batches);
+        if let Some(out) = try_graph_gemm(
+            ctx,
+            &a,
+            &b,
+            GemmDims {
+                m_u32,
+                k_u32,
+                n_u32,
+                batch_u32,
+                slice_c_i64,
+            },
+            (a_needed, b_needed, out_total),
+            plan,
+            stream,
+        )? {
+            return Ok(Some(out));
+        }
+    }
+
     let mut d_a = a.resolve(ctx, A_LABEL, a_needed, stream)?;
     let mut d_b = b.resolve(ctx, B_LABEL, b_needed, stream)?;
 
     let mut d_c = ctx.scratch(out_total)?;
-    // A GEMM with beta = 0 still evaluates `beta * C`, and `0.0 * NaN` is
-    // `NaN`. A recycled or freshly allocated buffer may hold either, so the
-    // output is zeroed exactly as the pre-pool code's `DeviceBuffer::zeroed`
-    // did — but stream-ordered, without that call's context-wide fence.
-    d_c.zero_fill(stream)?;
 
-    match plan_gemm(m, k, n, a_batches, b_batches) {
-        GemmPlan::Collapsed => {
-            // `[batch*m, k] x [k, n]`. The row count is the only quantity that
-            // changes, and the only one that can overflow a `u32` when the
-            // per-slice `m` could not.
-            let Some(rows) = batch.checked_mul(m) else {
-                return Ok(None);
-            };
-            let Ok(rows_u32) = u32::try_from(rows) else {
-                return Ok(None);
-            };
-            let desc_a =
-                MatrixDesc::<f32>::from_buffer(d_a.buffer(), rows_u32, k_u32, Layout::RowMajor)
-                    .map_err(blas_err)?;
-            let desc_b =
-                MatrixDesc::<f32>::from_buffer(d_b.buffer(), k_u32, n_u32, Layout::RowMajor)
-                    .map_err(blas_err)?;
-            let mut desc_c = MatrixDescMut::<f32>::from_buffer(
-                d_c.buffer_mut(),
-                rows_u32,
-                n_u32,
-                Layout::RowMajor,
-            )
-            .map_err(blas_err)?;
-
-            gemm(
-                ctx.dnn.blas(),
-                Transpose::NoTrans,
-                Transpose::NoTrans,
-                1.0_f32,
-                &desc_a,
-                &desc_b,
-                0.0_f32,
-                &mut desc_c,
-            )
-            .map_err(blas_err)?;
-        }
-        GemmPlan::StridedBatch { stride_a, stride_b } => {
-            let c_ptr = d_c.device_ptr();
-            gemm_strided_batched::<f32>(
-                ctx.dnn.blas(),
-                Transpose::NoTrans,
-                Transpose::NoTrans,
-                m_u32,
-                n_u32,
-                k_u32,
-                1.0_f32,
-                d_a.device_ptr(),
-                k_u32,
-                stride_a,
-                d_b.device_ptr(),
-                n_u32,
-                stride_b,
-                0.0_f32,
-                // C and D are the same buffer: the kernel computes
-                // `D = alpha*A*B + beta*C` in place, which over the zero-filled
-                // output above with `beta = 0` is exactly `alpha*A*B`. Passing
-                // one buffer for both also skips the device-to-device C -> D
-                // snapshot `gemm_strided_batched` would otherwise make per
-                // batch element.
-                c_ptr,
-                n_u32,
-                slice_c_i64,
-                c_ptr,
-                n_u32,
-                slice_c_i64,
-                batch_u32,
-            )
-            .map_err(blas_err)?;
-        }
-    }
+    issue_gemm(
+        ctx,
+        plan_gemm(m, k, n, a_batches, b_batches),
+        GemmDims {
+            m_u32,
+            k_u32,
+            n_u32,
+            batch_u32,
+            slice_c_i64,
+        },
+        GemmPointers {
+            a: d_a.device_ptr(),
+            b: d_b.device_ptr(),
+            c: d_c.device_ptr(),
+        },
+        GemmCapacities {
+            a: a_needed,
+            b: b_needed,
+            c: out_total,
+        },
+        stream,
+    )?;
 
     let mut out = vec![0.0_f32; out_total];
     d_c.download(&mut out, stream)?;
@@ -447,6 +423,438 @@ pub fn cuda_matmul(
 /// Wrap an `oxicuda-blas` error in this crate's dispatch error.
 fn blas_err(e: oxicuda_blas::error::BlasError) -> CudaDispatchError {
     CudaDispatchError::Blas(e.to_string())
+}
+
+// ── The launch, shared by the ordinary and the graph-recorded path ─────────
+
+/// The `u32`/`i64` launch dimensions a GEMM needs, already range-checked by
+/// [`cuda_gemm_batched`].
+#[derive(Debug, Clone, Copy)]
+struct GemmDims {
+    /// Rows of one output slice.
+    m_u32: u32,
+    /// Shared inner dimension.
+    k_u32: u32,
+    /// Columns of one output slice.
+    n_u32: u32,
+    /// Output batch slices.
+    batch_u32: u32,
+    /// Elements between consecutive output slices.
+    slice_c_i64: i64,
+}
+
+/// Where the three operands live on the device for one launch.
+#[derive(Debug, Clone, Copy)]
+struct GemmPointers {
+    a: CUdeviceptr,
+    b: CUdeviceptr,
+    c: CUdeviceptr,
+}
+
+/// How many `f32` elements each allocation behind [`GemmPointers`] actually
+/// holds.
+///
+/// Carried explicitly because the launch below builds its matrix descriptors
+/// with `MatrixDesc::from_raw`, which — unlike `from_buffer` — performs no
+/// bounds check of its own. Dropping the check rather than moving it would
+/// turn a malformed model into an out-of-bounds device read.
+#[derive(Debug, Clone, Copy)]
+struct GemmCapacities {
+    a: usize,
+    b: usize,
+    c: usize,
+}
+
+/// Zero the output and issue the GEMM launches for `plan`.
+///
+/// **The single definition of what a GEMM dispatch launches.** Both the
+/// ordinary path and [`crate::graph_cache`]'s recording call exactly this, so
+/// a recorded graph replays the same work the ordinary path would have done —
+/// which is what makes the two comparable at all, and what stops the two from
+/// drifting apart under later edits.
+///
+/// # Errors
+///
+/// [`CudaDispatchError::Shape`] when an allocation is too small for the
+/// descriptor it would back, or the BLAS error from the launch.
+fn issue_gemm(
+    ctx: &CudaContext,
+    plan: GemmPlan,
+    dims: GemmDims,
+    ptrs: GemmPointers,
+    capacities: GemmCapacities,
+    stream: &Stream,
+) -> Result<(), CudaDispatchError> {
+    // A GEMM with beta = 0 still evaluates `beta * C`, and `0.0 * NaN` is
+    // `NaN`. A recycled or freshly allocated buffer may hold either, so the
+    // output is zeroed exactly as the pre-pool code's `DeviceBuffer::zeroed`
+    // did — but stream-ordered, without that call's context-wide fence.
+    // `cuMemsetD32Async` is a stream-ordered operation, so it records into a
+    // graph as a memset node like any launch.
+    oxicuda_driver::memory_info::memset_d32_async(ptrs.c, 0, capacities.c, stream)
+        .map_err(CudaDispatchError::Driver)?;
+
+    match plan {
+        GemmPlan::Collapsed => {
+            // `[batch*m, k] x [k, n]`. The row count is the only quantity that
+            // changes, and the only one that can overflow a `u32` when the
+            // per-slice `m` could not.
+            let Some(rows_u32) = dims.batch_u32.checked_mul(dims.m_u32) else {
+                return Err(CudaDispatchError::Shape {
+                    op: "MatMul",
+                    msg: format!(
+                        "collapsed row count {} x {} exceeds a u32 kernel launch",
+                        dims.batch_u32, dims.m_u32,
+                    ),
+                });
+            };
+            let desc_a = raw_desc(ptrs.a, rows_u32, dims.k_u32, capacities.a, "A")?;
+            let desc_b = raw_desc(ptrs.b, dims.k_u32, dims.n_u32, capacities.b, "B")?;
+            check_capacity(rows_u32, dims.n_u32, capacities.c, "C")?;
+            let mut desc_c = MatrixDescMut::<f32>::from_raw(
+                ptrs.c,
+                rows_u32,
+                dims.n_u32,
+                dims.n_u32,
+                Layout::RowMajor,
+            );
+
+            gemm(
+                ctx.dnn.blas(),
+                Transpose::NoTrans,
+                Transpose::NoTrans,
+                1.0_f32,
+                &desc_a,
+                &desc_b,
+                0.0_f32,
+                &mut desc_c,
+            )
+            .map_err(blas_err)?;
+        }
+        GemmPlan::StridedBatch { stride_a, stride_b } => {
+            gemm_strided_batched::<f32>(
+                ctx.dnn.blas(),
+                Transpose::NoTrans,
+                Transpose::NoTrans,
+                dims.m_u32,
+                dims.n_u32,
+                dims.k_u32,
+                1.0_f32,
+                ptrs.a,
+                dims.k_u32,
+                stride_a,
+                ptrs.b,
+                dims.n_u32,
+                stride_b,
+                0.0_f32,
+                // C and D are the same buffer: the kernel computes
+                // `D = alpha*A*B + beta*C` in place, which over the zero-filled
+                // output above with `beta = 0` is exactly `alpha*A*B`. Passing
+                // one buffer for both also skips the device-to-device C -> D
+                // snapshot `gemm_strided_batched` would otherwise make per
+                // batch element.
+                ptrs.c,
+                dims.n_u32,
+                dims.slice_c_i64,
+                ptrs.c,
+                dims.n_u32,
+                dims.slice_c_i64,
+                dims.batch_u32,
+            )
+            .map_err(blas_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a descriptor whose `rows x cols` outruns the `held` elements behind
+/// its pointer.
+///
+/// This is `MatrixDesc::from_buffer`'s length check, relocated: the launch
+/// path takes raw pointers so that a graph recording and an ordinary dispatch
+/// can share it, and a raw pointer carries no length.
+fn check_capacity(
+    rows: u32,
+    cols: u32,
+    held: usize,
+    operand: &str,
+) -> Result<(), CudaDispatchError> {
+    let required = rows as usize * cols as usize;
+    if held < required {
+        return Err(CudaDispatchError::Shape {
+            op: "MatMul",
+            msg: format!(
+                "operand {operand} holds {held} elements but a {rows}x{cols} descriptor needs \
+                 {required}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// A row-major read-only descriptor over `ptr`, bounds-checked against `held`.
+fn raw_desc(
+    ptr: CUdeviceptr,
+    rows: u32,
+    cols: u32,
+    held: usize,
+    operand: &str,
+) -> Result<MatrixDesc<f32>, CudaDispatchError> {
+    check_capacity(rows, cols, held, operand)?;
+    Ok(MatrixDesc::<f32>::from_raw(
+        ptr,
+        rows,
+        cols,
+        cols,
+        Layout::RowMajor,
+    ))
+}
+
+// ── The graph-recorded path ───────────────────────────────────────────────
+
+/// Attempt this GEMM through [`crate::graph_cache`], returning the finished
+/// result when the graph path handled it.
+///
+/// Returns `Ok(None)` — meaning "use the ordinary path" — for every case the
+/// graph path declines, and those declines are the interesting part:
+///
+/// * **An operand carries an identity but is not resident yet.** That is the
+///   *first* dispatch of a graph initializer. Recording it now would bake in
+///   the address of a pooled scratch buffer, which the pool recycles; letting
+///   the ordinary path run instead makes the weight resident, and the second
+///   dispatch — the one that repeats forever — records against its stable
+///   address. Costing one un-recorded frame to get a sound recording is the
+///   right trade in a workload measured in thousands of frames.
+/// * **The cache is full, or this key already failed to record.** See
+///   [`crate::graph_cache::GraphCache::run`].
+///
+/// # Errors
+///
+/// Only a genuine device failure during the replay itself (upload, launch,
+/// readback, synchronise). A failed *recording* is a decline, not an error.
+#[allow(clippy::too_many_arguments)]
+fn try_graph_gemm(
+    ctx: &CudaContext,
+    a: &GemmOperand<'_, '_>,
+    b: &GemmOperand<'_, '_>,
+    dims: GemmDims,
+    needed: (usize, usize, usize),
+    plan: GemmPlan,
+    stream: &Stream,
+) -> Result<Option<Vec<f32>>, CudaDispatchError> {
+    let (a_needed, b_needed, out_total) = needed;
+    let (Some(a_source), Some(b_source)) = (
+        GraphOperand::classify(a, a_needed),
+        GraphOperand::classify(b, b_needed),
+    ) else {
+        return Ok(None);
+    };
+
+    // Owned-buffer layout: every uploaded operand first, in A-then-B order,
+    // then the output. `GraphOperand::Upload` records its own slot index so a
+    // caller never has to recompute this ordering. Stack arrays throughout:
+    // this runs on every dispatch of every eligible node, and the shapes this
+    // cache exists for are the ones that repeat thousands of times.
+    let mut owned_lens = [0usize; 3];
+    let mut owned_len = 0usize;
+    let mut external_ptrs = [0 as CUdeviceptr; 2];
+    let mut external_len = 0usize;
+    let a_slot = a_source.reserve(
+        &mut owned_lens,
+        &mut owned_len,
+        &mut external_ptrs,
+        &mut external_len,
+    );
+    let b_slot = b_source.reserve(
+        &mut owned_lens,
+        &mut owned_len,
+        &mut external_ptrs,
+        &mut external_len,
+    );
+    let c_slot = owned_len;
+    owned_lens[c_slot] = out_total;
+    owned_len += 1;
+    let owned_lens = &owned_lens[..owned_len];
+
+    // Everything that changes what gets launched goes into the key. The plan
+    // discriminant and its strides are in there explicitly rather than being
+    // trusted to follow from the dimensions: `plan_gemm` is where that mapping
+    // lives, and a future change to it must not silently alias two different
+    // recordings.
+    let (plan_tag, stride_a, stride_b) = match plan {
+        GemmPlan::Collapsed => (0u64, 0i64, 0i64),
+        GemmPlan::StridedBatch { stride_a, stride_b } => (1u64, stride_a, stride_b),
+    };
+    let Some(key) = crate::graph_cache::GraphKey::new(
+        "gemm",
+        &[
+            u64::from(dims.m_u32),
+            u64::from(dims.k_u32),
+            u64::from(dims.n_u32),
+            u64::from(dims.batch_u32),
+            plan_tag,
+            stride_a as u64,
+            stride_b as u64,
+            a_slot.map_or(u64::MAX, |slot| slot as u64),
+            b_slot.map_or(u64::MAX, |slot| slot as u64),
+        ],
+        &external_ptrs[..external_len],
+    ) else {
+        return Ok(None);
+    };
+
+    let mut out = vec![0.0_f32; out_total];
+    let ran = ctx.graphs.run(
+        key,
+        owned_lens,
+        stream,
+        // pre: this frame's activations cross the bus into the entry's own
+        // buffers. A resident operand uploads nothing.
+        |ptrs| {
+            a_source.upload(a_slot, ptrs, stream)?;
+            b_source.upload(b_slot, ptrs, stream)
+        },
+        // record: exactly the launches the ordinary path issues.
+        |ptrs| {
+            let Some(&c_ptr) = ptrs.get(c_slot) else {
+                return Err(CudaDispatchError::Shape {
+                    op: "MatMul",
+                    msg: "graph cache did not provide the output buffer".to_string(),
+                });
+            };
+            issue_gemm(
+                ctx,
+                plan,
+                dims,
+                GemmPointers {
+                    a: a_source.device_ptr(a_slot, ptrs)?,
+                    b: b_source.device_ptr(b_slot, ptrs)?,
+                    c: c_ptr,
+                },
+                GemmCapacities {
+                    a: a_needed,
+                    b: b_needed,
+                    c: out_total,
+                },
+                stream,
+            )
+        },
+        // post: read the result back out of the entry's own output buffer.
+        |ptrs| {
+            let Some(&c_ptr) = ptrs.get(c_slot) else {
+                return Err(CudaDispatchError::Shape {
+                    op: "MatMul",
+                    msg: "graph cache did not provide the output buffer".to_string(),
+                });
+            };
+            // SAFETY: a non-owning view of exactly `out.len()` elements over a
+            // buffer the cache allocated with `out_total >= out.len()`
+            // elements; its drop frees nothing.
+            let view = unsafe { oxicuda_memory::DeviceBuffer::<f32>::from_raw(c_ptr, out.len()) };
+            view.copy_to_host_async(&mut out, stream)
+                .map_err(CudaDispatchError::Driver)
+        },
+    )?;
+
+    Ok(ran.then_some(out))
+}
+
+/// How one GEMM operand reaches a recorded graph.
+///
+/// The distinction is exactly the pointer-stability one: a resident weight
+/// already has an address that outlives the recording, while an activation
+/// needs the cache to own a buffer on its behalf.
+enum GraphOperand<'a> {
+    /// Already on the device at a stable address, which the recording bakes in
+    /// and the key therefore carries.
+    Resident(CUdeviceptr),
+    /// Uploaded from host bytes into a buffer the cache owns, every call.
+    Upload(&'a [f32]),
+}
+
+impl<'a> GraphOperand<'a> {
+    /// Classify `operand`, or `None` if it cannot take part in a recording.
+    ///
+    /// The `None` case is an operand that has a residency identity but no
+    /// device copy yet — see [`try_graph_gemm`]'s decline list.
+    fn classify(operand: &'a GemmOperand<'_, '_>, needed: usize) -> Option<Self> {
+        if let Some(resident) = &operand.resident {
+            return Some(Self::Resident(resident.device_ptr()));
+        }
+        if operand.id.is_some() {
+            return None;
+        }
+        // An activation: its bytes change every frame, so the graph reads them
+        // out of a cache-owned buffer this dispatch refills.
+        operand.bytes?.get(..needed).map(Self::Upload)
+    }
+
+    /// Claim this operand's place in the entry's owned-buffer layout.
+    ///
+    /// Returns the slot index for an uploaded operand, or `None` for a
+    /// resident one (whose address goes into `external_ptrs` instead, becoming
+    /// part of the key).
+    ///
+    /// Writes into caller-provided fixed arrays rather than `Vec`s so a
+    /// dispatch that takes this path allocates nothing; both arrays are sized
+    /// by the caller for a GEMM's two operands plus its output.
+    fn reserve(
+        &self,
+        owned_lens: &mut [usize; 3],
+        owned_len: &mut usize,
+        external_ptrs: &mut [CUdeviceptr; 2],
+        external_len: &mut usize,
+    ) -> Option<usize> {
+        match self {
+            Self::Resident(ptr) => {
+                external_ptrs[*external_len] = *ptr;
+                *external_len += 1;
+                None
+            }
+            Self::Upload(bytes) => {
+                let slot = *owned_len;
+                owned_lens[slot] = bytes.len();
+                *owned_len += 1;
+                Some(slot)
+            }
+        }
+    }
+
+    /// The device address a recorded launch should read this operand from.
+    fn device_ptr(
+        &self,
+        slot: Option<usize>,
+        ptrs: &[CUdeviceptr],
+    ) -> Result<CUdeviceptr, CudaDispatchError> {
+        match self {
+            Self::Resident(ptr) => Ok(*ptr),
+            Self::Upload(_) => slot
+                .and_then(|slot| ptrs.get(slot).copied())
+                .ok_or_else(|| CudaDispatchError::Shape {
+                    op: "MatMul",
+                    msg: "graph cache did not provide an operand buffer".to_string(),
+                }),
+        }
+    }
+
+    /// Put this frame's bytes on the device, for an uploaded operand.
+    fn upload(
+        &self,
+        slot: Option<usize>,
+        ptrs: &[CUdeviceptr],
+        stream: &Stream,
+    ) -> Result<(), CudaDispatchError> {
+        let Self::Upload(bytes) = self else {
+            return Ok(());
+        };
+        let ptr = self.device_ptr(slot, ptrs)?;
+        // SAFETY: a non-owning view of exactly `bytes.len()` elements over a
+        // buffer the cache allocated with that many elements (see `reserve`);
+        // its drop frees nothing.
+        let mut view = unsafe { oxicuda_memory::DeviceBuffer::<f32>::from_raw(ptr, bytes.len()) };
+        view.copy_from_host_async(bytes, stream)
+            .map_err(CudaDispatchError::Driver)
+    }
 }
 
 #[cfg(test)]

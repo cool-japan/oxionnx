@@ -32,6 +32,18 @@
 //! in `intermediates`. That is the exact distinction
 //! `try_cuda_dispatch`'s residency keying keys on, so running the same shape
 //! both ways isolates what weight residency buys from what buffer pooling buys.
+//!
+//! Every `[w]` case therefore gives its weight a **distinct name**. That is
+//! load-bearing, not tidiness: residency is keyed by initializer name, and an
+//! entry whose cached host origin disagrees with the one being asked for is
+//! deliberately demoted to a per-dispatch upload *without disturbing the
+//! cache* (see `residency::WeightId`) — which is right for a session that
+//! violated the invariance contract, and catastrophic for a benchmark. When
+//! all six `[w]` cases were called `"b"`, the first case to run owned the slot
+//! and every later one re-uploaded its whole weight on **every** call: the
+//! ArcFace head measured 5.2 ms/call, of which 5.1 ms was 49 MiB crossing the
+//! bus. The per-case `w-hits`/`miss`/`KiB per call` columns exist so that a
+//! recurrence is visible in the output instead of being read as a slow kernel.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -106,6 +118,13 @@ fn bench(
         }
     }
 
+    // Snapshot the caches around the timed window, not just at the end of the
+    // run. A case whose steady state still re-uploads its weight every call is
+    // measuring the PCIe bus, not the kernel — and without this line that is
+    // indistinguishable from a slow kernel. (A 49 MiB ArcFace head at ~8 GB/s
+    // is ~6 ms; the GEMM itself is ~0.14 ms. Getting those two confused is the
+    // exact mistake this column exists to prevent.)
+    let before = ctx.cache_counters();
     let start = Instant::now();
     for _ in 0..ITERS {
         if let Err(e) = try_cuda_dispatch(node, weights, intermediates, ctx) {
@@ -114,7 +133,12 @@ fn bench(
         }
     }
     let per_call = start.elapsed().as_secs_f64() * 1000.0 / ITERS as f64;
-    println!("{label:<34} {per_call:>9.3} ms/call");
+    let delta = ctx.cache_counters().since(before);
+    let uploaded_per_call = delta.weight_bytes_uploaded as f64 / ITERS as f64 / 1024.0;
+    println!(
+        "{label:<34} {per_call:>9.3} ms/call   w-hits {:>3} miss {:>3}  {uploaded_per_call:>10.1} KiB/call uploaded",
+        delta.weight_hits, delta.weight_misses,
+    );
 }
 
 /// Keep the device busy for [`DEVICE_SPIN_UP`] so its clocks are up before the
@@ -176,7 +200,7 @@ fn main() {
         let (m, k, n) = (128usize, 512, 512);
         let mut weights = HashMap::new();
         weights.insert(
-            "b".to_string(),
+            "w_square".to_string(),
             Tensor::new(pseudo_random(k * n, 2), vec![k, n]),
         );
         let mut inter = HashMap::new();
@@ -184,7 +208,7 @@ fn main() {
             "a".to_string(),
             Tensor::new(pseudo_random(m * k, 1), vec![m, k]),
         );
-        let node = make_node(OpKind::MatMul, &["a", "b"]);
+        let node = make_node(OpKind::MatMul, &["a", "w_square"]);
         bench("matmul 128x512x512 [w]", &ctx, &node, &weights, &inter);
     }
 
@@ -195,7 +219,7 @@ fn main() {
         let (m, k, n) = (1usize, 25088, 512);
         let mut weights = HashMap::new();
         weights.insert(
-            "b".to_string(),
+            "w_arcface_head".to_string(),
             Tensor::new(pseudo_random(k * n, 3), vec![k, n]),
         );
         let mut inter = HashMap::new();
@@ -203,7 +227,7 @@ fn main() {
             "a".to_string(),
             Tensor::new(pseudo_random(m * k, 4), vec![m, k]),
         );
-        let node = make_node(OpKind::MatMul, &["a", "b"]);
+        let node = make_node(OpKind::MatMul, &["a", "w_arcface_head"]);
         bench(
             "arcface head 1x25088x512 [w]",
             &ctx,
@@ -219,7 +243,7 @@ fn main() {
         let (m, k, n) = (1usize, 512, 2048);
         let mut weights = HashMap::new();
         weights.insert(
-            "b".to_string(),
+            "w_adain".to_string(),
             Tensor::new(pseudo_random(k * n, 5), vec![k, n]),
         );
         let mut inter = HashMap::new();
@@ -227,7 +251,7 @@ fn main() {
             "a".to_string(),
             Tensor::new(pseudo_random(m * k, 6), vec![m, k]),
         );
-        let node = make_node(OpKind::MatMul, &["a", "b"]);
+        let node = make_node(OpKind::MatMul, &["a", "w_adain"]);
         bench(
             "inswapper adain 1x512x2048 [w]",
             &ctx,
@@ -297,7 +321,7 @@ fn main() {
         let (batch, m, k, n) = (8usize, 64usize, 128, 64);
         let mut weights = HashMap::new();
         weights.insert(
-            "b".to_string(),
+            "w_broadcast".to_string(),
             Tensor::new(pseudo_random(k * n, 9), vec![k, n]),
         );
         let mut inter = HashMap::new();
@@ -305,7 +329,7 @@ fn main() {
             "a".to_string(),
             Tensor::new(pseudo_random(batch * m * k, 10), vec![batch, m, k]),
         );
-        let node = make_node(OpKind::MatMul, &["a", "b"]);
+        let node = make_node(OpKind::MatMul, &["a", "w_broadcast"]);
         bench("broadcast batched b=8 [w]", &ctx, &node, &weights, &inter);
     }
 
@@ -418,7 +442,7 @@ fn main() {
         let (m, k, n) = (128usize, 512, 512);
         let mut weights = HashMap::new();
         weights.insert(
-            "b".to_string(),
+            "w_counters".to_string(),
             Tensor::new(pseudo_random(k * n, 2), vec![k, n]),
         );
         let mut inter = HashMap::new();
@@ -426,7 +450,7 @@ fn main() {
             "a".to_string(),
             Tensor::new(pseudo_random(m * k, 1), vec![m, k]),
         );
-        let node = make_node(OpKind::MatMul, &["a", "b"]);
+        let node = make_node(OpKind::MatMul, &["a", "w_counters"]);
         // Warm this exact identity, then measure one further steady-state call.
         let _ = try_cuda_dispatch(&node, &weights, &inter, &ctx);
         let warm = ctx.cache_counters();

@@ -47,6 +47,7 @@ pub mod context;
 pub mod conv;
 pub mod elementwise;
 pub mod error;
+pub mod graph_cache;
 pub mod matmul;
 pub mod reduce;
 pub mod reference;

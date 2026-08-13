@@ -581,12 +581,24 @@ fn interleaved_shapes_through_one_context_do_not_contaminate_each_other() {
 /// * `pool_allocs == 0` — the activation and output buffers came from the
 ///   pool. A steady-state frame that still calls `cuMemAlloc` has a size class
 ///   churning, which the timings would show but nothing would name.
+///
+/// # Pinned to the ordinary launch path, on purpose
+///
+/// The subject here is the *pool and residency* machinery, so this pins
+/// `set_graph_capture(false)` rather than inheriting whatever
+/// `OXIONNX_CUDA_GRAPH` happens to say. A graph-backed dispatch deliberately
+/// does not use the scratch pool at all — it replays against buffers the
+/// recording owns, which is what makes the recorded addresses stable (see
+/// `graph_cache`'s pointer-stability section) — so `pool_hits` is legitimately
+/// zero there. Without the pin, running this suite with graphs on would fail
+/// this test for doing exactly what it is supposed to do.
 #[test]
 fn a_steady_state_dispatch_uploads_no_weight_bytes_and_allocates_nothing() {
     let Some(ctx) = device() else {
         eprintln!("no CUDA device present, skipping a_steady_state_dispatch_uploads_no_weight_bytes_and_allocates_nothing");
         return;
     };
+    ctx.set_graph_capture(false);
     let (batch, m, k, n) = (2usize, 16usize, 24usize, 8usize);
 
     let b = slice_scaled(1, k * n, 0xFACE_B00C_0BAD_F00D);
