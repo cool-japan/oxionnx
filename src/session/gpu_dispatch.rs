@@ -4,7 +4,7 @@ use crate::OnnxError;
 use std::collections::HashMap;
 
 #[cfg(feature = "gpu")]
-use super::gpu_activations::RunActivations;
+use super::gpu_activations::GpuActivations;
 #[cfg(feature = "gpu")]
 use oxionnx_gpu::{DeviceTensor, GpuOutput, OutputPlacement, TensorSource};
 
@@ -615,7 +615,7 @@ fn initializer_key<'a>(
     name: &'a str,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
-    activations: &RunActivations,
+    activations: &GpuActivations,
 ) -> Option<&'a str> {
     if name.is_empty() || intermediates.contains_key(name) || activations.holds_node_output(name) {
         return None;
@@ -744,7 +744,7 @@ impl From<GpuOutput> for DispatchOutcome {
 #[cfg(feature = "gpu")]
 fn node_output_placement(
     node: &Node,
-    activations: &RunActivations,
+    activations: &GpuActivations,
     gpu: &crate::gpu::GpuContext,
 ) -> OutputPlacement {
     let single_output = node.outputs.len() == 1;
@@ -790,7 +790,7 @@ pub(crate) async fn try_gpu_dispatch_async(
     node: &Node,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
-    activations: &RunActivations,
+    activations: &GpuActivations,
     gpu: &crate::gpu::GpuContext,
 ) -> Result<Option<DispatchOutcome>, OnnxError> {
     // [r3a] Residency-aware size gate. See
@@ -851,7 +851,7 @@ fn operand_census(
     node: &Node,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
-    activations: &RunActivations,
+    activations: &GpuActivations,
     gpu: &crate::gpu::GpuContext,
 ) -> OperandCensus {
     let mut census = OperandCensus {
@@ -899,7 +899,7 @@ async fn dispatch_node_async(
     node: &Node,
     weights: &HashMap<String, Tensor>,
     intermediates: &HashMap<String, Tensor>,
-    activations: &RunActivations,
+    activations: &GpuActivations,
     gpu: &crate::gpu::GpuContext,
     placement: OutputPlacement,
 ) -> Result<Option<DispatchOutcome>, OnnxError> {
@@ -1415,29 +1415,42 @@ async fn dispatch_node_async(
                 let trans_a = attrs.i("transA", 0) != 0;
                 let trans_b = attrs.i("transB", 0) != 0;
                 if let Some((m, k, n)) = gemm_gpu_plan(a.shape(), &b.shape, trans_a, trans_b) {
-                    // [r3a] `gpu_gemm_nt` carries no FLOP gate of its own —
-                    // see `GEMM_GPU_MIN_FLOPS`. Without this, InSwapper's 12
-                    // 2.1-MFLOP AdaIN heads all dispatched and ran 3.07x
-                    // slower than the CPU kernel.
-                    let flops = crate::session::gpu_residency::gemm_flops(m, k, n);
-                    if !flops
-                        .is_some_and(|f| f >= crate::session::gpu_residency::GEMM_GPU_MIN_FLOPS)
-                    {
-                        return Ok(None);
-                    }
-                    let alpha = attrs.f("alpha", 1.0);
-                    let beta = attrs.f("beta", 1.0);
                     // `B` and `C` are initializers in every Gemm this engine
                     // dispatches — ArcFace's embedding head alone is a 51.4 MB
                     // `B`. `A` is the activation and is never keyed.
+                    let weight_key = node
+                        .inputs
+                        .get(1)
+                        .and_then(|n| initializer_key(n, weights, intermediates, activations));
                     let keys = crate::gpu::WeightKeys::new(
-                        node.inputs
-                            .get(1)
-                            .and_then(|n| initializer_key(n, weights, intermediates, activations)),
+                        weight_key,
                         node.inputs
                             .get(2)
                             .and_then(|n| initializer_key(n, weights, intermediates, activations)),
                     );
+                    // [r3a] `gpu_gemm_nt` carries no size gate of its own —
+                    // `kernel_support`'s convention puts the placement
+                    // heuristic at the session call site, and this is that
+                    // site. Without it, InSwapper's 12 2.1-MFLOP AdaIN heads
+                    // all dispatched and ran 3.07x slower than the CPU kernel.
+                    //
+                    // The gate is device- *and* shape-aware, and it needs
+                    // `weight_key` to be decided first: a `Gemm` whose `B` is a
+                    // graph initializer binds it from the residency cache on
+                    // every frame after the first, which is a different cost
+                    // model from one that re-uploads `k*n` floats per call. See
+                    // `gpu_residency::gemm_gpu_admits`.
+                    if !crate::session::gpu_residency::gemm_gpu_admits(
+                        gpu,
+                        m,
+                        k,
+                        n,
+                        weight_key.is_some(),
+                    ) {
+                        return Ok(None);
+                    }
+                    let alpha = attrs.f("alpha", 1.0);
+                    let beta = attrs.f("beta", 1.0);
                     if let Some(result) = crate::gpu::gpu_gemm_nt_placed_async(
                         gpu,
                         a,
@@ -1640,7 +1653,7 @@ pub(crate) fn try_gpu_dispatch(
         // host tensors between nodes and always have. An empty plan makes every
         // placement decision come out `Host`, so this path is byte-for-byte the
         // dispatcher it was before residency existed.
-        let activations = RunActivations::default();
+        let activations = GpuActivations::default();
         let outcome = pollster::block_on(try_gpu_dispatch_async(
             node,
             weights,

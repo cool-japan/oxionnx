@@ -9,7 +9,7 @@ documentation.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 readme = "README.md"
-description = "Operator implementations for OxiONNX — 188 ONNX operators in Pure Rust"
+description = "Operator implementations for OxiONNX — 189 ONNX operators in Pure Rust"
 keywords = ["onnx", "operators", "inference", "neural-network", "pure-rust"]
 categories = ["science", "mathematics"]
 

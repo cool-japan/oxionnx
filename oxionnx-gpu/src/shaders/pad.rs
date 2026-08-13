@@ -167,12 +167,12 @@ fn pad_constant(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-pub(crate) fn build_pad_pipeline(
-    device: &wgpu::Device,
+fn build_pad_pipeline(
+    ctx: &GpuContext,
     mode: PadMode,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
     build_pipeline(
-        device,
+        ctx,
         "pad",
         PAD_SHADER,
         mode.entry_point(),
@@ -302,7 +302,7 @@ pub async fn gpu_pad_placed_async(
     let queue = &ctx.queue;
 
     let scope = ErrorScope::begin(ctx);
-    let (pipeline, bgl) = build_pad_pipeline(device, mode);
+    let (pipeline, bgl) = build_pad_pipeline(ctx, mode);
 
     let input_buf = ctx.operand_source("pad_in", data, wgpu::BufferUsages::STORAGE)?;
     let output_buf = ctx.pooled_buffer(

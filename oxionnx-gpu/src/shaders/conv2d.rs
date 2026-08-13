@@ -110,14 +110,13 @@
 //! `compute.rs`.
 
 use crate::context::activation::{GpuOutput, OutputPlacement, TensorSource};
+use crate::context::pipeline_cache::PipelineLookup;
 use crate::context::{GpuContext, WeightFormat, WeightKeys};
 use crate::device_guard::{block_on_gpu, checked_storage_bytes, finish_output_async};
 use crate::device_guard::{ErrorScope, GpuLimits};
 use oxionnx_core::Tensor;
 
-use super::kernel_support::{
-    bgl_ro, bgl_rw, bgl_uniform, build_pipeline, insert_for_current_device,
-};
+use super::kernel_support::{bgl_ro, bgl_rw, bgl_uniform, build_pipeline};
 
 /// Output rows (channels) and columns (pixels) owned by one workgroup.
 ///
@@ -576,121 +575,48 @@ fn conv2d_implicit(
 }
 "#;
 
-/// Build this kernel's shader module, bind group layout and pipeline.
-pub(crate) fn build_conv2d_pipeline(
-    device: &wgpu::Device,
-) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-    build_pipeline(
-        device,
-        "conv2d_implicit",
-        CONV2D_SHADER,
-        "conv2d_implicit",
-        &[bgl_ro(0), bgl_ro(1), bgl_ro(2), bgl_rw(3), bgl_uniform(4)],
-    )
+/// The bind group layout every variant of this kernel uses: input, weight,
+/// bias, output, params.
+///
+/// A function rather than a `const` because the `bgl_*` helpers are functions;
+/// it is called only when a pipeline is actually compiled, which is once per
+/// context per variant.
+fn conv2d_bgl_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
+    [bgl_ro(0), bgl_ro(1), bgl_ro(2), bgl_rw(3), bgl_uniform(4)]
 }
+
+/// This kernel's shader module label, which is also its `@compute` entry point.
+const CONV2D_LABEL: &str = "conv2d_implicit";
+
+/// [w2-f16] The half-precision variant's label.
+///
+/// A *different* label from the `f32` one, which is what keeps the two apart in
+/// `GpuContext`'s pipeline cache: they are compiled from different sources and
+/// read the weight binding at different widths, so sharing a slot would not be
+/// slow — it would reinterpret pairs of halves as single floats. They share the
+/// entry point name, so the label is the whole distinction.
+const CONV2D_F16_LABEL: &str = "conv2d_implicit_f16";
 
 // ========================================================================
 // Pipeline cache
 // ========================================================================
 
-/// Thread-local one-entry cache of the compiled conv pipeline.
+/// The compiled `f32` pipeline for `ctx`, building and caching it on first use.
 ///
-/// The kernels in this directory otherwise rebuild their pipeline per call
-/// (see [`kernel_support`](super::kernel_support)), which is fine for a kernel
-/// that runs once. This one runs 20 times per InSwapper frame and 53 times per
-/// ArcFace frame, and a WGSL compile is milliseconds — the same order as the
-/// dispatch it is preparing. Caching it here rather than on `GpuContext` keeps
-/// the change inside this file; the eventual hoist into
-/// `GpuContext::build_from_device_queue` is a call-site move, exactly as
-/// `kernel_support` describes.
-///
-/// * **Thread-local, not `static`** — `wgpu::Device` is neither `Send` nor
-///   `Sync` on wasm32, so a `static Mutex<_>` would not compile there. Native
-///   worker threads each keep their own copy, which costs one extra compile
-///   per thread and nothing else.
-/// * **The `Device` is stored, not just compared** — `wgpu`'s handle equality
-///   is `Arc` identity, so holding the handle is what guarantees a later,
-///   different device cannot compare equal by reusing a freed slot. It also
-///   means every entry keeps its device alive, which is why insertion goes
-///   through [`insert_for_current_device`]: it drops the other devices'
-///   entries first, so a session that drops its `GpuContext` really does
-///   release the device rather than leaving it pinned until the thread exits.
-///   The `f32`/`f16` pair for the *current* device survives, because the
-///   predicate tests the device alone.
-///
-/// [w2-f16] `f16` is part of the identity, not a property of the entry: a
-/// context that flips the toggle must never be handed the other variant's
-/// pipeline. The two are compiled from different sources and read the weight
-/// binding at different widths, so sharing a slot would not be slow — it would
-/// reinterpret pairs of halves as single floats.
-struct CachedPipeline {
-    device: wgpu::Device,
-    f16: bool,
-    pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
-}
-
-thread_local! {
-    /// At most one entry per `(device, f16)`. A `Vec` rather than two `Option`s
-    /// so the lookup reads the same for both and adding a third variant later
-    /// is not a restructure; it holds two entries at most in practice.
-    static CONV2D_PIPELINE: std::cell::RefCell<Vec<CachedPipeline>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-
-    /// Devices on which the `f16` pipeline failed to compile.
-    ///
-    /// A negative cache, and it is load-bearing. Compiling a shader the driver
-    /// rejects raises a validation error, and the dispatch's own `ErrorScope`
-    /// would turn that into `mark_degraded` — killing the whole session's GPU
-    /// path over an *optional* fast path. So the first `f16` compile on a
-    /// device happens inside its own scope (see [`conv2d_pipeline_f16_async`]),
-    /// and a failure is remembered here so it is never retried and never
-    /// escalated: the kernel simply keeps taking the `f32` path.
-    ///
-    /// The entries are device handles, so they are inserted through
-    /// [`insert_for_current_device`] for the same lifetime reason as the
-    /// pipeline cache above: remembering a verdict must not pin the device it
-    /// was reached on.
-    static CONV2D_F16_UNAVAILABLE: std::cell::RefCell<Vec<wgpu::Device>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// The compiled `f32` pipeline for `device`, building and caching it on first
-/// use.
-fn conv2d_pipeline(device: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-    cached_pipeline(device, false, || build_conv2d_pipeline(device))
-}
-
-/// Look `(device, f16)` up in the thread-local cache, building with `build` on
-/// a miss.
-fn cached_pipeline(
-    device: &wgpu::Device,
-    f16: bool,
-    build: impl FnOnce() -> (wgpu::ComputePipeline, wgpu::BindGroupLayout),
-) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-    let hit = CONV2D_PIPELINE.with(|cell| {
-        cell.borrow()
-            .iter()
-            .find(|c| c.f16 == f16 && &c.device == device)
-            .map(|c| (c.pipeline.clone(), c.layout.clone()))
-    });
-    if let Some(found) = hit {
-        return found;
-    }
-    let (pipeline, layout) = build();
-    CONV2D_PIPELINE.with(|cell| {
-        insert_for_current_device(
-            &mut cell.borrow_mut(),
-            |c| &c.device == device,
-            CachedPipeline {
-                device: device.clone(),
-                f16,
-                pipeline: pipeline.clone(),
-                layout: layout.clone(),
-            },
-        );
-    });
-    (pipeline, layout)
+/// This kernel runs 20 times per InSwapper frame and 53 times per ArcFace
+/// frame, and a WGSL compile is milliseconds — the same order as the dispatch it
+/// is preparing — so the memo is not an optimization, it is the difference
+/// between the kernel being worth dispatching and not. It lives on the
+/// `GpuContext`; see `crate::context::pipeline_cache` for why it must, and for
+/// the second-session crash that keying it on the device handle produced.
+fn conv2d_pipeline(ctx: &GpuContext) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    build_pipeline(
+        ctx,
+        CONV2D_LABEL,
+        CONV2D_SHADER,
+        CONV2D_LABEL,
+        &conv2d_bgl_entries(),
+    )
 }
 
 /// The compiled `f16` pipeline for this context, or `None` when half precision
@@ -698,8 +624,8 @@ fn cached_pipeline(
 ///
 /// `None` for any of: the toggle is off or the device lacks `SHADER_F16`; the
 /// `f32` source has drifted from the derivation's anchors
-/// (`super::f16_variant`); or this device already failed to compile the
-/// variant once.
+/// (`super::f16_variant`); or this context's device already failed to compile
+/// the variant once.
 ///
 /// # Why the first compile gets its own error scope
 ///
@@ -711,47 +637,50 @@ fn cached_pipeline(
 /// is opened, and popping this scope ourselves keeps an `f16` rejection what it
 /// actually is: this kernel has no half-precision variant on this device, so it
 /// uses the `f32` one.
+///
+/// A refusal is remembered as a `Rejected` slot in the same cache the compiled
+/// pipelines live in, so it is never retried and never escalated. That verdict
+/// is per *context*, which is the only scope it is true at: it is a statement
+/// about one device, and this crate builds one `wgpu::Instance` per context, so
+/// nothing about it may leak to the next one.
 async fn conv2d_pipeline_f16_async(
     ctx: &GpuContext,
 ) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
     if !ctx.f16_compute_enabled() {
         return None;
     }
-    let device = &ctx.device;
-    let known_bad = CONV2D_F16_UNAVAILABLE.with(|cell| cell.borrow().iter().any(|d| d == device));
-    if known_bad {
-        return None;
-    }
-    if let Some(found) = CONV2D_PIPELINE.with(|cell| {
-        cell.borrow()
-            .iter()
-            .find(|c| c.f16 && &c.device == device)
-            .map(|c| (c.pipeline.clone(), c.layout.clone()))
-    }) {
-        return Some(found);
-    }
+    // Memoized behind a `OnceLock` (see `super::f16_variant`), so deriving it
+    // before the cache lookup costs a load, and the lookup needs it as part of
+    // the key.
     let src = super::f16_variant::conv2d_f16(CONV2D_SHADER)?;
+    match ctx.pipelines().lookup(CONV2D_F16_LABEL, CONV2D_LABEL, src) {
+        PipelineLookup::Ready(pipeline, layout) => return Some((pipeline, layout)),
+        PipelineLookup::Rejected => return None,
+        PipelineLookup::Absent => {}
+    }
 
     // This crate's scopes are a per-thread LIFO stack: this one is pushed and
     // popped entirely before the caller opens the dispatch's scope, so the
     // ordering contract in `device_guard::ErrorScope` is preserved.
+    let device = &ctx.device;
     let guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let built = build_pipeline(
+    let built = crate::context::pipeline_cache::compile(
         device,
-        "conv2d_implicit_f16",
+        CONV2D_F16_LABEL,
         src,
-        "conv2d_implicit",
-        &[bgl_ro(0), bgl_ro(1), bgl_ro(2), bgl_rw(3), bgl_uniform(4)],
+        CONV2D_LABEL,
+        &conv2d_bgl_entries(),
     );
     if guard.pop().await.is_some() {
         // Deliberately not `ctx.mark_degraded`: an optional shader extension
         // this device will not compile is a decline, not a dead device.
-        CONV2D_F16_UNAVAILABLE.with(|cell| {
-            insert_for_current_device(&mut cell.borrow_mut(), |d| d == device, device.clone());
-        });
+        ctx.pipelines()
+            .insert_rejected(CONV2D_F16_LABEL, CONV2D_LABEL, src);
         return None;
     }
-    Some(cached_pipeline(device, true, || built))
+    ctx.pipelines()
+        .insert_ready(CONV2D_F16_LABEL, CONV2D_LABEL, src, &built);
+    Some(built)
 }
 
 // ========================================================================
@@ -1090,7 +1019,7 @@ pub async fn gpu_conv2d_implicit_placed_async(
     let scope = ErrorScope::begin(ctx);
     let (pipeline, bgl) = match f16_pipeline {
         Some(pair) => pair,
-        None => conv2d_pipeline(device),
+        None => conv2d_pipeline(ctx),
     };
 
     let in_len = plan.n * plan.c_in * plan.h * plan.w;

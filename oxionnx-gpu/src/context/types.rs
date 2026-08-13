@@ -10,8 +10,11 @@ use super::functions::{
     ELEMENTWISE_SHADER, LAYER_NORM_SHADER, MATMUL_SHADER, REDUCE_SHADER, SOFTMAX_SHADER,
     TILED_MATMUL_SHADER, TRANSPOSE_SHADER,
 };
+use super::init_error::{GpuInitDiagnostic, GpuInitError};
+use super::pipeline_cache::PipelineCache;
 use super::resident::{Lookup, OperandBuffer, ResidentBuffers, ResidentCounters};
 use super::tracker_pool::{GpuBufferPool, DEFAULT_POOL_BYTE_BUDGET};
+use super::tuning::{GpuPerfClass, GpuTuning};
 use super::weight_format::{F16Compute, WeightBytes, WeightFormat};
 use crate::device_guard::GpuLimits;
 
@@ -88,6 +91,20 @@ pub struct GpuContext {
     /// half-precision path, and whether this device can at all. Off by default
     /// — see [`Self::set_f16_compute`].
     f16_compute: F16Compute,
+    /// The size and shape floors every kernel in this crate declines below,
+    /// derived once from this adapter's own [`wgpu::AdapterInfo`]. See
+    /// [`super::tuning`] for why these are not compile-time constants.
+    tuning: GpuTuning,
+    /// \[w5\] Compute pipelines this context's device has compiled, for the
+    /// kernels that build their own rather than taking one of the fields above.
+    ///
+    /// A field rather than a thread-local keyed on `self.device`, because
+    /// `wgpu::Device` equality is a per-`Instance` id and this crate creates one
+    /// `Instance` per context — so two contexts' devices compare *equal* and a
+    /// device-keyed cache serves the second one the first's pipelines. See
+    /// [`super::pipeline_cache`] for the crash that produced and why no key can
+    /// fix it.
+    pipelines: PipelineCache,
 }
 
 impl GpuContext {
@@ -158,8 +175,39 @@ impl GpuContext {
         }
     }
 
+    /// Async GPU context creation that **explains** its failure.
+    ///
+    /// [`Self::try_new_async`] is this with the explanation discarded. Prefer
+    /// this one anywhere the answer reaches a human: the most common reason a
+    /// Linux server with a perfectly good GPU produces `None` is a missing
+    /// Vulkan loader package, and that is not something an operator can guess
+    /// from a bare `None`. See [`crate::context::init_error`].
+    pub async fn try_new_diagnosed_async() -> Result<Self, GpuInitError> {
+        Self::acquire_device_diagnosed().await
+    }
+
+    /// Blocking form of [`Self::try_new_diagnosed_async`].
+    ///
+    /// Returns [`GpuInitError::BlockingUnavailable`] on wasm32, for the same
+    /// reason [`Self::try_new`] returns `None` there.
+    pub fn try_new_diagnosed() -> Result<Self, GpuInitError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on(Self::try_new_diagnosed_async())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Err(GpuInitError::BlockingUnavailable)
+        }
+    }
+
     /// Request an adapter and device, then build the context.
     async fn acquire_device() -> Option<Self> {
+        Self::acquire_device_diagnosed().await.ok()
+    }
+
+    /// The real constructor — see [`Self::try_new_diagnosed_async`].
+    async fn acquire_device_diagnosed() -> Result<Self, GpuInitError> {
         let backends = Self::requested_backends();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
@@ -169,14 +217,28 @@ impl GpuContext {
             display: None,
         });
 
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
             .await
-            .ok()?;
+        {
+            Ok(adapter) => adapter,
+            Err(_) => {
+                // Nothing on the requested backends. Before answering "no GPU",
+                // ask every *other* backend whether it can see one: a GPU that
+                // OpenGL reports and Vulkan does not is a missing Vulkan
+                // loader, not missing hardware, and that distinction is the
+                // difference between "install one package" and "get a
+                // different machine". Only reached on the failure path.
+                return Err(GpuInitError::NoAdapter {
+                    backends: format!("{backends:?}"),
+                    diagnostic: GpuInitDiagnostic::probe(backends).await,
+                });
+            }
+        };
 
         // [w2-f16] Ask for half-precision shader support *only where the adapter
         // already reports it*. Intersecting rather than naming the feature
@@ -228,9 +290,20 @@ impl GpuContext {
                 break;
             }
         }
-        let (device, queue) = device_queue?;
+        let info = adapter.get_info();
+        let Some((device, queue)) = device_queue else {
+            return Err(GpuInitError::NoDevice {
+                adapter: format!("{} ({:?})", info.name, info.backend),
+            });
+        };
 
-        Self::build_from_device_queue(device, queue)
+        let mut ctx =
+            Self::build_from_device_queue(device, queue).ok_or(GpuInitError::PipelineBuild)?;
+        // The adapter's own classification, which `build_from_device_queue`
+        // cannot know: it is `pub` and takes an already-acquired device, with no
+        // `AdapterInfo` attached. See `super::tuning` for what it selects.
+        ctx.set_tuning(GpuTuning::from_adapter_info(&info));
+        Ok(ctx)
     }
 
     /// True once the device has reported an unrecoverable error.
@@ -790,7 +863,64 @@ impl GpuContext {
             // The device's own feature set is the only answer correct for every
             // entry path.
             f16_compute: F16Compute::new(device_features.contains(wgpu::Features::SHADER_F16)),
+            // No `AdapterInfo` reaches this constructor — it is `pub` and takes
+            // an already-acquired device/queue pair — so the caller's device
+            // gets the `Unknown` class. `acquire_device` overwrites this with
+            // the real classification immediately afterwards, and any other
+            // caller can do the same through `set_tuning`.
+            tuning: GpuTuning::default(),
+            // [w5] Empty: the kernels that build their own pipelines fill it on
+            // first dispatch. It belongs to this context and dies with it.
+            pipelines: PipelineCache::default(),
         })
+    }
+
+    /// \[w5\] The pipelines this context's device has compiled.
+    ///
+    /// The kernels in `crate::shaders` that construct their own pipeline — the
+    /// standalone batch described in `shaders::kernel_support`, plus `conv2d`
+    /// and `gemm` — memoize through here instead of through a thread-local, so
+    /// a compiled pipeline can never outlive, or be found by, a device other
+    /// than the one that built it. See [`super::pipeline_cache`].
+    #[inline]
+    pub(crate) fn pipelines(&self) -> &PipelineCache {
+        &self.pipelines
+    }
+
+    /// The size and shape floors this context's kernels decline below.
+    ///
+    /// Every `gpu_*` entry point reads its threshold from here rather than from
+    /// a compile-time constant; see [`super::tuning`] for what each field means
+    /// and how the numbers were arrived at.
+    #[inline]
+    #[must_use]
+    pub fn tuning(&self) -> &GpuTuning {
+        &self.tuning
+    }
+
+    /// Which performance class this context's adapter was classified as.
+    #[inline]
+    #[must_use]
+    pub fn perf_class(&self) -> GpuPerfClass {
+        self.tuning.class
+    }
+
+    /// Replace this context's dispatch thresholds wholesale.
+    ///
+    /// Two callers are expected, and no others:
+    ///
+    /// * an embedder that has measured its own target and wants to say so, and
+    /// * a *kernel* test, which wants the numerics of one shader exercised at a
+    ///   size a real workload would decline. Installing [`GpuTuning::PARITY`]
+    ///   separates "does this kernel compute the right values" from "is this
+    ///   dispatch worth making", which is the whole reason the second question
+    ///   moved out of the shader modules and into [`GpuTuning`].
+    ///
+    /// `&mut self` deliberately: the thresholds are read on every dispatch, so
+    /// they must stay a plain field rather than becoming a lock or an atomic.
+    /// Configure the context before sharing it.
+    pub fn set_tuning(&mut self, tuning: GpuTuning) {
+        self.tuning = tuning;
     }
 }
 
@@ -1018,6 +1148,46 @@ impl GpuContext {
     pub fn pooled_gpu_bytes(&self) -> u64 {
         self.pool.lock().map_or(0, |pool| pool.pooled_bytes())
     }
+
+    /// \[w4\] Idle buffers the pool is holding, and the count bound it is holding
+    /// them under.
+    ///
+    /// The pair matters more than either number: with activation recycling a
+    /// graph that returns more buffers per frame than it requests walks the
+    /// pool up to its retention bound and is then held there by LRU eviction,
+    /// so "is this a steady state or a leak" is answered by whether the count
+    /// has reached the bound — not by whether it stopped moving.
+    #[must_use]
+    pub fn pooled_buffers(&self) -> (usize, usize) {
+        self.pool
+            .lock()
+            .map_or((0, 0), |pool| (pool.available_count(), pool.max_buffers()))
+    }
+
+    /// \[w4\] The pool's byte retention bound — the other half of
+    /// [`Self::pooled_buffers`]'s count bound.
+    #[must_use]
+    pub fn pool_byte_budget(&self) -> u64 {
+        self.pool.lock().map_or(0, |pool| pool.byte_budget())
+    }
+
+    /// \[w4\] Buffer requests the pool has served from an idle entry, cumulative.
+    ///
+    /// With [`Self::pool_allocations`] this is the whole account of what a
+    /// change in activation disposition does to allocation churn: the request
+    /// count is their sum and is a property of the graph, so only the split
+    /// between them can move.
+    #[must_use]
+    pub fn pool_reuses(&self) -> u64 {
+        self.pool.lock().map_or(0, |pool| pool.reuses())
+    }
+
+    /// \[w4\] Buffer requests the pool has had to ask the driver for, cumulative.
+    /// See [`Self::pool_reuses`].
+    #[must_use]
+    pub fn pool_allocations(&self) -> u64 {
+        self.pool.lock().map_or(0, |pool| pool.allocations())
+    }
 }
 
 // ========================================================================
@@ -1176,11 +1346,21 @@ impl GpuContext {
     /// Hand a finished activation's allocation back to the reusable-buffer pool
     /// instead of destroying it.
     ///
-    /// Not what the run loop does at an activation's last consumer — it *drops*
-    /// the value there, so the bytes leave the budget immediately and a run
-    /// ends with the live total back at its resident-weight baseline. This
-    /// exists for a caller that would rather trade that property for cheaper
-    /// allocation on the next frame.
+    /// \[w4\] This is what the session's run loop does at an activation's last
+    /// consumer (`session::gpu_activations`'s `RunActivations::dispose`, which
+    /// carries the A/B that chose it): measured against destroying, it is
+    /// 2% faster on InSwapper-128 and 11–28% faster on a chain of small
+    /// activations, byte-identical in 200 of 200 measured pairs.
+    ///
+    /// The bytes stay in [`Self::live_gpu_bytes`] until the pool evicts them,
+    /// so a caller asserting "a finished run is back at its resident-weight
+    /// baseline" must clear or reclaim the pool first. Nothing is stranded by
+    /// that: [`Self::pooled_gpu_bytes`] is reclaimed before any allocation is
+    /// declined, so a pooled buffer can never be the reason a node falls back
+    /// to the CPU.
+    ///
+    /// A poisoned pool mutex costs the recycling and nothing else — the tensor
+    /// is destroyed, exactly as it was before this became the default.
     pub fn recycle_device_tensor(&self, tensor: DeviceTensor) {
         if let Ok(mut pool) = self.pool.lock() {
             pool.return_buffer(tensor.into_buffer());
@@ -1440,5 +1620,18 @@ impl Drop for GpuContext {
         // alive, rather than leaving it to field drop glue that runs after this
         // function returns.
         self.resident.clear();
+        // [w5] And the compiled pipelines, for the ordering rather than the
+        // release: a `ComputePipeline` holds its own handle on the device, and
+        // `device` is declared before `pipelines`, so drop glue would destroy
+        // this context's device handle first and its pipelines afterwards.
+        //
+        // The thread-local caches this replaced needed a purge here for a
+        // different, worse reason: their entries kept a device alive across
+        // contexts, the purge could only ever reach the dropping thread's own
+        // copy, and — because they identified a device by a handle comparison
+        // that is really a per-`Instance` id — it could not reliably tell this
+        // context's entries from the next context's in the first place. See
+        // `super::pipeline_cache`.
+        self.pipelines.clear();
     }
 }

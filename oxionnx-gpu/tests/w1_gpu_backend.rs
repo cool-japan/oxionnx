@@ -28,8 +28,25 @@ const OVER_ONE_DIM_LEN: usize = 65_536 * 256; // 16_777_216
 /// Largest element count that still fits in a one-dimensional dispatch.
 const MAX_ONE_DIM_LEN: usize = 65_535 * 256; // 16_776_960
 
+/// A context whose *placement* floors are lifted (`GpuTuning::PARITY`).
+///
+/// Every correctness guard stays: device limits, the live-byte budget, dispatch
+/// planning, the degraded flag. Only the "is this dispatch worth making at all"
+/// size floors are zeroed.
+///
+/// This is load-bearing rather than cosmetic. Those floors are now measured and
+/// adapter-derived (`oxionnx_gpu::context::tuning`), and on a native discrete
+/// GPU the memory-bound kernels decline at *every* transferring size while the
+/// reduction and transpose floors sit in the millions of elements. The shapes in
+/// this file are deliberately small — they exist to pin index arithmetic,
+/// dispatch-grid splitting and attribute validation, not throughput — so on a
+/// real context every one of them would take its `else {{ return }}` and report
+/// green while verifying nothing. The floors themselves are covered by
+/// `p1_dispatch_gating.rs` and `w3_gpu_kernel_parity.rs`.
 fn context() -> Option<GpuContext> {
-    GpuContext::try_new()
+    let mut ctx = GpuContext::try_new()?;
+    ctx.set_tuning(oxionnx_gpu::GpuTuning::PARITY);
+    Some(ctx)
 }
 
 /// A context whose per-dimension workgroup limit has been lowered so the
@@ -390,9 +407,8 @@ fn forced_split_transpose_covers_every_element() {
     // against a limit of 64 gives a 64 x 4 grid.
     let (rows, cols) = (200usize, 256usize);
     let data: Vec<f32> = (0..rows * cols).map(pattern).collect();
-    let Some(result) = gpu_transpose(&ctx, &data, &[rows, cols], &[1, 0]) else {
-        return;
-    };
+    let result = gpu_transpose(&ctx, &data, &[rows, cols], &[1, 0])
+        .expect("PARITY tuning lifts the size floor; the 2-D grid split must be exercised");
     assert_eq!(result.len(), rows * cols);
     for i in 0..rows {
         for j in 0..cols {
@@ -413,16 +429,14 @@ fn forced_split_reduction_covers_every_output() {
     // out_count = 60_000 (over REDUCE_GPU_THRESHOLD) needs 235 workgroups.
     let rows = 60_000usize;
     let data: Vec<f32> = (0..rows * 3).map(pattern).collect();
-    let Some(result) = gpu_reduce_sum(&ctx, &data, 1, &[rows, 3]) else {
-        return;
-    };
+    let result = gpu_reduce_sum(&ctx, &data, 1, &[rows, 3])
+        .expect("PARITY tuning lifts the size floor; the 2-D grid split must be exercised");
     assert_eq!(result.len(), rows);
     let expected: Vec<f32> = data.chunks_exact(3).map(|c| c[0] + c[1] + c[2]).collect();
     assert_close(&result, &expected, 1e-6, "reduce_sum forced 2-D grid");
 
-    let Some(mean) = gpu_reduce_mean(&ctx, &data, &[rows, 3], &[1], false) else {
-        return;
-    };
+    let mean = gpu_reduce_mean(&ctx, &data, &[rows, 3], &[1], false)
+        .expect("PARITY tuning lifts the size floor; the 2-D grid split must be exercised");
     let expected_mean: Vec<f32> = expected.iter().map(|&s| s / 3.0).collect();
     assert_close(&mean, &expected_mean, 1e-6, "reduce_mean forced 2-D grid");
 }
@@ -442,7 +456,7 @@ fn forced_split_batch_norm_covers_every_element() {
     let var = [1.0f32, 2.0];
     let eps = 1e-5f32;
     let Some(result) = gpu_batch_norm(&ctx, &data, &shape, &scale, &bias, &mean, &var, eps) else {
-        return;
+        panic!("PARITY tuning lifts the size floor; the 2-D grid split must be exercised");
     };
     let spatial = 50 * 50;
     let expected: Vec<f32> = (0..total)
@@ -578,7 +592,11 @@ fn dispatch_declines_when_even_a_two_dimensional_grid_is_too_small() {
 
 #[test]
 fn transpose_declines_a_malformed_perm_instead_of_panicking() {
-    let Some(ctx) = context() else { return };
+    // PARITY, so every `is_none()` below is the perm check answering rather
+    // than the size floor short-circuiting ahead of it.
+    let Some(ctx) = context() else {
+        return;
+    };
 
     // [250, 256] = 64_000 elements, comfortably over TRANSPOSE_GPU_THRESHOLD.
     let (rows, cols) = (250usize, 256usize);

@@ -93,6 +93,23 @@ use std::collections::HashMap;
 /// 2.1 MFLOP each, so all 12 now decline (they were 3.07x slower on the GPU).
 /// ArcFace's head is `[1,25088] x [512,25088]^T` = 25.7 MFLOP and still
 /// dispatches.
+///
+/// # Superseded as the *gate*, kept as the number
+///
+/// [`gemm_gpu_admits`] is what the `Gemm` arm now calls, and it asks the
+/// context's [`oxionnx_gpu::GpuTuning`] instead of comparing against this
+/// constant, for two reasons this constant cannot express:
+///
+/// * the right floor depends on the adapter (a software rasterizer must never
+///   dispatch; a discrete part must amortize a real bus crossing), and
+/// * the right floor depends on the *shape*, not only the total — a
+///   `[1, 25088] x [25088, 512]` GEMM clears any FLOP threshold and still
+///   loses, because it moves a 51.4 MB `B` to do 25.7 MFLOP of work.
+///
+/// The value here is preserved verbatim as
+/// [`oxionnx_gpu::GpuTuning::gemm_min_mac_cached`] (halved, because that field
+/// counts multiply-accumulates where this one counts FLOPs), so the `Gemm`
+/// arm's behaviour on a cached weight is unchanged.
 pub const GEMM_GPU_MIN_FLOPS: u64 = 10_000_000;
 
 /// `2 * m * k * n`, or `None` on overflow. See [`GEMM_GPU_MIN_FLOPS`].
@@ -102,6 +119,50 @@ pub fn gemm_flops(m: usize, k: usize, n: usize) -> Option<u64> {
         .checked_mul(k as u64)?
         .checked_mul(n as u64)?
         .checked_mul(2)
+}
+
+/// Whether a `Gemm` node of this shape is worth dispatching on `gpu`.
+///
+/// The device- and shape-aware replacement for the bare
+/// `gemm_flops(..) >= GEMM_GPU_MIN_FLOPS` comparison the `Gemm` arm used to
+/// make. Two things it knows that a constant cannot:
+///
+/// * **The adapter.** `oxionnx_gpu::GpuTuning` is derived from the adapter's
+///   own `AdapterInfo` at context creation, so a `lavapipe`/WARP software
+///   adapter — a real possibility on a headless container or a Windows box
+///   without a GPU driver — declines every size instead of running the model
+///   through a shader interpreter on the same CPU the fallback would use.
+/// * **Whether `B` crosses the bus.** `weight_is_cacheable` is
+///   `initializer_key(B).is_some()`: a `Gemm` whose `B` is a graph initializer
+///   uploads it at most once for the life of the session and binds it from the
+///   residency cache on every frame after, which is a different cost model from
+///   one that re-uploads `k*n` floats per call. Measured on an RTX A4000,
+///   ArcFace's `[1,25088] x [512,25088]^T` head runs at **0.43x** the CPU kernel
+///   with a cached `B` and **1.54x** — a loss — with an uploaded one. The gate
+///   has to know which it is, or it must be wrong for one of them.
+///
+/// # Why "cacheable", not "cached"
+///
+/// This deliberately asks whether the operand *has* a cache identity, not
+/// whether it is resident at this instant. Gating on the latter would decline
+/// the very first dispatch — the one that would have populated the cache — and
+/// so decline every dispatch forever. The first frame pays one upload; every
+/// frame after it pays none, and a video pipeline runs hundreds.
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn gemm_gpu_admits(
+    gpu: &crate::gpu::GpuContext,
+    m: usize,
+    k: usize,
+    n: usize,
+    weight_is_cacheable: bool,
+) -> bool {
+    let traffic = if weight_is_cacheable {
+        crate::gpu::GemmWeightTraffic::Cached
+    } else {
+        crate::gpu::GemmWeightTraffic::PerDispatch
+    };
+    gpu.tuning().gemm_admits(m, k, n, traffic)
 }
 
 /// Operand-element floor for a memory-bound op under

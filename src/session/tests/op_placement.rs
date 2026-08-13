@@ -81,10 +81,16 @@ fn test_op_placement_auto_threshold() {
         "with no accelerator compiled in, Auto can only ever offer Cpu"
     );
 
-    // Non-GPU-capable op above threshold → still CPU: no backend, of any
-    // kind, implements Reshape as an accelerated kernel.
-    let reshape = decide_placement(&OpKind::Reshape, 2048, &placement);
-    assert_eq!(reshape, ProviderKind::Cpu);
+    // Non-GPU-capable op above threshold → still CPU. Exemplars derived, not
+    // named: `Reshape` was hard-coded here until oxionnx-cuda grew a kernel
+    // for it. See `execution_providers::ops_no_backend_implements`.
+    for op in crate::execution_providers::ops_no_backend_implements() {
+        assert_eq!(
+            decide_placement(&op, 2048, &placement),
+            ProviderKind::Cpu,
+            "{op:?}: no backend, of any kind, implements it as an accelerated kernel",
+        );
+    }
 }
 
 #[test]

@@ -6,33 +6,18 @@ use crate::device_guard::{
 use oxionnx_core::Tensor;
 use wgpu;
 
-/// Minimum number of FLOPs (M*K*N) before we bother using the GPU.
-/// Below this threshold, CPU is faster due to GPU dispatch overhead.
-/// GPU is only beneficial for very large GEMMs where compute dominates over
-/// CPU-to-GPU transfer overhead.  10M is a conservative threshold.
-///
-/// `u64`, not `usize`, and that is load-bearing: `usize` is **32 bits** on
-/// wasm32, so a `usize` product overflowed for every GEMM at or above
-/// `M*K*N == 2^32` — a 2048³ multiply, 8.6 GFLOP, is 2× past it. The
-/// `checked_mul` that guards the product then returned `None` and the kernel
-/// *declined*, so in a browser the GPU silently refused exactly the multiplies
-/// it exists for while happily taking the small ones. Measured in Chrome
-/// (Apple/metal-3): 1024³ dispatched in 7.7 ms, 2048³ declined in 0.0 ms with
-/// no device error, which is what put this on the record.
-///
-/// The operand *sizes* below stay `usize` on purpose — those are real
-/// allocations, and a length that does not fit `usize` cannot be indexed on
-/// this target anyway. Only the FLOP count, which is a pure comparison and
-/// never an index, is widened.
-const GPU_THRESHOLD: u64 = 10_000_000;
-
-/// FLOP count of an `[m, k] x [k, n]` GEMM, or `None` if it overflows `u64`.
-///
-/// See [`GPU_THRESHOLD`] for why this is not `usize` arithmetic.
-#[inline]
-fn gemm_flops(m: usize, k: usize, n: usize) -> Option<u64> {
-    (m as u64).checked_mul(k as u64)?.checked_mul(n as u64)
-}
+// The minimum problem size a GEMM must reach before this crate will dispatch
+// it — once a flat `GPU_THRESHOLD: u64 = 10_000_000` here — now lives on the
+// context as `GpuTuning::gemm_min_mac`, alongside the *shape* rule that a FLOP
+// count alone cannot express. See `crate::context::tuning` for the measured
+// table behind both, and why a skinny `[1, 25088] × [25088, 512]` — 12.8 M
+// multiply-accumulates, comfortably past any flat threshold — is 1.54x slower
+// on this GPU than the CPU kernel it displaces.
+//
+// `GpuTuning::gemm_mac` is the widened (`u64`, not `usize`) product this file
+// used to compute inline; the widening is load-bearing on wasm32 and is
+// documented there.
+use crate::context::tuning::GemmWeightTraffic;
 
 /// Minimum dimension size for tiled matmul (shared-memory tiles are 16x16).
 const TILED_MIN_DIM: usize = 32;
@@ -113,7 +98,22 @@ fn gemm_buffer_sizes(
 /// Automatically selects tiled (shared memory) kernel for large matrices
 /// and falls back to basic kernel for smaller ones.
 ///
-/// Returns `None` if the problem is too small for GPU (caller should use CPU).
+/// Returns `None` if the problem is too small **or the wrong shape** for the
+/// GPU (caller should use CPU).
+///
+/// # Both operands upload on every call
+///
+/// This entry point takes two host slices and has nowhere to cache either, so
+/// its gate is [`GemmWeightTraffic::PerDispatch`] — the strict one, including
+/// the arithmetic-intensity rule that declines skinny problems whatever their
+/// total size. That is not a limitation of the gate but a description of this
+/// function: a `[1, 25088] × [25088, 512]` call moves a 51.4 MB `B` across the
+/// bus to perform 25.7 MFLOP, and measured 1.54x slower than
+/// `oxionnx_ops::math::matmul` on an RTX A4000 for exactly that reason.
+///
+/// The same shape through [`crate::gpu_gemm_nt_resident_async`], whose `B` has
+/// a cache identity, measured **0.43x** — the fix for a skinny GEMM is
+/// residency, not a lower threshold. See [`crate::context::tuning`].
 pub async fn gpu_matmul_async(
     ctx: &GpuContext,
     a: &[f32],
@@ -122,9 +122,10 @@ pub async fn gpu_matmul_async(
     k: usize,
     n: usize,
 ) -> Option<Vec<f32>> {
-    // Skip GPU for small matrices — overhead not worth it. A shape whose FLOP
-    // count overflows even `u64` is nonsensical, not "big enough for the GPU".
-    if gemm_flops(m, k, n)? < GPU_THRESHOLD {
+    if !ctx
+        .tuning()
+        .gemm_admits(m, k, n, GemmWeightTraffic::PerDispatch)
+    {
         return None;
     }
 
@@ -163,8 +164,12 @@ pub async fn gpu_matmul_tiled_async(
     k: usize,
     n: usize,
 ) -> Option<Vec<f32>> {
-    // Only use GPU for large enough matrices
-    if gemm_flops(m, k, n)? < GPU_THRESHOLD {
+    // Same gate as `gpu_matmul_async`, for the same reason: both operands are
+    // host slices, so both upload on every call.
+    if !ctx
+        .tuning()
+        .gemm_admits(m, k, n, GemmWeightTraffic::PerDispatch)
+    {
         return None;
     }
 
@@ -641,7 +646,12 @@ pub async fn gpu_conv2d_fused_placed_async(
     placement: OutputPlacement,
 ) -> Option<GpuOutput> {
     let (m, k, n) = conv_gemm_shape(input.shape(), weight, strides, pads, dilations, group)?;
-    if gemm_flops(m, k, n)? < GPU_THRESHOLD {
+    // `conv_min_mac`, not `gemm_min_mac`: `Conv` is the one op every
+    // measurement has found a clear GPU winner (0.44x the CPU kernel across
+    // InSwapper's 20 convolutions), its implicit-GEMM cost model is not the flat
+    // GEMM one, and it keeps the threshold it was measured with. See
+    // `crate::context::tuning::GpuTuning::conv_min_mac`.
+    if !ctx.tuning().conv_admits(m, k, n) {
         return None;
     }
     if ctx.is_degraded() {
@@ -830,9 +840,14 @@ pub async fn gpu_conv2d_hybrid_async(
     }
 
     // Check if the GEMM is large enough for GPU. Same `u64` widening as
-    // `gpu_matmul_async` — see `GPU_THRESHOLD`: a conv whose inner GEMM is at
-    // or above 2^32 FLOPs used to decline on wasm32 instead of dispatching.
-    if gemm_flops(c_out_per_group, col_rows, col_cols)? < GPU_THRESHOLD {
+    // `GpuTuning::gemm_mac` documents: a conv whose inner GEMM is at or above
+    // 2^32 multiply-accumulates used to decline on wasm32 instead of
+    // dispatching. `conv_min_mac`, not `gemm_min_mac` — see
+    // `gpu_conv2d_fused_placed_async`.
+    if !ctx
+        .tuning()
+        .conv_admits(c_out_per_group, col_rows, col_cols)
+    {
         return None;
     }
 
@@ -1145,6 +1160,7 @@ fn im2col(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::tuning::GpuTuning;
 
     /// The FLOP count must be computed in `u64`, not `usize`.
     ///
@@ -1155,15 +1171,17 @@ mod tests {
     /// where the bug is invisible.
     #[test]
     fn gemm_flops_does_not_overflow_a_32_bit_usize() {
-        assert_eq!(gemm_flops(2048, 2048, 2048), Some(8_589_934_592));
-        assert!(gemm_flops(2048, 2048, 2048).is_some_and(|f| f > u64::from(u32::MAX)));
-        assert!(gemm_flops(2048, 2048, 2048).is_some_and(|f| f >= GPU_THRESHOLD));
+        let tuning = GpuTuning::for_class(crate::context::GpuPerfClass::Discrete);
+        let mac = GpuTuning::gemm_mac;
+        assert_eq!(mac(2048, 2048, 2048), Some(8_589_934_592));
+        assert!(mac(2048, 2048, 2048).is_some_and(|f| f > u64::from(u32::MAX)));
+        assert!(mac(2048, 2048, 2048).is_some_and(|f| f >= tuning.gemm_min_mac));
         // Small shapes are unchanged, and still below the threshold.
-        assert_eq!(gemm_flops(32, 32, 32), Some(32_768));
-        assert!(gemm_flops(32, 32, 32).is_some_and(|f| f < GPU_THRESHOLD));
+        assert_eq!(mac(32, 32, 32), Some(32_768));
+        assert!(mac(32, 32, 32).is_some_and(|f| f < tuning.gemm_min_mac));
         // Only a product that overflows `u64` declines.
-        assert_eq!(gemm_flops(usize::MAX, usize::MAX, 2), None);
-        assert_eq!(gemm_flops(0, 1 << 20, 1 << 20), Some(0));
+        assert_eq!(mac(usize::MAX, usize::MAX, 2), None);
+        assert_eq!(mac(0, 1 << 20, 1 << 20), Some(0));
     }
 
     /// CPU reference matmul for verification.

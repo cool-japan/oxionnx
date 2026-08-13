@@ -4,7 +4,7 @@ use crate::context::GpuContext;
 
 use super::common::{
     block_on_gpu, checked_storage_bytes, plan_dispatch, read_back_and_recycle_async, ErrorScope,
-    SoftmaxParams, SOFTMAX_DIM_THRESHOLD,
+    SoftmaxParams,
 };
 
 // The kernel's own workgroup size (256, matching its `array<f32, 256>` shared
@@ -49,7 +49,7 @@ pub async fn gpu_softmax_async(
         return None;
     }
     let last_dim = *shape.last()?;
-    if last_dim < SOFTMAX_DIM_THRESHOLD {
+    if last_dim < ctx.tuning().softmax_min_row_len {
         return None;
     }
     let num_rows: usize = shape
@@ -62,6 +62,15 @@ pub async fn gpu_softmax_async(
     }
     let total = num_rows.checked_mul(last_dim)?;
     if data.len() < total {
+        return None;
+    }
+    // Two gates, and the row-length one alone was not enough: `[64, 1024]`
+    // clears it with room to spare and measured 1.55x *slower* than the CPU
+    // kernel, because 64 workgroups do not fill the device and the dispatch is
+    // smaller than its own fixed cost. `[1024, 1024]` — the same row length,
+    // 16x the rows — won by 1.6x. See
+    // `crate::context::tuning::GpuTuning::softmax_min_elements`.
+    if total < ctx.tuning().softmax_min_elements {
         return None;
     }
 

@@ -68,7 +68,7 @@ mod gating_tests {
         intermediates.insert("x".to_string(), Tensor::new(vec![3.0], vec![1]));
         intermediates.insert("shadowed".to_string(), Tensor::new(vec![4.0], vec![1]));
 
-        let activations = RunActivations::default();
+        let activations = GpuActivations::default();
         assert_eq!(
             initializer_key("w", &weights, &intermediates, &activations),
             Some("w")
@@ -101,7 +101,7 @@ mod gating_tests {
         let mut weights = HashMap::new();
         weights.insert("shadowed".to_string(), Tensor::new(vec![2.0], vec![1]));
         let intermediates = HashMap::new();
-        let activations = RunActivations::default();
+        let activations = GpuActivations::default();
         // With nothing resident the name is a plain initializer.
         assert_eq!(
             initializer_key("shadowed", &weights, &intermediates, &activations),
@@ -775,11 +775,15 @@ mod gpu_e2e_tests {
         // row being computed from misaligned memory (the exact a7-9
         // failure mode when `b` carries an unexamined batch dimension).
         //
-        // M*K*N = 101*100*1000 = 10,100,000, above wgpu's 10M FLOP
-        // GPU_THRESHOLD, so this is genuinely claimed by the compute shader.
+        // Sized to clear *both* `PerDispatch` gates in `GpuTuning::gemm_admits`
+        // (`b` is an intermediate, not a resident weight, so the intensity gate
+        // applies): m*k*n = 101*100*2500 = 25,250,000 >= `gemm_min_mac`
+        // (25,000,000), and 2mkn/(mk+kn+mn) = 50,500,000/512,600 = 98 >=
+        // `gemm_min_intensity` (56). N was 1000 (10.1 M mac) when the floor was
+        // the legacy flat 10 M; that no longer clears the measured floor.
         const M: usize = 101;
         const K: usize = 100;
-        const N: usize = 1000;
+        const N: usize = 2500;
 
         let a_data = vec![1.0_f32; M * K];
         let mut b_data = vec![0.0_f32; K * N];
@@ -803,7 +807,7 @@ mod gpu_e2e_tests {
 
         let outputs = try_gpu_dispatch(&node, &HashMap::new(), &intermediates, &gpu)
             .expect("dispatch must not error")
-            .expect("10.1M FLOPs is above GPU_THRESHOLD (10M); must be claimed");
+            .expect("25.25M mac / intensity 98 clears gemm_min_mac + gemm_min_intensity; must be claimed");
         assert_eq!(outputs.len(), 1);
         let y = &outputs[0];
 
@@ -972,11 +976,19 @@ mod gpu_e2e_tests {
 
         // [a4-17/a7-7] The exact reported example: ReduceSum(axes=[-1],
         // keepdims=0) on a [100000, 3] tensor. out_count = 100000 >=
-        // REDUCE_GPU_THRESHOLD (50_000), so this is claimed by the GPU arm.
+        // `reduce_min_output_elements`, so this is claimed by the GPU arm.
         // Before the fix, `axes[0] as usize` on `-1_i64` wrapped to
         // `usize::MAX` instead of normalizing to `1`, and `out_shape[axis] =
         // 1` never consulted `keepdims`.
-        const ROWS: usize = 100_000;
+        //
+        // `out_count` here is exactly `ROWS` (reducing the last of `[ROWS, 3]`
+        // leaves `outer = ROWS, inner = 1`), and the measured floor is
+        // 8,000,000 -- the legacy flat 50_000 this was originally written
+        // against is, per `GpuTuning`'s own comment, "160x too low". The
+        // negative-axis and `keepdims` handling under test lives in the GPU
+        // dispatch arm itself, so the tensor has to be large enough to
+        // actually reach it; that costs ~96 MB of input for one test.
+        const ROWS: usize = 8_000_000;
         let data: Vec<f32> = (0..ROWS).flat_map(|_| [1.0_f32, 2.0, 3.0]).collect();
         let input = Tensor::new(data, vec![ROWS, 3]);
 
@@ -997,7 +1009,7 @@ mod gpu_e2e_tests {
 
         let outputs = try_gpu_dispatch(&node, &HashMap::new(), &intermediates, &gpu)
             .expect("dispatch must not error")
-            .expect("out_count 100000 is above REDUCE_GPU_THRESHOLD (50000); must be claimed");
+            .expect("out_count 8000000 clears reduce_min_output_elements; must be claimed");
         let y = &outputs[0];
 
         // keepdims=0 must drop the axis entirely: [100000], not the
@@ -1016,14 +1028,20 @@ mod gpu_e2e_tests {
             return;
         };
 
-        // [a4-12/a7-0] last_dim = 1024 >= SOFTMAX_DIM_THRESHOLD (1000). This
-        // is the positive-path counterpart to the pure `softmax_axis_*`
-        // decline tests: axis=-1 on a rank-2 tensor *is* the last dim, so
-        // this must still dispatch and compute correctly through the real
-        // kernel. All-zero input makes softmax exactly uniform: exp(0)=1 for
-        // all 1024 entries, sum=1024.0 (exact in f32), so every output is
-        // exactly 1/1024 = 2^-10.
-        const ROWS: usize = 2;
+        // [a4-12/a7-0] This is the positive-path counterpart to the pure
+        // `softmax_axis_*` decline tests: axis=-1 on a rank-2 tensor *is* the
+        // last dim, so this must still dispatch and compute correctly through
+        // the real kernel. All-zero input makes softmax exactly uniform:
+        // exp(0)=1 for all 1024 entries, sum=1024.0 (exact in f32), so every
+        // output is exactly 1/1024 = 2^-10 -- true per row, so the row count
+        // is free to grow.
+        //
+        // Both softmax gates must clear: `last_dim = 1024 >=
+        // softmax_min_row_len` (1000), and `ROWS*LAST = 524,288 >=
+        // softmax_min_elements` (262,144). ROWS was 2 when the row-length gate
+        // was the only one; `softmax_min_elements` was added because `[64,
+        // 1024]` cleared that gate and still measured 1.55x slower than the CPU.
+        const ROWS: usize = 512;
         const LAST: usize = 1024;
         let input = Tensor::new(vec![0.0_f32; ROWS * LAST], vec![ROWS, LAST]);
 
@@ -1043,7 +1061,7 @@ mod gpu_e2e_tests {
 
         let outputs = try_gpu_dispatch(&node, &HashMap::new(), &intermediates, &gpu)
             .expect("dispatch must not error")
-            .expect("last_dim 1024 is above SOFTMAX_DIM_THRESHOLD (1000); must be claimed");
+            .expect("row_len 1024 and 524288 elements clear both softmax gates; must be claimed");
         let y = &outputs[0];
 
         assert_eq!(y.shape, vec![ROWS, LAST]);

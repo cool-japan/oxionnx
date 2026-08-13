@@ -82,30 +82,9 @@ pub use pad::gpu_pad_placed_async;
 pub use prelu::gpu_prelu_placed_async;
 pub use resize::{gpu_resize_placed_async, ResizeKind};
 
-// Crate-internal only: the standalone kernel batch's per-call pipeline
-// builders (broadcast_binary/gemm/pad/prelu/resize -- see
-// `kernel_support`'s module docs). Re-exported here, not from their private
-// submodules directly, so a future integration wave can hoist these into
-// `GpuContext`'s cached pipeline fields (`context/types.rs`) as a call-site
-// move (`crate::shaders::build_broadcast_pipeline(...)`) without also having
-// to make `broadcast_binary`/`pad`/`prelu`/`resize`/`gemm` public modules.
-// Unused for now (nothing in this crate calls them yet -- that integration
-// is a follow-up wave's job, not this one's); the `#[allow]` is deliberate,
-// not a stray import to clean up.
-#[allow(unused_imports)]
-pub(crate) use broadcast_binary::{build_broadcast_pipeline, BroadcastOp};
-// `conv2d` already caches its own compiled pipeline per device (see its
-// `CONV2D_PIPELINE` docs), so this export exists for the same reason as the
-// others: hoisting the compile into `GpuContext` later stays a call-site move.
-#[allow(unused_imports)]
-pub(crate) use conv2d::build_conv2d_pipeline;
-#[allow(unused_imports)]
-pub(crate) use gemm::build_gemm_nt_pipeline;
-#[allow(unused_imports)]
-pub(crate) use instance_norm::build_instance_norm_pipeline;
-#[allow(unused_imports)]
-pub(crate) use pad::build_pad_pipeline;
-#[allow(unused_imports)]
-pub(crate) use prelu::build_prelu_pipeline;
-#[allow(unused_imports)]
-pub(crate) use resize::build_resize_pipeline;
+// [w5] The standalone kernel batch's `build_*_pipeline` helpers used to be
+// re-exported here, unused, so that a later wave could hoist their compiles
+// onto `GpuContext` as a call-site move. That hoist has happened: every one of
+// them now memoizes into `GpuContext`'s own `pipeline_cache`
+// (`kernel_support::build_pipeline`), so each stays private to the module that
+// owns its shader source and there is nothing left to re-export.

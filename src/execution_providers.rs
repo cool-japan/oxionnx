@@ -335,10 +335,14 @@ pub fn select_accelerator(op: &OpKind) -> Option<ProviderKind> {
 /// still shipped a `[1, 4]` bias-add across PCIe.
 ///
 /// `Auto` also consults each backend's **own** op-support predicate rather than
-/// the wgpu-flavoured [`is_gpu_capable`].  That matters: `is_gpu_capable` claims
-/// `Conv`, but `oxionnx_cuda::is_supported_op` correctly reports `false` for it
-/// (there is no CUDA convolution kernel), so `Auto` no longer routes convolutions
-/// to CUDA only to have them bounce straight back to the CPU.
+/// the wgpu-flavoured [`is_gpu_capable`].  That matters because the op sets
+/// genuinely differ: `is_gpu_capable` claims `ReduceMean`, but
+/// `oxionnx_cuda::is_supported_op` reports `false` for it (the CUDA reduce arm
+/// covers `ReduceSum`/`ReduceMax` only), so `Auto` does not route a `ReduceMean`
+/// to CUDA only to have it bounce straight back to the CPU.  (`Conv` used to be
+/// the example here; CUDA now has a real convolution kernel — `oxionnx_cuda`
+/// dispatches it directly to `oxicuda-dnn`'s `Conv1x1` / `DepthwiseConv` /
+/// `ImplicitGemmConv` engines — so `Auto` routes convolutions to CUDA.)
 ///
 /// # Availability
 ///
@@ -456,6 +460,130 @@ pub(crate) const GPU_DISPATCH_OPS: &[OpKind] = &[
 /// principle, capable of both.
 pub fn is_gpu_capable(op: &OpKind) -> bool {
     GPU_DISPATCH_OPS.contains(op)
+}
+
+/// An op the **wgpu** backend claims but the **CUDA** backend does not —
+/// the exemplar that proves [`provider_supports_op`] and the `Auto` placement
+/// gate consult each backend's *own* predicate rather than the wgpu-flavoured
+/// [`is_gpu_capable`].
+///
+/// # Why this is derived rather than named
+///
+/// Every test that needs such an op used to hard-code one, and each hard-coded
+/// choice has since been invalidated by CUDA growing the kernel: `Conv` was the
+/// original exemplar until `oxionnx_cuda::conv::cuda_conv` landed, `ReduceMean`
+/// replaced it and then fell to `reduce::cuda_reduce_mean_bound`, and `Reshape`
+/// (the second assertion in `provider_supports_op_cuda_delegates_to_the_cuda_crate`)
+/// was next in line. Each time, three separate tests in two files failed with a
+/// "pick a different exemplar" panic and had to be hand-edited in lockstep —
+/// pure churn, since *which* op is the odd one out was never the point. What the
+/// tests actually pin is that the two predicates are consulted independently,
+/// and that survives any particular op moving from one set to the other.
+///
+/// So: scan `GPU_DISPATCH_OPS` (wgpu's set, by construction) for the first entry
+/// CUDA declines. Adding a CUDA kernel now silently re-points the exemplar at
+/// the next surviving op instead of breaking the build.
+///
+/// # When this panics
+///
+/// Only when CUDA claims *every* op wgpu claims. At that point no exemplar
+/// exists, the two predicates are indistinguishable by observation, and the
+/// tests calling this genuinely have nothing left to prove — which is a real
+/// finding, not a test bug, so it is loud rather than a silent skip. Callers get
+/// the message rather than a `None` they might quietly swallow.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn op_wgpu_claims_but_cuda_lacks() -> OpKind {
+    GPU_DISPATCH_OPS
+        .iter()
+        .find(|op| !oxionnx_cuda::is_supported_op(op))
+        .cloned()
+        .expect(
+            "CUDA now claims every op in GPU_DISPATCH_OPS, so no exemplar can distinguish \
+             `oxionnx_cuda::is_supported_op` from `is_gpu_capable` any more -- the tests \
+             calling this helper have nothing left to prove and should be deleted along \
+             with it (or given a wgpu-only op to point at)",
+        )
+}
+
+/// Does no *compiled-in accelerator* claim `op`? (The CPU always does; it is
+/// the terminal fallback and is deliberately not consulted here.)
+///
+/// Spelled out per backend rather than delegating to [`select_accelerator`] so
+/// that tests which pin `select_accelerator`'s own behaviour are checking it
+/// against the three per-backend predicates rather than against itself.
+#[cfg(test)]
+pub(crate) fn no_accelerator_claims(op: &OpKind) -> bool {
+    // Read only by the cfg'd arms below; genuinely unused with no accelerator
+    // feature enabled, where every op trivially qualifies.
+    let _ = op;
+
+    #[cfg(feature = "cuda")]
+    if provider_supports_op(ProviderKind::Cuda, op) {
+        return false;
+    }
+    #[cfg(feature = "directml")]
+    if provider_supports_op(ProviderKind::DirectMl, op) {
+        return false;
+    }
+    #[cfg(feature = "gpu")]
+    if provider_supports_op(ProviderKind::Gpu, op) {
+        return false;
+    }
+    true
+}
+
+/// Real ops that no compiled-in accelerator implements — the exemplars for
+/// every "this stays on the CPU however large it is" test.
+///
+/// # Why this is derived rather than named
+///
+/// Same churn as [`op_wgpu_claims_but_cuda_lacks`], one layer down. Five tests
+/// across three files hard-coded `Reshape` (usually alongside `Shape`,
+/// `Squeeze`, `Flatten`, `Gather`) as the stand-in for "no backend has a kernel
+/// for this", and all five broke at once when `oxionnx-cuda` grew its
+/// shape-op wave — `Reshape`/`Squeeze`/`Unsqueeze`/`Flatten` share one dispatch
+/// arm there now, with `Concat`/`Slice`/`Pad` alongside. *Which* op is
+/// unclaimed was never the point of any of those tests; that it stays on the
+/// CPU is.
+///
+/// The candidates below are graph plumbing and metadata ops — indexing, dtype
+/// and shape *queries*, set operations — deliberately chosen as things no GPU
+/// backend has reason to claim, unlike the shape *rewrites* CUDA just took. Any
+/// that do get claimed simply drop out of the returned list.
+///
+/// Note the asymmetry with `Unknown("...")`, which the `select_accelerator`
+/// tests also use: that one is unclaimable *by construction* and so proves
+/// nothing about real dispatch tables. These are real ops that really are
+/// declined today.
+///
+/// # When this panics
+///
+/// Only when every candidate has been claimed, i.e. there is no longer any
+/// registered op that stays on the CPU. That would be a genuine finding about
+/// the dispatch tables rather than a test bug, so it is loud.
+#[cfg(test)]
+pub(crate) fn ops_no_backend_implements() -> Vec<OpKind> {
+    let candidates = [
+        OpKind::Shape,
+        OpKind::Gather,
+        OpKind::Identity,
+        OpKind::Cast,
+        OpKind::NonZero,
+        OpKind::Size,
+        OpKind::OneHot,
+        OpKind::Unique,
+    ];
+    let surviving: Vec<OpKind> = candidates
+        .into_iter()
+        .filter(no_accelerator_claims)
+        .collect();
+    assert!(
+        !surviving.is_empty(),
+        "every candidate plumbing op is now claimed by some accelerator, so no exemplar \
+         is left for the \"stays on the CPU however large it is\" tests -- widen the \
+         candidate list, or retire those tests if nothing is CPU-only any more",
+    );
+    surviving
 }
 
 #[cfg(test)]
@@ -599,12 +727,15 @@ mod tests {
     }
 
     /// An op no backend implements stays on the CPU however large it is.
+    ///
+    /// Exemplars are derived — see [`ops_no_backend_implements`]; `Reshape` was
+    /// hard-coded here until `oxionnx-cuda` grew a kernel for it.
     #[test]
     fn auto_non_accelerable_op_stays_on_cpu() {
         let placement = OpPlacement::Auto {
             gpu_threshold_bytes: 0,
         };
-        for op in [OpKind::Reshape, OpKind::Shape, OpKind::Gather] {
+        for op in ops_no_backend_implements() {
             assert_eq!(
                 decide_placement(&op, 1 << 24, &placement),
                 ProviderKind::Cpu,
@@ -613,36 +744,101 @@ mod tests {
         }
     }
 
-    /// `Auto` must consult the **backend's own** predicate, not `is_gpu_capable`.
+    /// CUDA now has a real `Conv` kernel, so `Auto` must route convolutions to
+    /// it — CUDA being the highest-priority accelerator.
     ///
-    /// `oxionnx_cuda::is_supported_op(Conv) == false` — `conv::cuda_conv` always
-    /// returns `Ok(None)`.  So `Auto` must never route a `Conv` to CUDA, no matter
-    /// which other accelerators are compiled in.  DirectML and wgpu both *do* have a
-    /// Conv kernel, and DirectML outranks wgpu, so it is the one that claims Conv when
-    /// present.
+    /// This test asserted the exact opposite until `oxionnx_cuda::cuda_conv`
+    /// gained a working implementation (direct dispatch to `oxicuda-dnn`'s
+    /// `Conv1x1` / `DepthwiseConv` / `ImplicitGemmConv` engines) and
+    /// `oxionnx_cuda::is_supported_op` was flipped to advertise it. It is kept,
+    /// inverted rather than deleted, because the placement decision it pins is
+    /// the one that matters most for the convolution-dominated models this
+    /// engine actually runs (SCRFD, ArcFace, InSwapper): if this silently goes
+    /// back to `DirectMl`/`Gpu`/`Cpu` on a CUDA host, every convolution in
+    /// every graph has stopped being CUDA-accelerated.
     #[cfg(feature = "cuda")]
     #[test]
-    fn auto_never_routes_conv_to_cuda() {
+    fn auto_routes_conv_to_cuda() {
         let placement = OpPlacement::Auto {
             gpu_threshold_bytes: 0,
         };
-        let got = decide_placement(&OpKind::Conv, 1 << 20, &placement);
+        assert_eq!(
+            decide_placement(&OpKind::Conv, 1 << 20, &placement),
+            ProviderKind::Cuda,
+            "CUDA has a Conv kernel and is the highest-priority accelerator; a Conv must be \
+             placed there rather than on DirectML/wgpu/CPU",
+        );
+    }
+
+    /// The backend the priority chain must hand `op` to once CUDA is out of the
+    /// running — the highest-priority *compiled-in* non-CUDA accelerator that
+    /// claims it, or the CPU when none does.
+    ///
+    /// Derived from each backend's own predicate rather than assumed, because
+    /// [`op_wgpu_claims_but_cuda_lacks`] is itself derived: the exemplar it
+    /// returns is guaranteed wgpu-capable but says nothing about DirectML, so
+    /// hard-coding `DirectMl` here would be right for a `ReduceMean` exemplar
+    /// (`DML_REDUCE_FUNCTION_AVERAGE`) and wrong for, say, a `Transpose` one.
+    #[cfg(feature = "cuda")]
+    fn highest_priority_non_cuda_backend(op: &OpKind) -> ProviderKind {
+        // Read only by the cfg'd arms below; genuinely unused with neither
+        // `directml` nor `gpu` enabled.
+        let _ = op;
+
+        #[cfg(feature = "directml")]
+        if provider_supports_op(ProviderKind::DirectMl, op) {
+            return ProviderKind::DirectMl;
+        }
+        #[cfg(feature = "gpu")]
+        if provider_supports_op(ProviderKind::Gpu, op) {
+            return ProviderKind::Gpu;
+        }
+        ProviderKind::Cpu
+    }
+
+    /// `Auto` must consult the **backend's own** predicate, not `is_gpu_capable`.
+    ///
+    /// Routing on `is_gpu_capable` would hand every wgpu-capable op to CUDA —
+    /// the highest-priority accelerator — for it to bounce straight back with
+    /// `Ok(None)`, one wasted upload/dispatch/readback per node. The exemplar is
+    /// whichever op still separates the two predicates; see
+    /// [`op_wgpu_claims_but_cuda_lacks`] for why it is derived rather than named
+    /// (`Conv`, then `ReduceMean`, were both hard-coded here and both went stale
+    /// the moment CUDA grew the kernel).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn auto_consults_the_backends_own_predicate_not_is_gpu_capable() {
+        let op = op_wgpu_claims_but_cuda_lacks();
+
+        // Both hold by construction; asserted anyway so a helper that ever
+        // started returning an op failing either one is caught here rather
+        // than silently making the rest of the test vacuous.
+        assert!(
+            is_gpu_capable(&op),
+            "{op:?}: exemplar must be wgpu-capable, else this proves nothing about the two \
+             predicates disagreeing",
+        );
+        assert!(
+            !oxionnx_cuda::is_supported_op(&op),
+            "{op:?}: exemplar must NOT be CUDA-capable, else this proves nothing about the \
+             two predicates disagreeing",
+        );
+
+        let placement = OpPlacement::Auto {
+            gpu_threshold_bytes: 0,
+        };
+        let got = decide_placement(&op, 1 << 20, &placement);
         assert_ne!(
             got,
             ProviderKind::Cuda,
-            "CUDA has no Conv kernel; routing Conv there guarantees a wasted round trip",
+            "{op:?}: CUDA has no kernel for it; routing it there guarantees a wasted round trip",
         );
-
-        // DirectML has a Conv kernel (`DML_CONVOLUTION`) and outranks wgpu, so it
-        // claims Conv whenever it is compiled in.
-        #[cfg(feature = "directml")]
-        assert_eq!(got, ProviderKind::DirectMl);
-        // With DirectML off but wgpu on, wgpu's Conv kernel takes the node.
-        #[cfg(all(feature = "gpu", not(feature = "directml")))]
-        assert_eq!(got, ProviderKind::Gpu);
-        // With neither wgpu nor DirectML, Conv has nowhere to go but the CPU.
-        #[cfg(all(not(feature = "gpu"), not(feature = "directml")))]
-        assert_eq!(got, ProviderKind::Cpu);
+        assert_eq!(
+            got,
+            highest_priority_non_cuda_backend(&op),
+            "{op:?}: with CUDA out of the running the node must fall to the next compiled-in \
+             backend that claims it (DirectML over wgpu), or to the CPU if none does",
+        );
     }
 
     // ── Manual ──────────────────────────────────────────────────────────────
@@ -739,8 +935,19 @@ mod tests {
 
     #[test]
     fn select_accelerator_declines_ops_no_backend_implements() {
-        assert_eq!(select_accelerator(&OpKind::Reshape), None);
-        assert_eq!(select_accelerator(&OpKind::Shape), None);
+        // Real ops that really are declined today, derived rather than named
+        // (`Reshape` was hard-coded here until CUDA grew a kernel for it), and
+        // filtered by the three per-backend predicates rather than by
+        // `select_accelerator` itself — so this compares the two independently
+        // instead of tautologically.
+        for op in ops_no_backend_implements() {
+            assert_eq!(
+                select_accelerator(&op),
+                None,
+                "{op:?}: no compiled-in backend's own predicate claims it, so \
+                 `select_accelerator` must decline it too",
+            );
+        }
         assert_eq!(
             select_accelerator(&OpKind::Unknown("Frobnicate".to_string())),
             None,
@@ -785,9 +992,27 @@ mod tests {
         assert!(provider_supports_op(ProviderKind::Cuda, &OpKind::MatMul));
         assert!(provider_supports_op(ProviderKind::Cuda, &OpKind::Add));
         assert!(provider_supports_op(ProviderKind::Cuda, &OpKind::Softmax));
-        // The whole point: CUDA has no Conv kernel, unlike wgpu.
-        assert!(!provider_supports_op(ProviderKind::Cuda, &OpKind::Conv));
-        assert!(!provider_supports_op(ProviderKind::Cuda, &OpKind::Reshape));
+        // `oxionnx_cuda::conv::cuda_conv` dispatches straight to oxicuda-dnn's
+        // Conv1x1 / DepthwiseConv / ImplicitGemmConv engines, so CUDA claims
+        // Conv alongside wgpu and DirectML.
+        assert!(provider_supports_op(ProviderKind::Cuda, &OpKind::Conv));
+
+        // The whole point of delegating rather than reusing `is_gpu_capable`:
+        // this is the CUDA crate's *own* op set, and it really is narrower.
+        // The exemplar is derived, not named — `ReduceMean` and `Reshape` were
+        // both hard-coded here and both were overtaken by new CUDA kernels; see
+        // `op_wgpu_claims_but_cuda_lacks`.
+        let narrower = op_wgpu_claims_but_cuda_lacks();
+        assert!(
+            is_gpu_capable(&narrower),
+            "{narrower:?}: must be wgpu-capable for the two op sets to differ here",
+        );
+        assert!(
+            !provider_supports_op(ProviderKind::Cuda, &narrower),
+            "{narrower:?}: wgpu claims it and the CUDA crate does not, so delegating to \
+             `oxionnx_cuda::is_supported_op` must decline it -- returning true would mean \
+             this arm is answering from the wgpu op set instead",
+        );
     }
 
     #[cfg(feature = "gpu")]

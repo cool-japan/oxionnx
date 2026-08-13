@@ -1,25 +1,18 @@
-//! Shared parameter structs, thresholds, and GPU read-back helper.
-
-/// Minimum tensor elements before GPU dispatch is worthwhile for element-wise ops.
-pub(super) const EW_GPU_THRESHOLD: usize = 100_000;
-
-/// Minimum last-dimension size before GPU softmax is worthwhile.
-pub(super) const SOFTMAX_DIM_THRESHOLD: usize = 1000;
-
-/// Minimum output elements before GPU reduction is worthwhile.
-pub(super) const REDUCE_GPU_THRESHOLD: usize = 50_000;
-
-/// Minimum elements before GPU LayerNorm is worthwhile.
-pub(super) const LAYER_NORM_GPU_THRESHOLD: usize = 50_000;
-
-/// Minimum elements before GPU BatchNorm is worthwhile.
-pub(super) const BATCH_NORM_GPU_THRESHOLD: usize = 50_000;
-
-/// Minimum elements before GPU Transpose is worthwhile.
-pub(super) const TRANSPOSE_GPU_THRESHOLD: usize = 50_000;
-
-/// Minimum tensor elements before GPU dispatch is worthwhile for binary element-wise ops.
-pub(super) const BINARY_EW_GPU_THRESHOLD: usize = 100_000;
+//! Shared parameter structs and GPU read-back helper.
+//!
+//! # Where the thresholds went
+//!
+//! This module used to own seven flat constants — `EW_GPU_THRESHOLD` and
+//! friends — each answering "is a GPU round trip cheaper than the CPU kernel
+//! at this size?" with one compile-time number for every adapter in existence.
+//! They now live on the context as [`crate::context::tuning::GpuTuning`],
+//! because that question has no adapter-independent answer and, for the
+//! memory-bound kernels, has no size-independent answer either: measured on an
+//! RTX A4000, `gpu_relu`, `gpu_add`, `gpu_layer_norm` and `gpu_batch_norm` lose
+//! to their CPU kernels at *every* size while their operands transfer, by
+//! 1.8x to 45x. The historical values are preserved as
+//! [`crate::context::tuning::GpuTuning::LEGACY_FLAT`], and every kernel below
+//! now reads `ctx.tuning()` at its gate.
 
 // --- Uniform param structs ---
 

@@ -67,6 +67,14 @@ pub struct GpuBufferPool {
     max_bytes: u64,
     /// Sum of the entries' sizes, maintained incrementally.
     pooled_bytes: u64,
+    /// \[w4\] Requests [`Self::get_buffer`] served from an idle entry.
+    reuses: u64,
+    /// \[w4\] Requests [`Self::get_buffer`] had to ask the driver for.
+    ///
+    /// Counted whether or not the allocation succeeded, so
+    /// `reuses + allocations` is the request count and the ratio between them
+    /// is what a change in buffer disposition is supposed to move.
+    allocations: u64,
     /// Live-byte accounting shared with the context this pool belongs to.
     /// Idle pooled buffers occupy device memory exactly like in-use ones, so
     /// they are counted the same and released on eviction.
@@ -107,6 +115,8 @@ impl GpuBufferPool {
             max_buffers,
             max_bytes,
             pooled_bytes: 0,
+            reuses: 0,
+            allocations: 0,
             budget,
         }
     }
@@ -147,10 +157,12 @@ impl GpuBufferPool {
         if let Some(idx) = best {
             if let Some(entry) = self.buffers.remove(idx) {
                 self.pooled_bytes = self.pooled_bytes.saturating_sub(entry.reserved_bytes());
+                self.reuses = self.reuses.saturating_add(1);
                 return Some(entry);
             }
         }
         // No suitable buffer found — create a new one.
+        self.allocations = self.allocations.saturating_add(1);
         let desc = wgpu::BufferDescriptor {
             label: Some("pool_buf"),
             size: min_size,
@@ -232,6 +244,28 @@ impl GpuBufferPool {
     #[must_use]
     pub fn byte_budget(&self) -> u64 {
         self.max_bytes
+    }
+
+    /// The pool's entry-count budget — the other half of the retention bound
+    /// [`Self::byte_budget`] states, and the one that usually binds first for a
+    /// graph whose activations are small.
+    #[must_use]
+    pub fn max_buffers(&self) -> usize {
+        self.max_buffers
+    }
+
+    /// \[w4\] Requests this pool has served from an idle entry since it was
+    /// created. Never reset — difference two readings to get one run's figure.
+    #[must_use]
+    pub fn reuses(&self) -> u64 {
+        self.reuses
+    }
+
+    /// \[w4\] Requests this pool has had to ask the driver for. See
+    /// [`Self::reuses`].
+    #[must_use]
+    pub fn allocations(&self) -> u64 {
+        self.allocations
     }
 }
 

@@ -28,6 +28,112 @@ thiserror = { workspace = true }
 # fallback keeps inference correct, but only `tracing::error!` tells the user their "GPU
 # acceleration" just quietly stopped applying. Costs nothing when no subscriber is attached.
 tracing = { workspace = true }
+# `crate::reference`'s CPU oracle (`OXIONNX_CUDA_VERIFY=1`) recomputes every
+# claimed op in naive, single-threaded `f64` to shadow-verify the GPU's
+# answer -- for a real conv layer that is tens of GFLOP of scalar work per
+# node. `rayon` splits it across cores (pure map-parallelism over
+# independent output rows, never across a single output element's own
+# accumulation), which is the difference between a diagnostic mode a
+# developer can actually leave on and one that turns a 7.7s swap into a
+# 45-minute one. Already a workspace dependency (`oxionnx-ops` uses it the
+# same way for its own conv/matmul kernels); this is oxionnx-cuda's first use
+# of it.
+rayon = { workspace = true }
 
 [features]
 default = []
+# On-device GPU validation tests (`#[cfg(feature = "gpu-tests")]` in
+# `src/dispatch_tests.rs` and `src/conv.rs`, plus the `[[test]]` targets
+# below). Mirrors the convention in `oxicuda-driver`/`oxicuda-blas`/
+# `oxicuda-dnn`: off by default because this crate's own CI has no
+# CUDA-capable host (see the `context` module docs), run manually with
+# `cargo test -p oxionnx-cuda --features gpu-tests` on a machine with a real
+# NVIDIA GPU.
+#
+# Turning the feature ON does NOT require a GPU. Every device fixture in
+# this crate returns `Option<CudaContext>` and each test skips (early
+# `return` after an `eprintln!`) when no driver / device is present, so
+# `cargo nextest run --all-features` stays green on a CPU-only host -- a Mac,
+# most notably, where `--all-features` unavoidably switches this feature on
+# because Cargo has no "all features except X". That is exactly what
+# OxiCUDA does: see `oxicuda-blas`'s `src/gpu_tests.rs` ("Every device test
+# returns early (skips) when no CUDA device is present, so the suite stays
+# green on CPU-only machines") and its `tests/gemm_shape_sweep_gpu.rs`
+# `try_handle() -> Option<_>`. Verified: `cargo nextest run -p oxicuda-blas
+# -p oxicuda-dnn -p oxicuda-driver --all-features` on an M3 Mac is 2753
+# passed / 0 failed.
+#
+# This crate briefly diverged from that (TODO.md section 22 replaced the
+# skips with `.expect()`-and-fail, on the stated but mistaken premise that
+# `.expect()` was the OxiCUDA convention being mirrored); section 24 restored
+# it. Do not reintroduce `.expect()` here -- it makes `--all-features` fail
+# on every non-CUDA host.
+gpu-tests = []
+
+# The `tests/*_gpu.rs` integration-test binaries below are gated on the same
+# feature via `required-features`, so a plain `cargo test -p oxionnx-cuda`
+# (no `--features gpu-tests`) does not build or run them at all -- keeping
+# them off the auto-discovered default `[[test]]` target Cargo would
+# otherwise create for any `tests/*.rs` file is REQUIRED, not cosmetic:
+# without this, on any host that happens to have a CUDA driver and device 0
+# (this workspace's own dev machine included), a bare `cargo test -p
+# oxionnx-cuda` -- no feature flag, no `OXIONNX_CUDA` env var -- silently
+# allocates GPU memory and launches real kernels the moment it reaches these
+# files, contradicting this crate's own documented contract (`context`
+# module docs: "default cargo test/CI never touches a GPU"). Confirmed on
+# this machine: before this `required-features` line existed,
+# `matmul_shape_sweep_gpu` ran three real on-device tests against the
+# machine's RTX A4000 under a plain `cargo test -p oxionnx-cuda`.
+[[test]]
+name = "matmul_shape_sweep_gpu"
+path = "tests/matmul_shape_sweep_gpu.rs"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "verify_path_gpu"
+path = "tests/verify_path_gpu.rs"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "batched_matmul_gpu"
+path = "tests/batched_matmul_gpu.rs"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "graph_cache_gpu"
+path = "tests/graph_cache_gpu.rs"
+required-features = ["gpu-tests"]
+
+# Data-movement CUDA op wave (MaxPool/AveragePool/Resize/Pad/Slice/Concat,
+# plus the Reshape-family residency alias): one `verify_or_fallback`-path test
+# per new dispatch arm, mirroring `verify_path_gpu`'s discipline. Same
+# `required-features` reasoning as every target above.
+[[test]]
+name = "data_ops_verify_path_gpu"
+path = "tests/data_ops_verify_path_gpu.rs"
+required-features = ["gpu-tests"]
+
+# Steady-state per-call dispatch cost on a real device. Carries
+# `required-features` for exactly the reason the test targets above do: it
+# allocates GPU memory and launches real kernels the moment it runs, so a host
+# that has not opted into `gpu-tests` must not even build it.
+[[example]]
+name = "dispatch_bench"
+path = "examples/dispatch_bench.rs"
+required-features = ["gpu-tests"]
+
+# Hardware probe for driver-backed CUDA stream capture / graph replay, and the
+# measurement that decides whether `graph_cache` is worth enabling on a given
+# machine. Same `required-features` reasoning as every target above: it touches
+# a real device the moment it runs.
+[[example]]
+name = "graph_capture_probe"
+path = "examples/graph_capture_probe.rs"
+required-features = ["gpu-tests"]
+
+# Interleaved A/B of `try_cuda_dispatch` with and without graph replay. Same
+# `required-features` reasoning again.
+[[example]]
+name = "graph_dispatch_bench"
+path = "examples/graph_dispatch_bench.rs"
+required-features = ["gpu-tests"]

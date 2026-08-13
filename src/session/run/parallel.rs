@@ -446,6 +446,25 @@ impl Session {
                         cuda_ctx,
                     ) {
                         Ok(results) => results,
+                        // PROVED WRONG under `OXIONNX_CUDA_STRICT=1` — the same
+                        // rule the sequential path applies, and for the same
+                        // reason: strict mode is a promise that a demonstrated
+                        // GPU fault ends the run, and it must not depend on
+                        // whether the session happens to be running in parallel.
+                        // See `Session::dispatch_to_cuda` in `run/sequential.rs`.
+                        Err(e)
+                            if super::sequential::classify_cuda_failure(&e)
+                                == super::sequential::CudaFailureAction::FailTheRun =>
+                        {
+                            tracing::error!(
+                                op = %node.op.as_str(),
+                                node = %node.name,
+                                err = %e,
+                                "parallel: CUDA was PROVED WRONG by shadow verification and \
+                                 OXIONNX_CUDA_STRICT is set; failing the run",
+                            );
+                            return Err(e);
+                        }
                         Err(_e) => {
                             #[cfg(debug_assertions)]
                             tracing::debug!(
@@ -1117,34 +1136,31 @@ mod tests {
     /// moment a CUDA or DirectML context existed.**
     ///
     /// The old gate was literally `if self.cuda.is_some() { return true; }` — no op
-    /// check at all — while `OpKind` has ~166 variants and CUDA implements 25 of
-    /// them (DirectML, 5).  So merely *owning* a CUDA context dragged every node in
+    /// check at all — while `OpKind` has ~166 variants and CUDA implements 40 of
+    /// them (DirectML, 15).  So merely *owning* a CUDA context dragged every node in
     /// the graph out of `par_iter` and into the serial phase, to be probed one at a
     /// time on the main thread only to be declined and handed back to the CPU.
     ///
-    /// `Reshape` is the sharpest case: **no** backend has a kernel for it (it is
-    /// absent from `oxionnx_cuda::is_supported_op`, from
-    /// `oxionnx_directml::is_supported_op`, and from `is_gpu_capable`), so a graph
-    /// of independent `Reshape`s must run *fully concurrently* even with every
-    /// accelerator context live — which is exactly what `all_live()` asserts here.
+    /// An op **no** backend has a kernel for must run *fully concurrently* even
+    /// with every accelerator context live — which is exactly what `all_live()`
+    /// asserts here.
+    ///
+    /// The exemplars are derived rather than named; see
+    /// [`crate::execution_providers::ops_no_backend_implements`]. `Reshape` was
+    /// this test's original subject (hence its old name) and was the sharpest
+    /// case while it was absent from all three dispatch tables — but
+    /// `oxionnx-cuda` has since grown a shape-op arm covering
+    /// `Reshape`/`Squeeze`/`Unsqueeze`/`Flatten`, so it is now legitimately
+    /// planned onto CUDA and can no longer stand in for "nothing claims this".
+    /// The regression itself is unchanged: the gate must consult the op, not
+    /// merely the presence of a context.
     #[test]
-    fn reshape_is_never_planned_onto_an_accelerator_even_with_every_context_live() {
-        let plan = plan_from_placement(&OpKind::Reshape, 1 << 24, &auto_everything(), all_live());
-        assert!(
-            plan.is_empty(),
-            "no backend implements Reshape; it must stay on the rayon CPU path, got {plan:?}",
-        );
-
-        // Same for the other pure-shape ops that make up the plumbing of a real graph.
-        for op in [
-            OpKind::Shape,
-            OpKind::Squeeze,
-            OpKind::Flatten,
-            OpKind::Gather,
-        ] {
+    fn a_cpu_only_op_is_never_planned_onto_an_accelerator_even_with_every_context_live() {
+        for op in crate::execution_providers::ops_no_backend_implements() {
+            let plan = plan_from_placement(&op, 1 << 24, &auto_everything(), all_live());
             assert!(
-                plan_from_placement(&op, 1 << 24, &auto_everything(), all_live()).is_empty(),
-                "{op:?} has no accelerator kernel and must not be serialised",
+                plan.is_empty(),
+                "no backend implements {op:?}; it must stay on the rayon CPU path, got {plan:?}",
             );
         }
     }
@@ -1153,9 +1169,13 @@ mod tests {
     /// nodes at one topological depth, executed with the parallel runner and the
     /// most permissive placement policy.
     ///
-    /// All four land in the same depth group, all four have an empty routing plan
-    /// (asserted above, *with every context live*), so all four go through
-    /// `par_iter` together and must come back with correct, non-crossed outputs.
+    /// All four land in the same depth group and must come back with correct,
+    /// non-crossed outputs. (When this was written no backend claimed `Reshape`,
+    /// so the four also provably shared one `par_iter` pass; `oxionnx-cuda`'s
+    /// shape-op arm now claims it, so what survives here is the concurrency-
+    /// correctness half. The routing-plan half is pinned by
+    /// `a_cpu_only_op_is_never_planned_onto_an_accelerator_even_with_every_context_live`
+    /// above, on an op that really is unclaimed.)
     #[test]
     fn several_independent_reshape_nodes_execute_concurrently_and_correctly() {
         let mut weights = HashMap::new();
@@ -1296,27 +1316,46 @@ mod tests {
         assert!(chain.is_empty(), "no accelerator is compiled in");
     }
 
-    /// CUDA has no `Conv` kernel (`conv::cuda_conv` always declines), so a `Conv`
-    /// must never be planned onto it — planning it would serialise the node out of
-    /// `par_iter` for a probe guaranteed to return `Ok(None)`.  DirectML and wgpu both
-    /// *do* have a Conv kernel; under `Auto` the plan is the priority chain
-    /// (`DirectMl` before `Gpu`) filtered by support, with CUDA dropped.
+    /// CUDA has a real `Conv` kernel (`conv::cuda_conv` dispatches directly to
+    /// `oxicuda-dnn`'s `Conv1x1` / `DepthwiseConv` / `ImplicitGemmConv`), so a
+    /// `Conv` must be planned onto it, at the head of the chain.  All three
+    /// accelerators implement `Conv`, so under `Auto` the plan is the full
+    /// priority chain, unfiltered: CUDA, then DirectML, then wgpu.
+    ///
+    /// Planning several providers is the point of the chain — a node CUDA
+    /// *declines* at dispatch time (asymmetric `pads`, say) falls through to the
+    /// next entry rather than straight to the CPU.
+    ///
+    /// This test asserted the exact opposite until CUDA gained a working
+    /// convolution; it is inverted rather than deleted because it is the parallel
+    /// path's copy of the placement decision that matters most for the
+    /// convolution-dominated models this engine runs.
     #[cfg(feature = "cuda")]
     #[test]
-    fn conv_is_never_planned_onto_cuda() {
+    fn conv_is_planned_onto_cuda_first() {
         let plan = plan_from_placement(&OpKind::Conv, 1 << 20, &auto_everything(), all_live());
-        assert!(
-            !plan.contains(&ProviderKind::Cuda),
-            "CUDA declines every Conv; planning it there is a guaranteed wasted round trip",
+        assert_eq!(
+            plan.first().copied(),
+            Some(ProviderKind::Cuda),
+            "CUDA implements Conv and heads the priority chain; it must be tried first, got \
+             {plan:?}",
         );
-        // DirectML outranks wgpu and both support Conv → DirectML-first, wgpu fallback.
+        // Every accelerator supports Conv → nothing is filtered out of the chain.
         #[cfg(all(feature = "gpu", feature = "directml"))]
-        assert_eq!(plan, vec![ProviderKind::DirectMl, ProviderKind::Gpu]);
-        // Only one of the two Conv-capable accelerators is present.
+        assert_eq!(
+            plan,
+            vec![
+                ProviderKind::Cuda,
+                ProviderKind::DirectMl,
+                ProviderKind::Gpu
+            ]
+        );
         #[cfg(all(feature = "gpu", not(feature = "directml")))]
-        assert_eq!(plan, vec![ProviderKind::Gpu]);
+        assert_eq!(plan, vec![ProviderKind::Cuda, ProviderKind::Gpu]);
         #[cfg(all(feature = "directml", not(feature = "gpu")))]
-        assert_eq!(plan, vec![ProviderKind::DirectMl]);
+        assert_eq!(plan, vec![ProviderKind::Cuda, ProviderKind::DirectMl]);
+        #[cfg(all(not(feature = "gpu"), not(feature = "directml")))]
+        assert_eq!(plan, vec![ProviderKind::Cuda]);
     }
 
     // ── Bug 3: `self.providers` was ignored on the parallel path ────────────

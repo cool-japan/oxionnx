@@ -64,7 +64,7 @@ The `_placed_async` family -- `gpu_add_placed_async`, `gpu_broadcast_placed_asyn
 
 ```toml
 [dependencies]
-oxionnx-gpu = "0.1.6"
+oxionnx-gpu = "0.1.7"
 ```
 
 ```rust
@@ -81,9 +81,49 @@ if let Some(ctx) = GpuContext::try_new() {
 }
 ```
 
+## Dispatch Thresholds Are Device-Aware, and Shape-Aware
+
+Every entry point may decline. *When* it declines used to be a set of flat
+compile-time constants (10 M multiply-accumulates for GEMM, 100 000 elements for
+element-wise, 50 000 for reduction/normalization); it is now
+`GpuTuning`, derived once from the adapter's own `wgpu::AdapterInfo` and carried
+on the `GpuContext` (`GpuContext::tuning()`, `GpuContext::perf_class()`,
+`GpuContext::set_tuning()`). Three things that change:
+
+- **A FLOP count alone is the wrong gate.** `[1, 25088] x [25088, 512]` is
+  25.7 MFLOP -- past any flat threshold -- and must move a 51.4 MB `B` across the
+  bus to do it. Measured on an RTX A4000 over Vulkan, that dispatch is **1.54x
+  slower** than `oxionnx-ops`' CPU matmul. `GpuTuning::gemm_admits` therefore also
+  gates on arithmetic intensity, `2*m*k*n / (m*k + k*n + m*n)`, which is dominated
+  by the *smallest* extent and so declines skinny problems in any of the three
+  dimensions rather than only small-`m` ones.
+- **Residency changes the answer, so the gate takes it as an input.** The same
+  shape through `gpu_gemm_nt_resident_async`, whose `B` has a cache identity and
+  crosses the bus once per context rather than once per call, measured **0.43x**
+  -- a 2.3x win. `GemmWeightTraffic::{PerDispatch, Cached}` selects between the
+  two cost models; the intensity rule applies only to the first.
+- **A software adapter never dispatches.** `wgpu::DeviceType::Cpu` (Mesa
+  `lavapipe`/`llvmpipe`, SwiftShader, Direct3D WARP) is this same CPU running one
+  invocation per shader thread, without `matrixmultiply`'s packing and without
+  rayon; it cannot win at any size. A headless container that installs
+  `mesa-vulkan-drivers` gets one and a perfectly valid adapter with no hardware
+  behind it, which is exactly the case this classification exists for.
+
+Measured on the same box, with every operand transferring, the memory-bound
+kernels (`gpu_relu`, `gpu_add`, `gpu_layer_norm`, `gpu_batch_norm`) lose to their
+CPU counterparts at **every** size tried, from 64 Ki to 64 Mi elements, by 1.8x to
+45x -- so their native floors are `usize::MAX` rather than a large number. That
+does not disable them: an operand already in a device buffer skips the size gate
+entirely (`skips_size_threshold`), which is the regime activation residency
+creates and the one where those kernels earn their place. `GpuTuning::PARITY`
+lifts every floor, for tests that want to exercise a shader's numerics rather
+than the placement policy. See `context::tuning` for the full measured tables and
+the provenance of each number.
+
 ## Platform Notes
 
 - **Native** (Linux/macOS/Windows): `GpuContext::try_new()` uses `pollster` for synchronous GPU initialization; backends are selected automatically (Vulkan, Metal, or DX12). Unchanged by this release.
+- **Linux needs the Vulkan *loader*, which is a separate package from the driver.** `requested_backends()` asks for `wgpu::Backends::VULKAN` only on Linux, and wgpu reaches a Vulkan GPU through `libvulkan.so.1` -- Debian/Ubuntu `libvulkan1`, Fedora/RHEL/Alpine `vulkan-loader`, Arch `vulkan-icd-loader`. The loader is what reads the ICD manifests in `/usr/share/vulkan/icd.d/` and dlopens the vendor driver behind them; **NVIDIA's driver package installs the manifest and the driver library but not the loader**, and nothing pulls it into a minimal container image. Reproduced on this crate's reference box: with `nvidia-smi` fully working and `/usr/share/vulkan/icd.d/nvidia_icd.json` present, wgpu enumerated *zero* Vulkan adapters and `GpuContext::try_new()` returned a bare `None`; `apt-get install libvulkan1` turned the same call into a working context, with no driver change and no reboot. Use **`GpuContext::try_new_diagnosed()`** (or `try_new_diagnosed_async`) instead of `try_new` anywhere the answer reaches a human: on failure it re-enumerates every *other* backend and, when one of them reports a real GPU, says so and names the package to install, rather than returning the same `None` a machine with no GPU would.
 - **WebAssembly**: `wasm32` now has a real async path. `GpuContext::try_new_async()` acquires a `wgpu::Backends::BROWSER_WEBGPU` adapter, and kernel read-backs await a genuine `map_async` promise instead of the native blocking path; `GpuContext::try_new()` still returns `None` here, deliberately -- nothing on that target may block a thread waiting on GPU work, and blocking would deadlock the page. `cargo build -p oxionnx --target wasm32-unknown-unknown --features wasm,gpu` compiles, and the async entry points are exercised by tests, but only on native targets so far (`pollster::block_on`-driven, taking the native `try_new`/blocking-read-back branch, never `BROWSER_WEBGPU` acquisition or the browser read-back path) -- this crate's async path has not been run in an actual browser. This crate is the GPU backend, not the session layer: the entry points that would drive it from a browser are `Session::enable_gpu_async()`/`Session::run_gpu_async()` on the `oxionnx` crate, and as of this release they are not yet wired into `oxionnx`'s wasm-bindgen-exported `WasmSession`, which still runs every GPU-eligible node on the CPU.
 
 ## Part of [oxionnx](https://github.com/cool-japan/oxionnx)

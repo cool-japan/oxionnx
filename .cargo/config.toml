@@ -1,0 +1,115 @@
+# Cargo configuration for the OxiONNX workspace.
+#
+# Mirrors /notebooks/oxiface/.cargo/config.toml's x86_64-unknown-linux-gnu
+# treatment (oxiface is oxionnx's primary consumer and drove this addition —
+# see that file for the sibling copy of this reasoning). No wasm32 entry is
+# added here even though oxionnx *does* build for wasm32 (the `wasm` feature,
+# `src/wasm.rs`, `scripts/check_wasm.sh`): this section is specifically about
+# the native x86_64 codegen-baseline gap, and adding a simd128 default for
+# oxionnx's browser build is a separate, unmeasured change this session did
+# not investigate — it would need its own before/after validation the way
+# oxiface's wasm32 entry documents (2.9-4.3x, bit-identical), not a copy-paste
+# guess.
+
+[target.x86_64-unknown-linux-gnu]
+# Codegen baseline: "x86-64-v3", the psABI microarchitecture level = the
+# original x86-64 baseline (SSE2 only — what rustc ships as this target's
+# default; confirmed via `cargo rustc -- --print cfg` on an unconfigured
+# build, which reports only `sse`/`sse2`/`fxsr`) PLUS AVX, AVX2, FMA, BMI1,
+# BMI2, F16C, LZCNT, MOVBE. With this flag, the same `--print cfg` reports
+# `avx2`/`fma`/`bmi1`/`bmi2`/... too.
+#
+# Why this repo cares: `oxionnx-ops` implements 189 ONNX operators, and only
+# a fraction of them have hand-written SIMD (`simd_ops::avx2`, the conv
+# im2col fast path, `attention::simd_sdpa`, all correctly runtime-dispatched
+# via `is_x86_feature_detected!` — see `simd_ops/tests.rs` for a regression
+# test that the dispatch itself actually engages, independent of this
+# section). Everything else — `math::{reduce,broadcast,argminmax}`,
+# `resize`, `comparison`, `bitwise`, the scalar fallback arms of every SIMD
+# op above, and most of the other ~170 operators — is plain scalar Rust that
+# only LLVM's auto-vectorizer can speed up, and it can't select instructions
+# wider than whatever `-C target-cpu` baseline it's told is legal. Without
+# this flag, that's SSE2 (128-bit) everywhere, even on hardware — like this
+# dev machine's Xeon Gold 5315Y, and like oxiface's target deployment
+# environment — that has 256-bit AVX2 available and unused. In oxiface's
+# per-frame video pipeline this operator crate is called hundreds of times
+# per run, so this is not a one-off cost.
+#
+# Numerically safe, verified rather than assumed: `-C target-cpu` only
+# widens which vector *instructions* the compiler may select — it does not
+# loosen Rust/LLVM's floating-point semantics. Checked by disassembly
+# (rustc 1.97.1): a plain `a * b + c` compiles to separate `vmulss`/`vaddss`
+# whether or not FMA is in the enabled target-feature set — rustc never
+# implicitly contracts float expressions into a fused multiply-add (only an
+# explicit `f32::mul_add` does that). And `f32::mul_add` is unaffected in
+# *output* either way: without hardware FMA it tail-calls the
+# correctly-rounded `fmaf` from libm (same single rounding, just a function
+# call instead of one `vfmadd213ss` instruction) — so having the
+# target-feature only changes speed, never the result. Nothing in this crate
+# relies on `-ffast-math`-style reassociation, and this flag grants none. So
+# this is a pure speed change with bit-identical output on the plain
+# (non-reduction) elementwise loops that make up most of the affected code.
+# (Reduction-shaped code — `math::reduce`'s sum/mean, `simd_reduce_sum`'s
+# Kahan-summation scalar fallback, etc. — already documents its own ordering
+# guarantees independent of this flag; LLVM will not silently reassociate a
+# `+=` reduction into SIMD-parallel order without an explicit fast-math
+# opt-in this codebase does not set, regardless of target-cpu.)
+#
+# Level choice: v3, not v2 (too little — no AVX/FMA, which matter most for
+# this crate's conv/matmul-adjacent kernels) and not v4 (needs AVX-512,
+# which this dev machine's CPU does NOT have per `lscpu`, and which a large
+# fraction of 2015-2023 x86_64 desktop/server CPUs still lack — baking in a
+# v4 default would be an illegal-instruction crash on real deployment
+# hardware). v3 = Haswell-class (2013+), safely within "essentially all
+# 2015+ x86_64 Linux server/desktop CPUs."
+#
+# ── RUSTFLAGS SHADOWING — READ THIS BEFORE ASSUMING THIS FLAG IS ACTIVE ──
+#
+# Cargo's rustflags sources are *mutually exclusive*, not merged, in this
+# priority order: (1) `CARGO_ENCODED_RUSTFLAGS` env var, (2) `RUSTFLAGS` env
+# var, (3) all matching `target.<triple>.rustflags` / `target.<cfg>.rustflags`
+# config entries (this section is source 3), (4) `build.rustflags` config.
+# The instant *anything* sets the `RUSTFLAGS` env var, Cargo uses ONLY that
+# and ignores this section entirely — it does not append to it, even
+# partially. (Verified against Cargo 1.97.1: also tried the newer
+# `target.'cfg(target_arch = "x86_64")'.rustflags` selector syntax as an
+# alternate source — it is shadowed the exact same way; the cfg-predicate
+# form is not a different priority tier, just different selector syntax
+# within the same tier 3.)
+#
+# This is not hypothetical here: the reference dev container this repo was
+# built in exports a global RUSTFLAGS from `~/.bashrc` (for oxicuda/CUDA
+# rpath linking, needed because `oxionnx-cuda` links against libcudart —
+# `-L native=.../lib64 -C link-arg=-Wl,-rpath,... -C debuginfo=0`, no
+# `-C target-cpu` of its own). Confirmed by direct comparison of
+# `cargo rustc -- --print cfg` in that container: with that ambient
+# RUSTFLAGS present, this section's target-cpu setting is completely inert —
+# `--print cfg` reports the bare `sse2` baseline, byte-for-byte the same as
+# a crate with no `.cargo/config.toml` at all. Unset RUSTFLAGS (or build
+# outside such a shell) and the same command reports `avx2`/`fma`/`bmi1`/
+# `bmi2`/... — this section takes effect exactly as intended. So: on a fresh
+# clone in a normal environment (no ambient RUSTFLAGS), this section just
+# works, no action needed. Reproducing this repo's build inside a shell that
+# exports its own RUSTFLAGS (as the reference container's does) needs one of:
+#   - Make that shell's own RUSTFLAGS include this flag too, e.g. append
+#     `-C target-cpu=x86-64-v3` to whatever it already exports (it's a flat,
+#     space-separated rustc flag string — appending composes fine alongside
+#     link/rpath flags already present; this is a fix applied to a
+#     RUSTFLAGS-exporting shell profile, not to this file).
+#   - Or unset it for the build: `env -u RUSTFLAGS cargo build --release`.
+# (`CARGO_ENCODED_RUSTFLAGS`, if set, outranks plain `RUSTFLAGS` too — but
+# it's an equally all-or-nothing replacement, not a merge primitive, so it
+# doesn't change the guidance above.)
+#
+# Note this section only ever affects oxionnx's own host-side Rust codegen.
+# `oxionnx-cuda`'s device kernels are separate: they compile via NVRTC/PTX
+# at their own optimization settings and never see rustc's `-C target-cpu`
+# at all, so this flag has no interaction — good or bad — with GPU codegen.
+#
+# TODO(aarch64): no ARM hardware was available to validate an
+# aarch64-unknown-linux-gnu equivalent when this section was added — add one
+# once there's real hardware (or at minimum QEMU) to confirm the flags
+# against, rather than guessing at a `target-cpu`/`target-feature` baseline
+# for a family (Cortex-A / Apple Silicon / Graviton / ...) that varies far
+# more between chips than x86-64-v3 does across x86_64 vendors.
+rustflags = ["-C", "target-cpu=x86-64-v3"]

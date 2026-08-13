@@ -8,6 +8,52 @@ use super::types::{ModelInfo, ModelMetadata, NodeProfile};
 use super::Session;
 
 impl Session {
+    /// A snapshot of this session's CUDA device-cache and transfer counters.
+    ///
+    /// `None` when the session has no CUDA context (no device, or CUDA was not
+    /// activated). The counters are cumulative for the context's lifetime, so
+    /// "what did this frame move" is
+    /// [`CacheCounters::since`](oxionnx_cuda::residency::CacheCounters::since)
+    /// between two snapshots.
+    ///
+    /// # What to watch
+    ///
+    /// * `weight_bytes_uploaded` — must be **zero** across a steady-state
+    ///   frame, or some initializer is crossing the bus every frame.
+    /// * `host_to_device_bytes` / `device_to_host_bytes` — the whole bus cost of
+    ///   a frame, counted at the copies themselves rather than inferred from
+    ///   shapes.
+    /// * `stream_syncs` — blocking host↔device rendezvous. Before activation
+    ///   residency this was one per CUDA-claimed node; after it, one per
+    ///   host-visible result.
+    /// * `resident_activation_binds` / `device_handoffs` — operands bound
+    ///   without an upload, and results kept without a read-back. These are the
+    ///   two halves of what residency actually did.
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn cuda_cache_counters(&self) -> Option<oxionnx_cuda::residency::CacheCounters> {
+        self.cuda
+            .as_ref()
+            .map(oxionnx_cuda::CudaContext::cache_counters)
+    }
+
+    /// Whether this session's CUDA context issues every launch and copy on one
+    /// driver queue.
+    ///
+    /// `None` when there is no CUDA context. `Some(false)` means the context
+    /// was built with a split BLAS stream, in which case activation residency
+    /// is switched off for its runs — see
+    /// `session::run::sequential::CUDA_RESIDENCY_ENV_VAR`.
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn cuda_streams_unified(&self) -> Option<bool> {
+        self.cuda
+            .as_ref()
+            .map(oxionnx_cuda::CudaContext::streams_unified)
+    }
+}
+
+impl Session {
     /// Register an additional (or replacement) operator at runtime.
     ///
     /// The operator is keyed by its own [`Operator::op_type`], so registering a
@@ -322,6 +368,60 @@ impl Session {
             }
             None => false,
         }
+    }
+
+    /// Device bytes this session's context currently has allocated, idle pooled
+    /// buffers included.
+    ///
+    /// `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_live_bytes(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.live_gpu_bytes())
+    }
+
+    /// Device bytes held by idle buffers waiting to be reused — a subset of
+    /// [`Self::gpu_live_bytes`] that no dispatch is reading.
+    ///
+    /// Run-over-run growth here is the memory-boundedness question that decides
+    /// whether recycling is affordable, so it is exposed rather than inferred.
+    /// `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pooled_bytes(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.pooled_gpu_bytes())
+    }
+
+    /// Idle buffers this session's context is pooling, and the count bound it
+    /// keeps them under. `(0, 0)` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pooled_buffers(&self) -> (usize, usize) {
+        self.gpu.as_ref().map_or((0, 0), |gpu| gpu.pooled_buffers())
+    }
+
+    /// The byte retention bound this session's context keeps its idle pooled
+    /// buffers under. `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pool_byte_budget(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.pool_byte_budget())
+    }
+
+    /// Buffer requests this session's context served from an idle pooled entry,
+    /// cumulative. `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pool_reuses(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.pool_reuses())
+    }
+
+    /// Buffer requests this session's context had to ask the driver for,
+    /// cumulative. `0` without a device.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu_pool_allocations(&self) -> u64 {
+        self.gpu.as_ref().map_or(0, |gpu| gpu.pool_allocations())
     }
 
     /// Cumulative host→device bytes this session's context has uploaded —

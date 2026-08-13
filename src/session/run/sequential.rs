@@ -43,6 +43,10 @@ use super::super::types::NodeProfile;
 use super::super::Session;
 use super::state::SessionRunState;
 use super::{OutputSet, RefCounts};
+#[cfg(feature = "cuda")]
+use crate::session::gpu_activations::CudaActivations;
+#[cfg(feature = "cuda")]
+use crate::session::gpu_residency::{ResidencyTier, RESIDENT_DISPATCH_FLOOR};
 
 // ── Mixed precision ⟂ execution providers ────────────────────────────────────
 
@@ -228,6 +232,186 @@ fn accelerator_gate(
     accelerator_rank(candidate) > accelerator_rank(chosen) && provider_supports_op(candidate, op)
 }
 
+// ── CUDA activation residency ────────────────────────────────────────────────
+
+/// Set `OXIONNX_CUDA_RESIDENCY=0` to make every CUDA-claimed node read its
+/// result back to the host, as it did before activations could stay on the
+/// device.
+///
+/// A kill switch rather than an opt-in: residency is a strict reduction in
+/// work (it deletes uploads, read-backs and fences without changing a single
+/// kernel), so the default is on and this exists for bisecting a suspected
+/// residency bug against the pre-residency behaviour in the same binary.
+#[cfg(feature = "cuda")]
+pub const CUDA_RESIDENCY_ENV_VAR: &str = "OXIONNX_CUDA_RESIDENCY";
+
+/// May this run keep CUDA activations on the device between nodes?
+///
+/// Three conditions, all necessary:
+///
+/// * **The kill switch is not set.** See [`CUDA_RESIDENCY_ENV_VAR`].
+/// * **The context's streams are unified.** Residency drops the per-node
+///   `stream.synchronize()`, and what makes that sound is that every launch and
+///   copy the provider issues rides one queue (`DnnHandle` builds its BLAS
+///   sub-handle on its own stream). A context built with a split BLAS stream
+///   would need event choreography this layer does not perform, so it keeps the
+///   fenced behaviour instead of being silently raced.
+/// * **Shadow verification is off.** `OXIONNX_CUDA_VERIFY=1` recomputes every
+///   claimed node on a CPU oracle, and the oracle needs the exact host bytes
+///   the kernel read *and* the exact host bytes it wrote. A resident operand
+///   has neither. Rather than verify a subset and report a clean run, a
+///   verifying run materialises everything — which is precisely the behaviour
+///   it had before residency existed, so a `VERIFY=1` comparison is still
+///   node-for-node against the same code path it always graded. The cost is
+///   that `VERIFY=1` wall-clock numbers are not comparable with production
+///   ones, which was already true (the oracle roughly doubles every node).
+///
+/// This is where the last two are decided, next to the environment flags they
+/// answer to; `oxionnx_cuda`'s own `try_cuda_dispatch_resident` documents the
+/// same interaction from the kernel side.
+#[cfg(feature = "cuda")]
+fn cuda_residency_enabled(ctx: &oxionnx_cuda::CudaContext) -> bool {
+    let switched_off = std::env::var(CUDA_RESIDENCY_ENV_VAR)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        });
+    !switched_off && ctx.streams_unified() && !oxionnx_cuda::reference::verify_enabled()
+}
+
+/// Which cost model this node's dispatch is priced under.
+///
+/// # Why "any operand resident", and not the wgpu rule
+///
+/// `gpu_residency::node_residency_tier` answers `Resident` only when *every*
+/// operand is on the device, because the wgpu path's `Transferred` floor is
+/// `usize::MAX` — one uploading operand there really does sink the node, and
+/// `sequential_async` uploads the small remainder to make the strict claim true
+/// rather than relaxing it.
+///
+/// The CUDA path is priced differently and the arithmetic is what decides:
+/// declining a node with a resident operand does not avoid a transfer, it
+/// *forces* one. The value exists only on the device, so the CPU operator
+/// cannot run until it has been read back (`4n` bytes down), and the next CUDA
+/// node then uploads the result again (`4·out` bytes up). Dispatching moves at
+/// most the node's *host* operands, which the transferring model already
+/// priced. So one resident operand is enough to change which side of the trade
+/// the node is on, and requiring all of them would leave InSwapper's
+/// `Mul([1,C,H,W], [1,C,1,1])` pairs — big operand resident, small one from a
+/// CPU-side `Gemm` — declining and dragging a 33 MB activation back across the
+/// bus.
+///
+/// [`RESIDENT_DISPATCH_FLOOR`] still binds, and is what stops this from being
+/// a blanket bypass: a dispatch too small to fill one workgroup is not worth
+/// making whatever its operands cost.
+#[cfg(feature = "cuda")]
+fn cuda_node_tier(node: &Node, activations: &CudaActivations) -> ResidencyTier {
+    let any_resident = node
+        .inputs
+        .iter()
+        .any(|name| !name.is_empty() && activations.get(name).is_some());
+    if any_resident {
+        ResidencyTier::Resident
+    } else {
+        ResidencyTier::Transferred
+    }
+}
+
+/// Should CUDA be offered this node, given which tier it is in?
+///
+/// [`ResidencyTier::Transferred`] is exactly [`accelerator_gate`] — the
+/// pre-residency decision, unchanged, including `OpPlacement::Auto`'s
+/// `gpu_threshold_bytes` and the hard `MIN_GPU_DISPATCH_BYTES` floor.
+///
+/// [`ResidencyTier::Resident`] replaces those two byte floors with
+/// [`RESIDENT_DISPATCH_FLOOR`] and keeps everything else:
+///
+/// * `OpPlacement::CpuOnly` still closes the gate. A user who said "no
+///   accelerator" gets no accelerator, whatever is resident.
+/// * `OpPlacement::Manual` still binds to its pin: an op pinned elsewhere (or
+///   to the CPU, or not pinned at all) does not reach CUDA.
+/// * `oxionnx_cuda::is_supported_op` still has to claim the op.
+///
+/// # Why the byte floors have to go, specifically
+///
+/// `oxiface` builds its sessions with `Auto { gpu_threshold_bytes: 16_384 }`
+/// against `estimate_output_bytes` — *the node's own output size*. That is the
+/// right question while operands transfer and the wrong one once they do not.
+/// InSwapper's 24 InstanceNorm `ReduceMean` nodes produce `[1, C, 1, 1]` = 4 KB
+/// and its 12 AdaIN `Gemm` heads produce `[1, 2048]` = 8 KB; both sit under the
+/// floor, and each decline drags its 33 MB *input* back across the bus. The
+/// floor was calibrated against a cost model in which the node's output is what
+/// moves. Under residency the node's output is what *stays*.
+#[cfg(feature = "cuda")]
+fn cuda_accelerator_gate(
+    op: &OpKind,
+    output_bytes: usize,
+    resident_elements: usize,
+    placement_cfg: &crate::execution_providers::OpPlacement,
+    tier: ResidencyTier,
+) -> bool {
+    use crate::execution_providers::{provider_supports_op, OpPlacement};
+
+    if matches!(tier, ResidencyTier::Transferred) {
+        return accelerator_gate(ProviderKind::Cuda, op, output_bytes, placement_cfg);
+    }
+
+    if !provider_supports_op(ProviderKind::Cuda, op) {
+        return false;
+    }
+    if resident_elements < RESIDENT_DISPATCH_FLOOR {
+        return false;
+    }
+    match placement_cfg {
+        OpPlacement::CpuOnly => false,
+        OpPlacement::Auto { .. } => true,
+        OpPlacement::Manual(map) => map.get(op).copied() == Some(ProviderKind::Cuda),
+    }
+}
+
+// ── What a CUDA dispatch *failure* means ─────────────────────────────────────
+
+/// What the run loop must do with an `Err` a CUDA dispatch handed back.
+///
+/// Two outcomes that used to be one, and had to stop being one: see the
+/// "DECLINED / FAILED / PROVED-WRONG" note above `Session::dispatch_to_cuda`.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CudaFailureAction {
+    /// The node has **not** been executed — a driver error, a PTX failure, an
+    /// allocation refused.  Recoverable: the CPU operator computes it instead,
+    /// and the run continues (logged at `warn!`).
+    FallBackToCpu,
+    /// `OXIONNX_CUDA_VERIFY=1` proved the GPU wrong on this node and
+    /// `OXIONNX_CUDA_STRICT=1` says that ends the run.  Propagated as `Err`.
+    FailTheRun,
+}
+
+/// Classify an error returned by `oxionnx_cuda::try_cuda_dispatch`.
+///
+/// A free function, shared by the sequential and parallel execution paths, so
+/// "what does `OXIONNX_CUDA_STRICT` mean" cannot come out different depending
+/// on `with_parallel_execution` — and so the decision is unit-testable on a
+/// host with no CUDA device, which is where this rule was silently wrong
+/// before.
+///
+/// Note that a verify mismatch is only ever an `Err` **in strict mode**: under
+/// the default `FailurePolicy::Fallback`, `oxionnx_cuda`'s `shadow_verify`
+/// discards the GPU's numbers and reports a decline (`Ok(None)`), which never
+/// reaches this function.  So `FailTheRun` needs no separate strict check —
+/// reaching it *is* strict mode.
+#[cfg(feature = "cuda")]
+pub(super) fn classify_cuda_failure(err: &OnnxError) -> CudaFailureAction {
+    if oxionnx_cuda::is_verify_mismatch(err) {
+        CudaFailureAction::FailTheRun
+    } else {
+        CudaFailureAction::FallBackToCpu
+    }
+}
+
 impl Session {
     /// The model's `ai.onnx` (default-domain) opset version.
     ///
@@ -292,7 +476,33 @@ impl Session {
         // bound before the first node executes.
         self.bind_registry_opset();
 
-        for node in &self.sorted_nodes {
+        // Which of this graph's values may live in a CUDA buffer between nodes,
+        // and which node is the last one that will read each of them. Both are
+        // properties of the node order, which is fixed, so both are decided
+        // once here rather than guessed at per node — and by the *same*
+        // `RunActivations` the wgpu path drives, over a different buffer type
+        // (see `session::gpu_activations`). A session with no CUDA context, or
+        // one whose residency is switched off, gets the empty plan, and every
+        // path below then behaves exactly as it did before activations could
+        // stay resident.
+        #[cfg(feature = "cuda")]
+        let mut cuda_activations = CudaActivations::new(
+            self.cuda.as_ref().is_some_and(cuda_residency_enabled),
+            &self.sorted_nodes,
+            &self.output_names,
+            // One capable consumer is enough here, because the read-back a
+            // host-only consumer forces is one this engine would have paid at
+            // the *producer* anyway — see `KeepPolicy`. On InSwapper, where
+            // every second node is a `Pad`/`Slice`/`Unsqueeze`/broadcasting
+            // `Mul` with no CUDA arm, the strict rule keeps essentially nothing.
+            crate::session::gpu_activations::KeepPolicy::AnyCapableConsumer,
+            |node, slot| oxionnx_cuda::accepts_resident_slot(&node.op, slot),
+        );
+
+        // The index is the CUDA activation plan's release schedule; without
+        // that feature nothing consults it.
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+        for (node_index, node) in self.sorted_nodes.iter().enumerate() {
             // NOTE: there is deliberately no `OpKind::Unknown => continue` here.
             // The registry lookup below is the single gate for "this engine
             // cannot run that operator"; see `super::unsupported_op_error`.
@@ -335,6 +545,29 @@ impl Session {
             } else {
                 0
             };
+            // `estimate_output_bytes` prefers the resolved output shape and
+            // falls back to the first input tensor it can find in the run
+            // state. A node whose only input stayed on the device is absent
+            // from that map, so without this substitution the fallback would
+            // answer `0` — below every floor — and close the gate on precisely
+            // the nodes residency exists to keep open. Applied only when the
+            // estimate is `0`, so a graph with no resident values gets the
+            // identical number it always did. Mirrors
+            // `sequential_async::async_output_bytes`.
+            #[cfg(feature = "cuda")]
+            let cuda_resident_elements: usize = node
+                .inputs
+                .iter()
+                .filter_map(|name| cuda_activations.get(name))
+                .map(oxionnx_cuda::CudaDeviceTensor::len)
+                .max()
+                .unwrap_or(0);
+            #[cfg(feature = "cuda")]
+            let output_bytes = if output_bytes == 0 {
+                cuda_resident_elements.saturating_mul(std::mem::size_of::<f32>())
+            } else {
+                output_bytes
+            };
             #[cfg(not(any(feature = "gpu", feature = "cuda", feature = "directml")))]
             let output_bytes: usize = 0;
 
@@ -351,8 +584,12 @@ impl Session {
                     ref_counts,
                     output_set,
                     resolved,
+                    #[cfg(feature = "cuda")]
+                    &mut cuda_activations,
                 )? {
                     if dispatched {
+                        #[cfg(feature = "cuda")]
+                        cuda_activations.release_after(node_index, self.cuda.as_ref());
                         continue;
                     }
                     // dispatched == false means all explicit providers returned None
@@ -377,15 +614,17 @@ impl Session {
             // CUDA — highest priority accelerator.
             #[cfg(feature = "cuda")]
             if accel_eligible
-                && accelerator_gate(
-                    ProviderKind::Cuda,
+                && cuda_accelerator_gate(
                     &node.op,
                     output_bytes,
+                    cuda_resident_elements,
                     &self.op_placement,
+                    cuda_node_tier(node, &cuda_activations),
                 )
-                && self.dispatch_to_cuda(node, state, resolved)?
+                && self.dispatch_to_cuda(node, state, &mut cuda_activations, resolved)?
             {
                 self.decrement_refs_state(node, state, ref_counts, output_set);
+                cuda_activations.release_after(node_index, self.cuda.as_ref());
                 continue;
             }
 
@@ -403,6 +642,8 @@ impl Session {
                 && self.dispatch_to_directml(node, state, resolved)?
             {
                 self.decrement_refs_state(node, state, ref_counts, output_set);
+                #[cfg(feature = "cuda")]
+                cuda_activations.release_after(node_index, self.cuda.as_ref());
                 continue;
             }
 
@@ -418,8 +659,21 @@ impl Session {
                 && self.dispatch_to_wgpu(node, state, resolved)?
             {
                 self.decrement_refs_state(node, state, ref_counts, output_set);
+                #[cfg(feature = "cuda")]
+                cuda_activations.release_after(node_index, self.cuda.as_ref());
                 continue;
             }
+
+            // Everything below this line runs on the host, so anything this
+            // node reads has to be there. This is the *single* convergence
+            // point for that: the DirectML/wgpu arms above already take host
+            // tensors, and the mixed-precision arm, the CPU operator and the
+            // unsupported-op error all pass through here, so a resident operand
+            // cannot reach any of them. One read-back per tensor per run — the
+            // host copy is memoized into the run state, and later CUDA
+            // consumers still bind the device copy in place.
+            #[cfg(feature = "cuda")]
+            self.materialize_resident_cuda_inputs(node, state, &cuda_activations)?;
 
             // ── Mixed precision: native f16 element-wise execution ────────────
             // No native f16 kernel for this op → fall through to normal execution
@@ -427,6 +681,8 @@ impl Session {
             if mixed_precision_node
                 && self.try_native_f16_node(node, state, ref_counts, output_set, resolved)?
             {
+                #[cfg(feature = "cuda")]
+                cuda_activations.release_after(node_index, self.cuda.as_ref());
                 continue;
             }
 
@@ -463,7 +719,28 @@ impl Session {
             }
 
             self.decrement_refs_state(node, state, ref_counts, output_set);
+            // Released after a node that ran on the CPU too: "last consumer" is
+            // a property of the graph, not of where the node executed.
+            #[cfg(feature = "cuda")]
+            cuda_activations.release_after(node_index, self.cuda.as_ref());
         }
+        #[cfg(feature = "cuda")]
+        if cuda_activations.is_enabled() {
+            tracing::debug!(
+                peak_activation_bytes = cuda_activations.peak_bytes(),
+                live_activation_bytes = cuda_activations.live_bytes(),
+                "CUDA activation residency: run finished",
+            );
+        }
+        // Nothing should be left: every name in the plan has a last consumer,
+        // and every node released after itself. Dropping the map **destroys**
+        // whatever a future edit does leave behind — deliberately not the
+        // recycling `release_after` performs, because a value that reaches here
+        // is one the last-use schedule lost track of, and the honest thing to
+        // do with it is return its bytes to the driver rather than hand them to
+        // the pool as if they had been released on schedule.
+        #[cfg(feature = "cuda")]
+        drop(cuda_activations);
         Ok(())
     }
 
@@ -561,32 +838,110 @@ impl Session {
     // Each returns:
     //   Ok(true)  — the provider executed the node and its outputs are committed
     //               to `state` (validated, all-or-nothing).
-    //   Ok(false) — the node was NOT executed; walk on down the chain.  Two very
-    //               different things currently collapse into this:
+    //   Ok(false) — the node was NOT executed; walk on down the chain.  Two
+    //               distinct-but-both-recoverable things map to this:
     //                 * DECLINED — no live context, no kernel for this op, or the
     //                   node's configuration is out of the kernel's range
     //                   (`Ok(None)`).  A normal, expected fall-back.
-    //                 * FAILED — the backend errored (`Err`).  Abnormal.
-    //   Err(_)    — unrecoverable.  Reserved for a provider that returned results
-    //               violating the write-back contract (wrong arity, internally
-    //               inconsistent tensor, shape disagreeing with shape inference).
-    //               Corrupt results must never be laundered into a quiet CPU
-    //               fallback: the graph is already poisoned at that point, and a
-    //               wrong answer is worse than a slow one.
+    //                 * FAILED — the backend errored (`Err`) while trying to run
+    //                   the node: a driver error, a PTX failure, an allocation
+    //                   refused.  Abnormal, logged at `warn!`, but the node has
+    //                   not been executed and the CPU can still compute it, so
+    //                   the run continues.
+    //   Err(_)    — unrecoverable.  Two things reach it:
+    //                 * a provider returning results that violate the write-back
+    //                   contract (wrong arity, internally inconsistent tensor,
+    //                   shape disagreeing with shape inference).  Corrupt results
+    //                   must never be laundered into a quiet CPU fallback: the
+    //                   graph is already poisoned at that point, and a wrong
+    //                   answer is worse than a slow one.
+    //                 * a **shadow-verification mismatch under
+    //                   `OXIONNX_CUDA_STRICT=1`** — see `dispatch_to_cuda`.
     //
-    // The DECLINED/FAILED collapse is pre-existing and a later wave will separate
-    // them.  It is not made worse here, and the failure information is no longer
-    // thrown away: it used to be logged behind `#[cfg(debug_assertions)]
-    // tracing::debug!`, i.e. invisible in every release build.  It is now a
-    // release-visible `tracing::warn!` carrying the provider, node, op kind and
-    // the error itself — the exact record that wave will need.
+    // # DECLINED / FAILED / PROVED-WRONG
+    //
+    // The first two are recoverable and stay collapsed onto `Ok(false)`: in both
+    // cases the node simply has not run yet, and the CPU operator produces the
+    // right answer.  The third is not, and used to be collapsed with them, which
+    // is what made `OXIONNX_CUDA_STRICT=1` a documented promise the engine did
+    // not keep: a run whose kernels the oracle had just caught disagreeing with
+    // it logged `strict=true` mismatches and then exited `0` with CPU-recomputed
+    // numbers.  "Strict" has to mean the run fails.  It now does.
+
+    /// Read back every operand of `node` that exists only on the device, once.
+    ///
+    /// Called immediately before any host-side execution of the node. The host
+    /// tensor is memoized into the run state, so a second consumer of the same
+    /// value finds it there and no second read-back happens; the device copy is
+    /// deliberately kept, so a *later* CUDA consumer still binds it in place.
+    ///
+    /// # Errors
+    ///
+    /// [`OnnxError::Internal`] when the read-back fails. That is a device
+    /// error, and unlike every other decline in this engine it has no fallback:
+    /// the only copy of the value is in a buffer that cannot be read, so the
+    /// run cannot produce a correct result and must say so rather than continue
+    /// with a missing tensor.
+    #[cfg(feature = "cuda")]
+    fn materialize_resident_cuda_inputs(
+        &self,
+        node: &Node,
+        state: &mut SessionRunState,
+        activations: &CudaActivations,
+    ) -> Result<(), OnnxError> {
+        if !activations.is_enabled() {
+            return Ok(());
+        }
+        let Some(cuda_ctx) = &self.cuda else {
+            return Ok(());
+        };
+        for name in &node.inputs {
+            if name.is_empty() || state.get(name).is_some() {
+                continue;
+            }
+            let Some(device) = activations.get(name) else {
+                continue;
+            };
+            // "Exists only on the device" is the condition, and a *promoted*
+            // operand never satisfies it: it was uploaded from the weight map,
+            // which still holds those bytes, so reading it back would move
+            // bytes the host already has. Only a node output needs this — and
+            // the distinction has to be `holds_node_output` rather than "is it
+            // in `weights`", because a model may legally name a node output
+            // after an initializer, and then the initializer's bytes are
+            // precisely the wrong ones to hand the operator.
+            if !activations.holds_node_output(name) {
+                continue;
+            }
+            let tensor = device.read_back(cuda_ctx).map_err(|err| {
+                OnnxError::Internal(format!(
+                    "reading device-resident tensor '{}' back for node '{}' ({}) failed: {err}; \
+                     the value exists only on the device and the node cannot run without it",
+                    name,
+                    node.name,
+                    node.op.as_str(),
+                ))
+            })?;
+            state.insert(
+                name.clone(),
+                tensor,
+                self.pool.as_ref().map(|m| m as &Mutex<SizeClassPool>),
+            );
+        }
+        Ok(())
+    }
 
     /// Offer `node` to the CUDA backend.  See the block comment above.
+    ///
+    /// `activations` is this run's device-resident value map: operands found in
+    /// it are bound in place rather than uploaded, and a result the plan says
+    /// may stay resident is stored there instead of being read back.
     #[cfg(feature = "cuda")]
     fn dispatch_to_cuda(
         &self,
         node: &Node,
         state: &mut SessionRunState,
+        activations: &mut CudaActivations,
         resolved_shapes: &HashMap<String, Vec<usize>>,
     ) -> Result<bool, OnnxError> {
         let Some(cuda_ctx) = &self.cuda else {
@@ -594,9 +949,44 @@ impl Session {
             return Ok(false);
         };
 
+        // A device result is a *request*: the arm answers with a host tensor
+        // whenever its epilogue only exists there (a `Gemm` bias to fold, a
+        // convolution engine that owes a host-side bias add), and the caller
+        // stores whichever it gets. The three conditions for making the request
+        // at all — residency on, exactly one output, and the graph plan says
+        // that output may stay — mirror `gpu_dispatch::node_output_placement`.
+        let placement = if node.outputs.len() == 1
+            && node
+                .outputs
+                .first()
+                .is_some_and(|name| activations.may_keep(name))
+        {
+            oxionnx_cuda::CudaOutputPlacement::Device
+        } else {
+            oxionnx_cuda::CudaOutputPlacement::Host
+        };
+
         let started = crate::time_compat::Instant::now();
-        match oxionnx_cuda::try_cuda_dispatch(node, &self.weights, state.as_map(), cuda_ctx) {
-            Ok(Some(results)) => {
+        match oxionnx_cuda::try_cuda_dispatch_resident(
+            node,
+            &self.weights,
+            state.as_map(),
+            activations,
+            placement,
+            cuda_ctx,
+        ) {
+            Ok(Some(oxionnx_cuda::CudaDispatchOutcome::Device(tensor))) => {
+                let elapsed = started.elapsed();
+                self.commit_resident_cuda_output(
+                    node,
+                    tensor,
+                    elapsed,
+                    activations,
+                    resolved_shapes,
+                )
+                .map(|()| true)
+            }
+            Ok(Some(oxionnx_cuda::CudaDispatchOutcome::Host(results))) => {
                 let elapsed = started.elapsed();
                 self.commit_provider_results(node, "CUDA", results, elapsed, state, resolved_shapes)
                     .map(|()| true)
@@ -604,8 +994,32 @@ impl Session {
             // DECLINED: no kernel for this op, or this node's configuration is out
             // of the kernel's range.  Fall through to the next provider.
             Ok(None) => Ok(false),
-            // FAILED — not the same thing as declined, however similarly it is
-            // currently treated.  Kept visible in release builds.
+            // PROVED WRONG: `OXIONNX_CUDA_VERIFY=1` recomputed this node on the
+            // CPU oracle, the two disagreed, and `OXIONNX_CUDA_STRICT=1` says a
+            // demonstrated GPU fault ends the run.  (Without STRICT the mismatch
+            // never becomes an `Err` at all: `oxionnx_cuda::reference::shadow_verify`
+            // discards the GPU's numbers and reports a decline, which arrives
+            // above as `Ok(None)` and falls back to the CPU.  So reaching here
+            // *is* strict mode.)
+            //
+            // Falling back would defeat the flag: the user asked to be told, and
+            // a CPU-recomputed result exits `0` and looks identical to a healthy
+            // run.  Propagated instead, aborting the inference.
+            Err(err) if classify_cuda_failure(&err) == CudaFailureAction::FailTheRun => {
+                tracing::error!(
+                    provider = "CUDA",
+                    op = %node.op.as_str(),
+                    node = %node.name,
+                    error = %err,
+                    "execution provider was PROVED WRONG by shadow verification and \
+                     OXIONNX_CUDA_STRICT is set; failing the run instead of falling back",
+                );
+                Err(err)
+            }
+            // FAILED — the backend could not run the node (driver, PTX,
+            // allocation).  Recoverable: nothing was executed, so the CPU
+            // operator below still computes the right answer.  Kept visible in
+            // release builds.
             Err(err) => {
                 tracing::warn!(
                     provider = "CUDA",
@@ -736,6 +1150,64 @@ impl Session {
         self.write_node_outputs(node, provider, results, state, resolved_shapes)
     }
 
+    /// Store a node result that stayed in a device buffer.
+    ///
+    /// The device counterpart of [`Session::commit_provider_results`], and it
+    /// keeps the one check that matters: `write_node_outputs` validates a host
+    /// result's shape against shape inference, and a kernel that computed the
+    /// wrong extent would otherwise poison every later node with no diagnostic
+    /// — worse here than for a host tensor, because a device buffer is harder
+    /// to inspect.
+    ///
+    /// # Errors
+    ///
+    /// [`OnnxError::Internal`] when the node declares no output to store the
+    /// value under, or [`OnnxError::ShapeMismatch`] when the kernel's extent
+    /// disagrees with the resolved shape.
+    #[cfg(feature = "cuda")]
+    fn commit_resident_cuda_output(
+        &self,
+        node: &Node,
+        tensor: oxionnx_cuda::CudaDeviceTensor,
+        elapsed: std::time::Duration,
+        activations: &mut CudaActivations,
+        resolved_shapes: &HashMap<String, Vec<usize>>,
+    ) -> Result<(), OnnxError> {
+        let name = node.outputs.first().ok_or_else(|| {
+            OnnxError::Internal(format!(
+                "CUDA provider kept the result of node '{}' ({}) on the device, but the node \
+                 declares no output to store it under",
+                node.name,
+                node.op.as_str(),
+            ))
+        })?;
+        if let Some(expected) = resolved_shapes.get(name) {
+            if tensor.shape() != expected.as_slice() {
+                return Err(OnnxError::ShapeMismatch(format!(
+                    "CUDA provider returned device-resident output '{}' of node '{}' ({}) with \
+                     shape {:?}, but shape inference resolved {:?}",
+                    name,
+                    node.name,
+                    node.op.as_str(),
+                    tensor.shape(),
+                    expected,
+                )));
+            }
+        }
+        if let Some(ref profiling) = self.profiling_data {
+            if let Ok(mut data) = profiling.lock() {
+                data.push(NodeProfile {
+                    node_name: node.name.clone(),
+                    op_type: node.op.as_str().to_string(),
+                    duration: elapsed,
+                    output_shapes: vec![tensor.shape().to_vec()],
+                });
+            }
+        }
+        activations.insert_output(name, tensor, self.cuda.as_ref());
+        Ok(())
+    }
+
     /// Attempt to dispatch `node` through the ordered provider list stored in
     /// `self.providers`.
     ///
@@ -770,6 +1242,11 @@ impl Session {
     // arms below.  With no accelerator feature enabled,
     // `ProviderKind::Cpu` is the enum's sole variant and
     // those arms vanish.
+    // Eight parameters with `cuda` on: seven pieces of run state plus this
+    // run's activation map. Bundling them into a struct would only move the
+    // list, since every one is a distinct `&mut` borrow the arms below need
+    // independently.
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::never_loop)] // The loop CAN iterate when GPU/CUDA/DirectML features are enabled;
                                  // without those features, only ProviderKind::Cpu exists and the first
                                  // iteration always returns — this is correct conditional-compilation behaviour.
@@ -781,6 +1258,7 @@ impl Session {
         ref_counts: &mut RefCounts<'_>,
         output_set: &OutputSet<'_>,
         resolved_shapes: &HashMap<String, Vec<usize>>,
+        #[cfg(feature = "cuda")] activations: &mut CudaActivations,
     ) -> Result<Option<bool>, OnnxError> {
         // The hard floor binds every listed accelerator identically, so a node
         // below it resolves to the CPU fallback without walking the list at all —
@@ -797,7 +1275,7 @@ impl Session {
 
                 #[cfg(feature = "cuda")]
                 ProviderKind::Cuda => {
-                    if self.dispatch_to_cuda(node, state, resolved_shapes)? {
+                    if self.dispatch_to_cuda(node, state, activations, resolved_shapes)? {
                         self.decrement_refs_state(node, state, ref_counts, output_set);
                         return Ok(Some(true));
                     }
@@ -1176,46 +1654,76 @@ mod tests {
         }
     }
 
-    /// `Auto` consults each backend's *own* op-support predicate.  CUDA has no
-    /// `Conv` kernel (`oxionnx_cuda::is_supported_op(Conv) == false`) even though
-    /// wgpu does, so a convolution must never be gated to CUDA — the round trip
-    /// would be pure waste.
+    /// `Auto` consults each backend's *own* op-support predicate.  CUDA has a
+    /// real `Conv` kernel (`oxionnx_cuda::is_supported_op(Conv) == true`, backed
+    /// by direct dispatch to `oxicuda-dnn`'s `Conv1x1` / `DepthwiseConv` /
+    /// `ImplicitGemmConv` engines), so a convolution must be gated *to* CUDA —
+    /// that is the whole point of having the kernel.
+    ///
+    /// The op sets still differ, which is why the gate consults each backend's
+    /// own predicate rather than the wgpu-flavoured `is_gpu_capable`: whichever
+    /// op `op_wgpu_claims_but_cuda_lacks` turns up must *not* be gated to CUDA.
+    /// (That exemplar is derived rather than named — `ReduceMean` was hard-coded
+    /// here until CUDA grew a kernel for it.)  This test asserted
+    /// the opposite for `Conv` until CUDA gained the kernel; it is inverted
+    /// rather than deleted because a silent regression here means every
+    /// convolution in every graph quietly stops being CUDA-accelerated.
     #[cfg(feature = "cuda")]
     #[test]
-    fn auto_never_gates_conv_to_cuda() {
-        use crate::execution_providers::OpPlacement;
+    fn auto_gates_conv_to_cuda_but_not_an_op_cuda_lacks() {
+        use crate::execution_providers::{op_wgpu_claims_but_cuda_lacks, OpPlacement};
 
         let placement = OpPlacement::Auto {
             gpu_threshold_bytes: 0,
         };
         assert!(
-            !accelerator_gate(ProviderKind::Cuda, &OpKind::Conv, 1 << 20, &placement),
-            "CUDA has no Conv kernel; gating Conv to it guarantees a wasted round trip",
+            accelerator_gate(ProviderKind::Cuda, &OpKind::Conv, 1 << 20, &placement),
+            "CUDA has a Conv kernel; the gate must let convolutions through to it",
         );
 
-        // wgpu does have one, so with `gpu` also compiled in it takes the node.
+        // The op that still separates the two predicates, derived rather than
+        // named: `ReduceMean` was hard-coded here until CUDA grew
+        // `reduce::cuda_reduce_mean_bound`. See `op_wgpu_claims_but_cuda_lacks`.
+        let lacked = op_wgpu_claims_but_cuda_lacks();
+        assert!(
+            !accelerator_gate(ProviderKind::Cuda, &lacked, 1 << 20, &placement),
+            "{lacked:?}: CUDA has no kernel for it; gating it there guarantees a wasted \
+             round trip",
+        );
+
+        // wgpu claims Conv, and claims `lacked` by construction, so with `gpu`
+        // also compiled in it stays in the chain for either op.
         #[cfg(feature = "gpu")]
-        assert!(accelerator_gate(
-            ProviderKind::Gpu,
-            &OpKind::Conv,
-            1 << 20,
-            &placement
-        ));
+        {
+            assert!(accelerator_gate(
+                ProviderKind::Gpu,
+                &OpKind::Conv,
+                1 << 20,
+                &placement
+            ));
+            assert!(
+                accelerator_gate(ProviderKind::Gpu, &lacked, 1 << 20, &placement),
+                "{lacked:?}: comes from wgpu's own op set, so wgpu's gate must let it through",
+            );
+        }
     }
 
     /// An op no compiled backend implements stays on the CPU however large it is.
     #[cfg(any(feature = "gpu", feature = "cuda", feature = "directml"))]
     #[test]
     fn auto_leaves_non_accelerable_ops_on_the_cpu() {
-        use crate::execution_providers::OpPlacement;
+        use crate::execution_providers::{ops_no_backend_implements, OpPlacement};
 
         let placement = OpPlacement::Auto {
             gpu_threshold_bytes: 0,
         };
+        // Exemplars derived, not named: `Reshape` was hard-coded here until
+        // oxionnx-cuda grew a shape-op arm. See `ops_no_backend_implements`.
+        let non_accelerable = ops_no_backend_implements();
         for accel in all_accelerators() {
-            for op in [OpKind::Reshape, OpKind::Shape, OpKind::Gather] {
+            for op in &non_accelerable {
                 assert!(
-                    !accelerator_gate(accel, &op, 1 << 24, &placement),
+                    !accelerator_gate(accel, op, 1 << 24, &placement),
                     "{accel:?}: {op:?} has no kernel there",
                 );
             }
@@ -1343,5 +1851,90 @@ mod tests {
                 "{accel:?} must outrank the CPU",
             );
         }
+    }
+
+    // ── OXIONNX_CUDA_STRICT actually being strict ───────────────────────────
+    //
+    // The regression: `dispatch_to_cuda` collapsed every `Err` from
+    // `try_cuda_dispatch` into `Ok(false)` — "declined" — so a run under
+    // `OXIONNX_CUDA_STRICT=1` logged `strict=true` verify mismatches for 22
+    // nodes, silently recomputed each of them on the CPU, and exited `0`.  The
+    // documented contract (`oxiface --device` help, `oxionnx-cuda`'s
+    // `context` module docs) is that strict mode *fails the run*.
+    //
+    // These tests are GPU-free by construction: they exercise the classifier
+    // the run loop consults, on errors built the same way the real path builds
+    // them.
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_shadow_verify_mismatch_fails_the_run_rather_than_falling_back() {
+        // Exactly the error `oxionnx_cuda`'s `verify_or_fallback` produces
+        // under `FailurePolicy::Strict`, through the same lossy
+        // `CudaDispatchError -> OnnxError` conversion the runner sees.
+        let err: OnnxError = oxionnx_cuda::CudaError::Verify(
+            "element 208113: GPU=0.056837104, CPU-oracle=0.056530874".into(),
+        )
+        .into();
+        assert_eq!(
+            classify_cuda_failure(&err),
+            CudaFailureAction::FailTheRun,
+            "a proved-wrong kernel must abort the run; falling back to the CPU is what made \
+             OXIONNX_CUDA_STRICT=1 exit 0 on a run it had just caught misbehaving",
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn an_ordinary_cuda_dispatch_failure_still_falls_back_to_the_cpu() {
+        for err in [
+            oxionnx_cuda::CudaError::Dnn("cuDNN engine refused the problem".into()),
+            oxionnx_cuda::CudaError::Ptx("PTX compilation failed".into()),
+            oxionnx_cuda::CudaError::Shape {
+                op: "MatMul",
+                msg: "K mismatch".into(),
+            },
+            oxionnx_cuda::CudaError::Unsupported {
+                op: "Conv",
+                reason: "asymmetric pads".into(),
+            },
+        ] {
+            let onnx: OnnxError = err.into();
+            assert_eq!(
+                classify_cuda_failure(&onnx),
+                CudaFailureAction::FallBackToCpu,
+                "the node never ran, so the CPU can still compute it: {onnx}",
+            );
+        }
+    }
+
+    /// An `OnnxError` raised anywhere *else* in the engine must not be
+    /// mistaken for a CUDA verify mismatch just because it quotes one.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_non_cuda_error_is_never_treated_as_a_proved_wrong_kernel() {
+        assert_eq!(
+            classify_cuda_failure(&OnnxError::ShapeMismatch(
+                "CUDA VERIFY MISMATCH: not really".into()
+            )),
+            CudaFailureAction::FallBackToCpu,
+        );
+    }
+
+    /// The end-to-end chain, minus the GPU: `oxionnx-cuda`'s own strict-policy
+    /// gate produces an error, and this file's classifier recognises it.  This
+    /// is what stops the two crates drifting apart — `oxionnx-cuda` could
+    /// reword the message and `oxionnx` would keep falling back, silently, and
+    /// only a real GPU fault would ever reveal it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_strict_policy_error_oxionnx_cuda_actually_raises_is_the_one_we_classify() {
+        let mismatch = oxionnx_cuda::error::is_verify_mismatch;
+        let err: OnnxError = oxionnx_cuda::CudaError::Verify("element 0".into()).into();
+        assert!(
+            mismatch(&err),
+            "oxionnx_cuda must recognise the error it raises itself",
+        );
+        assert_eq!(classify_cuda_failure(&err), CudaFailureAction::FailTheRun);
     }
 }

@@ -4,6 +4,39 @@
 
 use super::types::Op;
 
+// Test-only instrumentation for the runtime AVX2 dispatch mechanism.
+//
+// Every numeric SIMD-vs-scalar test in this crate is blind to a broken
+// `is_x86_feature_detected!("avx2")` guard for pure elementwise ops (add,
+// mul, relu, ...): AVX2 and scalar are bit-identical for those (no
+// reduction/reassociation involved), so a dispatcher that silently always
+// fell through to the scalar arm would still pass every existing output
+// comparison while quietly discarding the AVX2 speedup on every AVX2-capable
+// machine. For the reduction-shaped ops (`simd_reduce_sum`/`_max`/`_min`,
+// `simd_dot_product`, `simd_softmax_inplace`, `simd_layer_norm`) the same
+// blindness risk exists from the opposite direction: their scalar fallbacks
+// use compensated (Kahan) summation while the AVX2 kernels reduce
+// lane-parallel, so a small numeric difference between the two is *expected*
+// and already tolerance-checked elsewhere -- which makes a silent
+// always-scalar dispatch bug even easier to miss by output comparison alone
+// (the "difference" a broken dispatcher would produce is simply zero, which
+// looks like success). This counter lets `simd_ops::tests` assert the AVX2
+// arm was *actually entered*, independent of what it computed, at all eight
+// of this module's `is_x86_feature_detected!("avx2")` call sites: the two
+// shared chokepoints (`dispatch_binary`, `dispatch_unary`) and the six
+// standalone reduction/normalization functions listed above.
+//
+// `thread_local!` (not a shared `AtomicUsize`) deliberately, so the counter
+// is immune to cross-talk from unrelated `#[test]` functions running
+// concurrently on other threads elsewhere in this crate's test binary; each
+// `#[test]` fn gets its own thread under the default libtest harness, so
+// reading "did *my* call bump *my* thread's counter" is race-free without
+// any locking. `#[cfg(test)]`-only: does not exist in a shipped build.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AVX2_DISPATCH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// SIMD-accelerated element-wise addition: `out[i] = a[i] + b[i]`
 pub fn simd_add(a: &[f32], b: &[f32], out: &mut [f32]) {
     debug_assert_eq!(a.len(), b.len());
@@ -82,6 +115,8 @@ pub fn simd_reduce_sum(data: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            #[cfg(test)]
+            AVX2_DISPATCH_HITS.with(|c| c.set(c.get() + 1));
             return unsafe { super::avx2::avx2_impl::reduce_sum(data) };
         }
     }
@@ -106,6 +141,8 @@ pub fn simd_reduce_max(data: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
+            #[cfg(test)]
+            AVX2_DISPATCH_HITS.with(|c| c.set(c.get() + 1));
             return unsafe { super::avx2::avx2_impl::reduce_max(data) };
         }
     }
@@ -130,6 +167,8 @@ pub fn simd_reduce_min(data: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
+            #[cfg(test)]
+            AVX2_DISPATCH_HITS.with(|c| c.set(c.get() + 1));
             return unsafe { super::avx2::avx2_impl::reduce_min(data) };
         }
     }
@@ -158,6 +197,8 @@ pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            #[cfg(test)]
+            AVX2_DISPATCH_HITS.with(|c| c.set(c.get() + 1));
             return unsafe { super::avx2::avx2_impl::dot_product(a, b) };
         }
     }
@@ -191,6 +232,8 @@ pub fn simd_softmax_inplace(data: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            #[cfg(test)]
+            AVX2_DISPATCH_HITS.with(|c| c.set(c.get() + 1));
             unsafe { super::avx2::avx2_impl::softmax_inplace(data) };
             return;
         }
@@ -232,6 +275,8 @@ pub fn simd_layer_norm(data: &mut [f32], scale: &[f32], bias: Option<&[f32]>, ep
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            #[cfg(test)]
+            AVX2_DISPATCH_HITS.with(|c| c.set(c.get() + 1));
             unsafe { super::avx2::avx2_impl::layer_norm_inplace(data, scale, bias, eps) };
             return;
         }
@@ -279,6 +324,8 @@ fn dispatch_binary(a: &[f32], b: &[f32], out: &mut [f32], op: Op) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
+            #[cfg(test)]
+            AVX2_DISPATCH_HITS.with(|c| c.set(c.get() + 1));
             unsafe {
                 match op {
                     Op::Add => super::avx2::avx2_impl::add(a, b, out),
@@ -317,6 +364,8 @@ fn dispatch_unary(data: &mut [f32], op: Op) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
+            #[cfg(test)]
+            AVX2_DISPATCH_HITS.with(|c| c.set(c.get() + 1));
             unsafe {
                 match op {
                     Op::Relu => super::avx2::avx2_impl::relu(data),

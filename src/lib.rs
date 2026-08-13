@@ -25,6 +25,22 @@ pub mod gpu {
 #[cfg(feature = "cuda")]
 pub mod cuda {
     //! CUDA-accelerated dispatch for ONNX ops.
+    /// Was this [`OnnxError`](crate::OnnxError) raised because
+    /// `OXIONNX_CUDA_VERIFY=1` proved a CUDA kernel wrong on a node, with
+    /// `OXIONNX_CUDA_STRICT=1` demanding that end the run?
+    ///
+    /// Re-exported for *applications*, not for CUDA callers. An application
+    /// that catches an inference error and carries on — retrying, skipping the
+    /// item, degrading gracefully — has to be able to tell "this GPU is
+    /// producing wrong numbers and the user asked to be stopped" apart from an
+    /// ordinary per-item failure, or `OXIONNX_CUDA_STRICT` stops meaning
+    /// anything the moment the error crosses out of `Session::run`.
+    /// `oxiface`'s per-face swap loop is exactly such a caller: it logs a
+    /// failed face at `warn!` and swaps the rest, which is right for a bad
+    /// crop and wrong for a demonstrated GPU fault.
+    ///
+    /// See [`oxionnx_cuda::error::is_verify_mismatch`].
+    pub use oxionnx_cuda::is_verify_mismatch;
     pub use oxionnx_cuda::CudaContext;
     pub use oxionnx_cuda::CudaError;
 }

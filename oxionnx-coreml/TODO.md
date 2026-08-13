@@ -4,7 +4,13 @@ Tracker for known gaps in the initial 0.1.3 release. Every tracked item
 below is now resolved as of 0.1.5 (see each item's own planned/resolved
 date) — `predict_raw`, `predict_features`, `compute_plan_breakdown`,
 `model_metadata`, the concurrency stress test, and iOS/tvOS/visionOS
-support all shipped this release. Remaining open ideas live under
+support all shipped this release. 0.1.6 then shipped further work that
+was never tracked here as a discrete item — `MlPackageModel::ensure_compiled`,
+the persistent on-disk compile cache (`package/compile_cache.rs`, fixing
+the every-load `$TMPDIR` recompile-and-leak), and the single-pass
+`array_read.rs` output extraction (stride walk and dtype conversion fused
+into one `getBytesWithHandler:` pass) — see `CHANGELOG.md`'s `[0.1.6]`
+section for the full writeup. Remaining open ideas live under
 [Proposed follow-ups](#proposed-follow-ups) below.
 
 ## I/O performance

@@ -3,9 +3,31 @@
 use crate::context::GpuBufferPool;
 use crate::context::GpuContext;
 use crate::shaders::{
-    gpu_batch_norm, gpu_gelu, gpu_layer_norm, gpu_reduce_mean, gpu_relu, gpu_sigmoid, gpu_softmax,
-    gpu_transpose,
+    gpu_batch_norm, gpu_broadcast_add, gpu_conv2d_implicit, gpu_gelu, gpu_gemm_nt, gpu_layer_norm,
+    gpu_reduce_mean, gpu_relu, gpu_sigmoid, gpu_softmax, gpu_transpose, ConvActivation,
 };
+
+/// A context whose *placement* floors are lifted, for the kernel tests below.
+///
+/// Every guard that protects correctness — device limits, the memory budget,
+/// dispatch planning, the degraded flag — stays exactly as it is; only the
+/// "is this dispatch worth making" floors are zeroed
+/// (`crate::context::tuning::GpuTuning::PARITY`).
+///
+/// Without this, these tests would pass by *skipping*. Their shapes are chosen
+/// small enough to check by hand, and the real floors are measured: on a native
+/// discrete GPU the memory-bound kernels decline at every transferring size
+/// (they lose to their CPU counterparts by 1.8x-45x), and the reduction and
+/// transpose floors are in the millions of elements. Each test's
+/// `None => return` would then fire on every run, on every machine, and report
+/// green — the exact false-green shape `w3_gpu_kernel_parity.rs` was written to
+/// eliminate. The floors themselves are covered there and in
+/// `tests/p1_dispatch_gating.rs`.
+fn kernel_ctx() -> Option<GpuContext> {
+    let mut ctx = GpuContext::try_new()?;
+    ctx.set_tuning(crate::context::tuning::GpuTuning::PARITY);
+    Some(ctx)
+}
 
 /// After a dispatch, the only device memory this crate still holds is what the
 /// pool deliberately retains — every operand, params and staging buffer has
@@ -19,10 +41,7 @@ use crate::shaders::{
 /// budget declines on, and it is the same code on both targets.
 #[test]
 fn a_dispatch_leaves_only_pooled_bytes_live() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
     assert_eq!(ctx.live_gpu_bytes(), 0, "a fresh context owns nothing");
 
     // Comfortably over `EW_GPU_THRESHOLD` so the kernel does not decline.
@@ -59,10 +78,7 @@ fn a_dispatch_leaves_only_pooled_bytes_live() {
 /// CPU and the context stays perfectly usable afterwards.
 #[test]
 fn an_exhausted_budget_declines_instead_of_allocating() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
     let data = vec![0.5f32; 200_000];
     if gpu_relu(&ctx, &data).is_none() {
         return; // No dispatch on this device at all; nothing to compare against.
@@ -117,10 +133,7 @@ fn test_gpu_buffer_pool_basic() {
 
 #[test]
 fn test_gpu_buffer_pool_reuse() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     let mut pool = GpuBufferPool::new(16);
     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
@@ -346,10 +359,7 @@ async fn tiny_limited_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 
 #[test]
 fn test_gpu_softmax() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // Shape: [2, 2000] — last dim > 1000 so GPU should accept.
     let rows = 2usize;
@@ -382,10 +392,7 @@ fn test_gpu_softmax() {
 
 #[test]
 fn test_gpu_relu() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     let len = 200_000;
     let data: Vec<f32> = (0..len)
@@ -410,10 +417,7 @@ fn test_gpu_relu() {
 
 #[test]
 fn test_gpu_sigmoid() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     let len = 200_000;
     let data: Vec<f32> = (0..len).map(|i| (i as f32 - 100_000.0) * 0.0001).collect();
@@ -436,10 +440,7 @@ fn test_gpu_sigmoid() {
 
 #[test]
 fn test_gpu_gelu() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     let len = 200_000;
     let data: Vec<f32> = (0..len).map(|i| (i as f32 - 100_000.0) * 0.00005).collect();
@@ -470,10 +471,7 @@ fn test_gpu_gelu() {
 
 #[test]
 fn test_gpu_layer_norm() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // [batch=250, n_elements=256] — 64000 > threshold
     let batch = 250usize;
@@ -512,10 +510,7 @@ fn test_gpu_layer_norm() {
 
 #[test]
 fn test_gpu_batch_norm() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // [N=10, C=2, H=50, W=50] → 50000 elements
     let (nn, c, h, w) = (10, 2, 50, 50);
@@ -553,10 +548,7 @@ fn test_gpu_batch_norm() {
 
 #[test]
 fn test_gpu_transpose() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // [200, 256] → [256, 200] — 51200 > threshold
     let (rows, cols) = (200usize, 256usize);
@@ -587,10 +579,7 @@ fn test_gpu_transpose() {
 
 #[test]
 fn test_gpu_reduce_mean() {
-    let ctx = match GpuContext::try_new() {
-        Some(ctx) => ctx,
-        None => return,
-    };
+    let Some(ctx) = kernel_ctx() else { return };
 
     // [100000, 3] axis=1 → output [100000] (output >= 50000)
     let (d0, d1) = (100_000usize, 3usize);
@@ -615,4 +604,98 @@ fn test_gpu_reduce_mean() {
             "reduce_mean mismatch at {i}: got {result_val}, expected {expected}",
         );
     }
+}
+
+/// \[w5\] A context's compiled pipelines belong to that context, and a second
+/// context compiles its own.
+///
+/// # What this replaces, and why the assertion changed shape
+///
+/// This used to assert that dropping a context purged *this thread's* entries
+/// from five device-keyed thread-local caches. Those caches were the
+/// second-session crash (`crate::context::pipeline_cache`): they identified a
+/// device by `&cached.device == device`, which on wgpu 29 is a per-`Instance`
+/// id comparison, and this crate builds one `Instance` per context — so two
+/// live contexts were indistinguishable and the second was served the first's
+/// `BindGroupLayout`. Purging on drop could not fix that, and the count it
+/// asserted on could not even be attributed to one context.
+///
+/// The cache is now a field of `GpuContext`, so "dropping a context releases its
+/// pipelines" is a structural fact rather than something to test. What is worth
+/// pinning is the property the old arrangement got wrong: two contexts alive at
+/// once each compile into their own table, and neither is empty because one of
+/// them ran first.
+#[test]
+fn each_context_compiles_into_its_own_pipeline_cache() {
+    let Some(first) = kernel_ctx() else { return };
+    assert_eq!(
+        first.pipelines().len(),
+        0,
+        "a fresh context must start with no lazily compiled pipelines",
+    );
+
+    // `gpu_broadcast_add` compiles through `kernel_support`'s helper; a
+    // convolution compiles `conv2d`'s own. Both land in this context's table.
+    let a = vec![1.0f32; 64 * 64];
+    let b = vec![2.0f32; 64];
+    let _ = gpu_broadcast_add(&first, &a, &[64, 64], &b, &[1, 64]);
+    let input = oxionnx_core::Tensor::new(vec![0.25f32; 32 * 32 * 32], vec![1, 32, 32, 32]);
+    let weight = oxionnx_core::Tensor::new(vec![0.05f32; 32 * 32 * 3 * 3], vec![32, 32, 3, 3]);
+    let _ = gpu_conv2d_implicit(
+        &first,
+        &input,
+        &weight,
+        None,
+        [1, 1],
+        [1, 1, 1, 1],
+        [1, 1],
+        1,
+        ConvActivation::None,
+    );
+
+    // [w2-f16] On an adapter with `shader-f16` this also exercises the variant
+    // path, whose verdict — compiled, or refused by the driver — now lands as a
+    // slot in this same per-context table instead of in a device-keyed
+    // thread-local list of "devices where it failed".
+    if first.set_f16_compute(true) {
+        let (m, k, n) = (32usize, 512usize, 512usize);
+        let ga: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.01).collect();
+        let gb: Vec<f32> = (0..n * k).map(|i| (i % 13) as f32 * 0.02).collect();
+        let _ = gpu_gemm_nt(&first, &ga, m, k, &gb, n, None, 1.0, 0.0);
+        first.set_f16_compute(false);
+    }
+
+    let populated = first.pipelines().len();
+    if populated == 0 {
+        eprintln!("skip: the adapter declined every dispatch, so no pipeline was compiled");
+        return;
+    }
+    // Printed rather than asserted at an exact value: how many pipelines the
+    // dispatches above compile depends on what this adapter accepted (the `f16`
+    // variants only exist where `SHADER_F16` does), and pinning the number would
+    // make the test a statement about one machine.
+    eprintln!("  {populated} pipelines compiled by the first context");
+
+    // A second, independent context starts empty however much the first has
+    // compiled — the old thread-local caches would have reported the first
+    // context's entries here, and then handed them out.
+    let Some(second) = kernel_ctx() else { return };
+    assert_eq!(
+        second.pipelines().len(),
+        0,
+        "a second context must not inherit the first's {populated} compiled pipelines",
+    );
+
+    // And using the second context does not disturb the first's table.
+    let _ = gpu_broadcast_add(&second, &a, &[64, 64], &b, &[1, 64]);
+    assert_ne!(
+        second.pipelines().len(),
+        0,
+        "the second context compiled nothing of its own",
+    );
+    assert_eq!(
+        first.pipelines().len(),
+        populated,
+        "the second context's dispatch changed the first context's cache",
+    );
 }

@@ -19,8 +19,25 @@ use std::time::Instant;
 use oxionnx_core::Tensor;
 use oxionnx_gpu::{gpu_conv2d, gpu_softmax, GpuBufferPool, GpuContext, TrackedBuffer};
 
+/// A context whose *placement* floors are lifted (`GpuTuning::PARITY`).
+///
+/// Every correctness guard stays: device limits, the live-byte budget, dispatch
+/// planning, the degraded flag. Only the "is this dispatch worth making at all"
+/// size floors are zeroed.
+///
+/// This is load-bearing rather than cosmetic. Those floors are now measured and
+/// adapter-derived (`oxionnx_gpu::context::tuning`), and on a native discrete
+/// GPU the memory-bound kernels decline at *every* transferring size while the
+/// reduction and transpose floors sit in the millions of elements. The shapes in
+/// this file are deliberately small — they exist to pin index arithmetic,
+/// dispatch-grid splitting and attribute validation, not throughput — so on a
+/// real context every one of them would take its `else {{ return }}` and report
+/// green while verifying nothing. The floors themselves are covered by
+/// `p1_dispatch_gating.rs` and `w3_gpu_kernel_parity.rs`.
 fn context() -> Option<GpuContext> {
-    GpuContext::try_new()
+    let mut ctx = GpuContext::try_new()?;
+    ctx.set_tuning(oxionnx_gpu::GpuTuning::PARITY);
+    Some(ctx)
 }
 
 /// Deterministic, exactly-representable f32 pattern so GPU and CPU agree
