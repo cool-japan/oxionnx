@@ -8,6 +8,7 @@
 use oxionnx_core::graph::{Attributes, Node, OpKind};
 use oxionnx_core::operator::{OpContext, Operator};
 use oxionnx_core::{OnnxError, Tensor};
+use oxionnx_ops::registry::conv_ops::PadOp;
 use oxionnx_ops::registry::shape_ops::{ConcatOp, ExpandOp, SplitOp, SqueezeOp, TransposeOp};
 use oxionnx_ops::shape;
 // `pad_axes` is not re-exported at the `shape` module root (that re-export list lives in
@@ -224,6 +225,119 @@ fn pad_legacy_wrapper_still_applies_valid_negative_pads_and_wrap() {
     let x1d = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
     let wrapped = shape::pad(&x1d, &[2, 2], "wrap", 0.0);
     assert_eq!(wrapped.data, vec![2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]);
+}
+
+// ── issue #4: Pad accepts the pre-opset-11 attribute form of `pads` / `value` ────────────────
+
+/// `Pad-2` (every opset below 11) carries `pads` and `value` as **attributes** on a node whose
+/// only input is `data`. Reading `pads` from input 1 unconditionally made every such node fail
+/// with `TensorNotFound`, so no pre-opset-11 export containing a `Pad` could run at all.
+///
+/// x = [[1,2],[3,4]] as [1,1,2,2], pads = [0,0,1,1, 0,0,1,1] (one element on each side of H and
+/// W), value = 7 -> a 4x4 frame of 7s around the original 2x2 block.
+#[test]
+fn test_issue_4_pad_opset2_attribute_form_is_accepted() -> Result<(), OnnxError> {
+    let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+    let mut node = dummy_node(OpKind::Pad);
+    node.attrs
+        .int_lists
+        .insert("pads".to_string(), vec![0, 0, 1, 1, 0, 0, 1, 1]);
+    node.attrs.floats.insert("value".to_string(), 7.0);
+    node.attrs
+        .strings
+        .insert("mode".to_string(), "constant".to_string());
+
+    let ctx = make_ctx(&node, vec![Some(&x)]);
+    let out = PadOp.execute(&ctx)?;
+    assert_eq!(out[0].shape, vec![1, 1, 4, 4]);
+    assert_eq!(
+        out[0].data,
+        vec![
+            7.0, 7.0, 7.0, 7.0, //
+            7.0, 1.0, 2.0, 7.0, //
+            7.0, 3.0, 4.0, 7.0, //
+            7.0, 7.0, 7.0, 7.0,
+        ]
+    );
+
+    // The zero-copy slot path must resolve the operands identically, not keep its own rule.
+    let mut slots = vec![Tensor::new(Vec::new(), vec![0])];
+    PadOp.execute_into_slots(&ctx, &mut slots)?;
+    assert_eq!(slots[0].shape, out[0].shape);
+    assert_eq!(slots[0].data, out[0].data);
+    Ok(())
+}
+
+/// `Pad-1` spells the same list `paddings`, and omits `value` (default 0).
+#[test]
+fn test_issue_4_pad_opset1_paddings_attribute_form_is_accepted() -> Result<(), OnnxError> {
+    let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
+    let mut node = dummy_node(OpKind::Pad);
+    node.attrs
+        .int_lists
+        .insert("paddings".to_string(), vec![1, 1]);
+
+    let ctx = make_ctx(&node, vec![Some(&x)]);
+    let out = PadOp.execute(&ctx)?;
+    assert_eq!(out[0].shape, vec![5]);
+    assert_eq!(out[0].data, vec![0.0, 1.0, 2.0, 3.0, 0.0]);
+    Ok(())
+}
+
+/// A `Pad` node with neither the input nor the attribute form reports a model error naming both
+/// accepted spellings, instead of the bare `input[1] not found` it used to.
+#[test]
+fn test_issue_4_pad_without_any_pads_reports_invalid_model() {
+    let x = Tensor::new(vec![1.0, 2.0], vec![2]);
+    let node = dummy_node(OpKind::Pad);
+    let ctx = make_ctx(&node, vec![Some(&x)]);
+    let err = PadOp
+        .execute(&ctx)
+        .expect_err("a Pad with no pads at all must be rejected");
+    assert!(
+        err.to_string().contains("pads"),
+        "error should name the missing operand, got: {err}"
+    );
+}
+
+/// The `pads` **input** still wins when both forms are present, matching `UpsampleOp`'s
+/// precedence for its opset-7 `scales` attribute.
+#[test]
+fn test_issue_4_pad_input_wins_over_legacy_attribute() -> Result<(), OnnxError> {
+    let x = Tensor::new(vec![1.0, 2.0], vec![2]);
+    let pads = Tensor::new(vec![2.0, 0.0], vec![2]);
+    let mut node = dummy_node(OpKind::Pad);
+    node.attrs.int_lists.insert("pads".to_string(), vec![1, 1]);
+
+    let ctx = make_ctx(&node, vec![Some(&x), Some(&pads)]);
+    let out = PadOp.execute(&ctx)?;
+    assert_eq!(
+        out[0].shape,
+        vec![4],
+        "the input's [2,0], not the attribute's [1,1]"
+    );
+    assert_eq!(out[0].data, vec![0.0, 0.0, 1.0, 2.0]);
+    Ok(())
+}
+
+/// `reflect` with a pad wider than the axis keeps reflecting (numpy's rule), and a size-1 axis
+/// degenerates to repeating its single element. Both are reachable from `nn.ReflectionPad*`
+/// exports on small feature maps, and are the two cases a naive single-mirror implementation
+/// gets wrong.
+#[test]
+fn test_issue_4_pad_reflect_wider_than_axis() -> Result<(), OnnxError> {
+    // np.pad([1,2,3], (5,0), 'reflect') -> [2,1,2,3,2,1,2,3]: the virtual index -k folds with
+    // period 2*(dim-1) = 4, so -5 -> 1, -4 -> 0, -3 -> 1, -2 -> 2, -1 -> 1.
+    let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
+    let y = pad_axes(&x, &[5, 0], "reflect", 0.0, None)?;
+    assert_eq!(y.shape, vec![8]);
+    assert_eq!(y.data, vec![2.0, 1.0, 2.0, 3.0, 2.0, 1.0, 2.0, 3.0]);
+
+    // np.pad([5], (2,2), 'reflect') -> [5,5,5,5,5].
+    let single = Tensor::new(vec![5.0], vec![1]);
+    let y = pad_axes(&single, &[2, 2], "reflect", 0.0, None)?;
+    assert_eq!(y.data, vec![5.0; 5]);
+    Ok(())
 }
 
 // ── [a0-12] / [a10-6]: Unsqueeze normalizes against OUTPUT rank, rejects OOB/duplicates ─────

@@ -173,39 +173,79 @@ pub(super) fn infer_tile_shape(
     None
 }
 
-/// Pad: add padding to spatial dims.
+/// Pad: grow (or, for a negative pad, crop) each padded axis.
+///
+/// Mirrors `oxionnx_ops::shape::sequence::pad_axes`, including the two ways a model can
+/// hand the operator its `pads`:
+///
+/// * the `pads` input of Pad-11+ (`[begin_0, .., begin_{k-1}, end_0, .., end_{k-1}]`), and
+/// * the `pads` / `paddings` **attribute** of Pad-1/2, whose node has `data` as its only
+///   input — previously unreachable here, because the missing input 1 returned `None`.
+///
+/// The opset-18 `axes` input is honoured rather than ignored: `pads` then names only the
+/// listed axes (`2 * len(axes)` entries), so reading it as one `(begin, end)` pair per input
+/// axis mispredicts any `axes` that is not the identity list — a `[2, 3]`-shaped tensor with
+/// `axes = [1, 0]` and `pads = [0, 1, 0, 1]` used to satisfy the `2 * rank` length check and
+/// be attributed to the wrong axes. An `axes` input that is not a resolvable constant makes
+/// this decline (return `None`, "unknown") instead of guessing.
 pub(super) fn infer_pad_shape(
     node: &Node,
     known: &HashMap<String, Vec<usize>>,
     weights: &HashMap<String, Tensor>,
 ) -> Option<Vec<Vec<usize>>> {
     let input_shape = get_input_shape(node, 0, known)?;
+    let rank = input_shape.len();
 
-    // pads input: [begin_0, begin_1, ..., end_0, end_1, ...]
-    let pads_name = node.inputs.get(1)?;
-    if pads_name.is_empty() {
+    let pads: Vec<i64> = match node.inputs.get(1).filter(|name| !name.is_empty()) {
+        Some(pads_name) => weights
+            .get(pads_name)?
+            .data
+            .iter()
+            .map(|&v| v as i64)
+            .collect(),
+        // Pad-1/2: `pads` (Pad-2) or `paddings` (Pad-1) as an attribute.
+        None => [node.attrs.ints("pads"), node.attrs.ints("paddings")]
+            .into_iter()
+            .find(|list| !list.is_empty())?
+            .to_vec(),
+    };
+
+    // Which input axis each (begin, end) pair in `pads` refers to.
+    let axes: Vec<usize> = match node.inputs.get(3).filter(|name| !name.is_empty()) {
+        Some(axes_name) => weights
+            .get(axes_name)?
+            .data
+            .iter()
+            .map(|&v| {
+                let ax = v as i64;
+                let ax = if ax < 0 { ax + rank as i64 } else { ax };
+                usize::try_from(ax).ok().filter(|&ax| ax < rank)
+            })
+            .collect::<Option<Vec<usize>>>()?,
+        None => (0..rank).collect(),
+    };
+    if pads.len() != axes.len() * 2 {
         return None;
     }
 
-    if let Some(pads_tensor) = weights.get(pads_name) {
-        let pads: Vec<i64> = pads_tensor.data.iter().map(|&v| v as i64).collect();
-        let rank = input_shape.len();
-        if pads.len() != rank * 2 {
-            return None;
-        }
-
-        let mut out = Vec::with_capacity(rank);
-        for i in 0..rank {
-            let padded = input_shape[i] as i64 + pads[i] + pads[i + rank];
-            if padded < 0 {
-                return None;
-            }
-            out.push(padded as usize);
-        }
-        return Some(vec![out]);
+    // Expanded exactly as `pad_axes` expands it — by assignment, so a (malformed) repeated
+    // axis resolves last-wins in both places rather than accumulating only here.
+    let mut begin = vec![0_i64; rank];
+    let mut end = vec![0_i64; rank];
+    for (i, &ax) in axes.iter().enumerate() {
+        begin[ax] = pads[i];
+        end[ax] = pads[axes.len() + i];
     }
 
-    None
+    let mut out = Vec::with_capacity(rank);
+    for d in 0..rank {
+        let padded = input_shape[d] as i64 + begin[d] + end[d];
+        if padded < 0 {
+            return None;
+        }
+        out.push(padded as usize);
+    }
+    Some(vec![out])
 }
 
 /// Look up a Resize tensor input that is a constant initializer.

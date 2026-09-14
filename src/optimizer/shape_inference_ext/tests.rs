@@ -391,3 +391,67 @@ fn test_shape_inference_gru() {
     assert_eq!(result.get("y"), Some(&vec![8, 1, 2, 4]));
     assert_eq!(result.get("y_h"), Some(&vec![1, 2, 4]));
 }
+
+/// issue #4: a pre-opset-11 `Pad` keeps `pads` in an attribute and has `data` as its only
+/// input, so inference that insisted on an input 1 gave up on every such node. Pad-2's `pads`
+/// and Pad-1's `paddings` both resolve; [1,1,2,2] padded by 1 on each spatial side is
+/// [1,1,4,4].
+#[test]
+fn test_issue_4_pad_shape_inference_from_legacy_attribute() {
+    for attr in ["pads", "paddings"] {
+        let mut node = make_node(OpKind::Pad, "pad", vec!["x"], vec!["y"]);
+        node.attrs
+            .int_lists
+            .insert(attr.to_string(), vec![0, 0, 1, 1, 0, 0, 1, 1]);
+
+        let result = infer_shapes(
+            &[node],
+            &HashMap::new(),
+            &shapes_map(&[("x", vec![1, 1, 2, 2])]),
+        );
+        assert_eq!(
+            result.get("y"),
+            Some(&vec![1, 1, 4, 4]),
+            "attribute `{attr}`"
+        );
+    }
+}
+
+/// issue #4: the opset-18 `axes` input means `pads` names only the listed axes, in *their*
+/// order. `axes = [1, 0]` with `pads = [0, 1, 0, 1]` pads axis 1 by (0,0) and axis 0 by (1,1),
+/// giving [4, 3] — not the [2, 5] that reading the pairs positionally produces. The old
+/// inference ignored `axes` entirely and, because `2 * len(axes)` happened to equal `2 * rank`
+/// here, published that wrong shape instead of declining.
+#[test]
+fn test_issue_4_pad_shape_inference_honours_axes_input() {
+    let node = make_node(OpKind::Pad, "pad", vec!["x", "pads", "", "axes"], vec!["y"]);
+    let weights = weights_map(&[
+        ("pads", vec![0.0, 1.0, 0.0, 1.0], vec![4]),
+        ("axes", vec![1.0, 0.0], vec![2]),
+    ]);
+
+    let result = infer_shapes(&[node], &weights, &shapes_map(&[("x", vec![2, 3])]));
+    assert_eq!(result.get("y"), Some(&vec![4, 3]));
+}
+
+/// A negative `axes` entry counts from the end, and an `axes` that is not a resolvable constant
+/// makes inference decline rather than guess.
+#[test]
+fn test_issue_4_pad_shape_inference_negative_and_dynamic_axes() {
+    let node = make_node(OpKind::Pad, "pad", vec!["x", "pads", "", "axes"], vec!["y"]);
+    let weights = weights_map(&[
+        ("pads", vec![2.0, 2.0], vec![2]),
+        ("axes", vec![-1.0], vec![1]),
+    ]);
+    let result = infer_shapes(
+        std::slice::from_ref(&node),
+        &weights,
+        &shapes_map(&[("x", vec![2, 3])]),
+    );
+    assert_eq!(result.get("y"), Some(&vec![2, 7]));
+
+    // Same node, but `axes` is a runtime value: no shape may be published.
+    let weights = weights_map(&[("pads", vec![2.0, 2.0], vec![2])]);
+    let result = infer_shapes(&[node], &weights, &shapes_map(&[("x", vec![2, 3])]));
+    assert_eq!(result.get("y"), None);
+}

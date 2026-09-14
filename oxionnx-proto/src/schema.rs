@@ -141,7 +141,11 @@ pub fn default_schemas() -> HashMap<String, OpSchema> {
     add_schema(&mut schemas, "Flatten", 1, Some(1), 1, Some(1));
     add_schema(&mut schemas, "Expand", 2, Some(2), 1, Some(1));
     add_schema(&mut schemas, "Split", 1, Some(2), 1, None); // variadic outputs
-    add_schema(&mut schemas, "Pad", 2, Some(3), 1, Some(1));
+
+    // Pad's operand count is opset-dependent: Pad-1/2 take only `data` (`pads`/`paddings` and
+    // `value` are attributes), Pad-11 moved `pads` and `constant_value` into inputs 1 and 2,
+    // and Pad-18 added the optional `axes` input 3.
+    add_schema(&mut schemas, "Pad", 1, Some(4), 1, Some(1));
     add_schema(&mut schemas, "Tile", 2, Some(2), 1, Some(1));
     add_schema(&mut schemas, "DepthToSpace", 1, Some(1), 1, Some(1));
     add_schema(&mut schemas, "SpaceToDepth", 1, Some(1), 1, Some(1));
