@@ -235,4 +235,4 @@ missing files; and the documented `load_from_bytes` rejection.
 
 ## License
 
-Apache-2.0.  Copyright COOLJAPAN OU (Team Kitasan).
+Apache-2.0.  Copyright COOLJAPAN OU (Team KitaSan).

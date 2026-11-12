@@ -1042,7 +1042,7 @@ fn feature_value_image_unsupported_format_errors_clearly() {
 #[test]
 fn insert_metadata_string_reads_present_string_value() {
     let key = NSString::from_str("com.example.author");
-    let val: Retained<NSString> = NSString::from_str("Team Kitasan");
+    let val: Retained<NSString> = NSString::from_str("Team KitaSan");
     let val_any: Retained<AnyObject> = Retained::from(val);
     let keys_owned = [NSString::from_str("com.example.author")];
     let vals_owned = [val_any];
@@ -1053,7 +1053,7 @@ fn insert_metadata_string_reads_present_string_value() {
 
     let mut out = HashMap::new();
     macos_impl::insert_metadata_string(&dict, Some(&key), "author", &mut out);
-    assert_eq!(out.get("author").map(String::as_str), Some("Team Kitasan"));
+    assert_eq!(out.get("author").map(String::as_str), Some("Team KitaSan"));
 }
 
 /// A value present under the key but of the wrong runtime class
@@ -1082,7 +1082,7 @@ fn insert_metadata_string_skips_non_string_value() {
 /// A key absent from the dictionary must be skipped silently.
 #[test]
 fn insert_metadata_string_skips_missing_key() {
-    let val: Retained<NSString> = NSString::from_str("Team Kitasan");
+    let val: Retained<NSString> = NSString::from_str("Team KitaSan");
     let val_any: Retained<AnyObject> = Retained::from(val);
     let keys_owned = [NSString::from_str("com.example.author")];
     let vals_owned = [val_any];
@@ -1105,7 +1105,7 @@ fn insert_metadata_string_skips_missing_key() {
 /// panicking on the `None`.
 #[test]
 fn insert_metadata_string_skips_none_key() {
-    let val: Retained<NSString> = NSString::from_str("Team Kitasan");
+    let val: Retained<NSString> = NSString::from_str("Team KitaSan");
     let val_any: Retained<AnyObject> = Retained::from(val);
     let keys_owned = [NSString::from_str("com.example.author")];
     let vals_owned = [val_any];

@@ -2,7 +2,7 @@
 
 **Repository:** `cool-japan/oxionnx`
 **License:** Apache-2.0
-**Author:** COOLJAPAN OU (Team Kitasan)
+**Author:** COOLJAPAN OU (Team KitaSan)
 
 **Current stats (2026-08-14):** ~159,672 SLoC (Rust code, tokei) | 190 OpKind variants | 189 registered operators (204 op-type strings incl. aliases) | 3,595 tests passing (all-features; 3,289 with default features) | workspace layout (8 crates)
 **Dependencies:** `half`, `matrixmultiply`, `bytemuck`, `rayon` (non-wasm), `tracing`, optional `wgpu`/`pollster` (gpu feature), optional `oxicuda-*` (cuda feature)

@@ -259,4 +259,4 @@ Other workspace members:
 
 Licensed under `Apache-2.0`.
 
-Copyright COOLJAPAN OU (Team Kitasan).
+Copyright COOLJAPAN OU (Team KitaSan).
